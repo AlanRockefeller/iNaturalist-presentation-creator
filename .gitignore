@@ -5,3 +5,7 @@ __pycache__/
 var/
 var-*/
 *.pptx
+
+# Local agent guides; kept on the server, not in the repo
+CLAUDE.md
+AGENTS.md
