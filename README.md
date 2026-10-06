@@ -2,6 +2,7 @@
 
 **https://presentations.dikarya.us/** builds PowerPoint decks from iNaturalist
 observations, sized and laid out for projectors. (`presentation.dikarya.us` permanently redirects here.)
+Licensed under the [GNU GPL v3](LICENSE).
 
 Pick one or more iNaturalist sources, choose photos, put them in order, preview the
 real slide sequence and download a 16:9 `.pptx`. Built for mushroom-club talks and
@@ -402,3 +403,14 @@ Environment overrides: `SRC_DIR`, `CODE_OWNER`, `PORT`, `SKIP_APT=1`,
 **DNS**: `presentations.dikarya.us` and `presentation.dikarya.us` must both
 point at this server before the certificate can be issued. If they don't yet,
 the script leaves the site on HTTP and says so. Re-run it once DNS is in place.
+
+## License
+
+Dikarya Presentations is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option) any
+later version. See [LICENSE](LICENSE) for the full text.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE.
