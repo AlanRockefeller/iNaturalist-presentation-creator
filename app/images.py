@@ -31,6 +31,12 @@ from .ratelimit import ByteBudget
 log = logging.getLogger(__name__)
 
 Image.MAX_IMAGE_PIXELS = 120_000_000  # bound decompression bombs
+# The formats iNaturalist serves. Pillow picks a parser from a file's contents,
+# not its name, so only these parsers are ever tried on downloaded bytes: a
+# file named .jpg that holds anything else (EPS, which runs Ghostscript, TIFF,
+# and so on) is rejected before any other parser touches it.
+IMAGE_FORMATS = ("JPEG", "PNG", "GIF", "WEBP")  # parsers Image.open may try
+DETECTED_FORMATS = {"JPEG", "MPO", "PNG", "GIF", "WEBP"}  # MPO comes from the JPEG parser
 EMBEDDABLE = {"JPEG": ("image/jpeg", "jpg"), "MPO": ("image/jpeg", "jpg"), "PNG": ("image/png", "png"), "GIF": ("image/gif", "gif")}
 
 
@@ -152,9 +158,18 @@ class MediaFetcher:
             total -= size
 
 
+def open_image(path: Path) -> Image.Image:
+    """Image.open limited to IMAGE_FORMATS. Use it for every downloaded file."""
+    im = Image.open(path, formats=IMAGE_FORMATS)
+    if im.format not in DETECTED_FORMATS:  # belt and braces: formats= already ensures this
+        im.close()
+        raise Image.UnidentifiedImageError(f"unexpected image format {im.format!r}")
+    return im
+
+
 def _verify_image(path: Path, photo_id: int) -> None:
     try:
-        with Image.open(path) as im:
+        with open_image(path) as im:
             im.verify()
     except Exception as exc:  # Pillow raises many types for bad data
         raise ImageFetchError(f"Photo {photo_id} is not a readable image.") from exc
@@ -162,7 +177,7 @@ def _verify_image(path: Path, photo_id: int) -> None:
 
 def prepare_for_slide(src: Path, work_dir: Path) -> PreparedImage:
     """Return something PowerPoint can embed, re-encoding only when necessary."""
-    with Image.open(src) as im:
+    with open_image(src) as im:
         fmt = (im.format or "").upper()
         orientation = 1
         try:
@@ -199,7 +214,7 @@ def title_background(src: Path, out: Path, position: str = "center", max_width: 
 
     The title slide is the only place a photo is ever cropped.
     """
-    with Image.open(src) as im:
+    with open_image(src) as im:
         im = ImageOps.exif_transpose(im).convert("RGB")
         if rotation in ROTATE_CLOCKWISE:
             im = im.transpose(ROTATE_CLOCKWISE[rotation])

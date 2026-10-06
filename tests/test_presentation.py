@@ -336,3 +336,28 @@ def test_custom_photo_order_sets_slide_order():
     pr = pr.model_copy(update={"observations": list(st.values())})
     plan = build_slide_plan(pr, obs)
     assert [s["photo_id"] for s in plan["slides"] if s.get("observation_id") == 1] == [103, 101, 102]
+
+
+def test_only_expected_image_formats_are_parsed(tmp_path):
+    from app.images import ImageFetchError, _verify_image, open_image
+
+    for fmt in ("JPEG", "PNG", "GIF", "WEBP"):
+        path = tmp_path / f"ok.{fmt.lower()}.jpg"
+        Image.new("RGB", (20, 10), (1, 2, 3)).save(path, fmt)
+        _verify_image(path, 1)
+        with open_image(path) as im:
+            assert im.format == fmt
+    mpo = tmp_path / "mpo.jpg"
+    Image.new("RGB", (20, 10)).save(mpo, "MPO", save_all=True, append_images=[Image.new("RGB", (20, 10))])
+    with open_image(mpo) as im:
+        assert im.format == "MPO"
+
+    eps = tmp_path / "evil.jpg"  # EPS would hand the file to Ghostscript
+    eps.write_bytes(b"%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 10 10\nshowpage\n")
+    tiff = tmp_path / "tiff.jpg"
+    Image.new("RGB", (20, 10)).save(tiff, "TIFF")
+    for bad in (eps, tiff):
+        with pytest.raises(ImageFetchError):
+            _verify_image(bad, 7)
+        with pytest.raises(Exception):
+            prepare_for_slide(bad, tmp_path / "work")

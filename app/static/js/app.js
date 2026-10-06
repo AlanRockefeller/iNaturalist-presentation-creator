@@ -1694,6 +1694,7 @@
   });
 
   function openProject(project) {
+    projectGen++; // cancels a draft restore still in progress
     setProject(project);
     S.obs = new Map();
     S.workspaceId = null;
@@ -1717,36 +1718,93 @@
   window.addEventListener('pagehide', saveDraft);
   document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') saveDraft(); });
 
-  async function resumeDraft() {
-    let d = null;
+  // A draft that could not be restored is moved here, so autosaving whatever the
+  // user does next can never delete it. A card offers to try again or discard it.
+  const UNRESTORED_KEY = 'dp-draft-unrestored';
+  let projectGen = 0; // bumped when the user starts or opens another project
+
+  function readDraft(key) {
     try {
-      d = JSON.parse(localStorage.getItem(DRAFT_KEY) || 'null');
-      if (!d) {
-        const old = JSON.parse(localStorage.getItem('dp-project') || 'null');
-        if (old) d = { project: old, step: 'organize', dirty: true };
-      }
-    } catch (e) { d = null; }
-    if (!d || !d.project || !Array.isArray(d.project.sources) || !d.project.sources.length) { restoring = false; return; }
+      const d = JSON.parse(localStorage.getItem(key) || 'null');
+      return d && d.project && Array.isArray(d.project.sources) && d.project.sources.length ? d : null;
+    } catch (e) { return null; }
+  }
+  function setAsideDraft(d) {
+    try { localStorage.setItem(UNRESTORED_KEY, JSON.stringify(d)); } catch (e) { /* ignore */ }
+  }
+
+  // Validate a draft and continue it. Returns false if it could not be restored.
+  // `replace` = the user asked for it in place of the open project.
+  async function restoreDraft(d, replace = false) {
+    const gen = projectGen;
     let project;
     try {
       project = (await api('/api/project/validate', { method: 'POST', body: d.project })).project;
     } catch (err) {
-      restoring = false;
       toast(`Your last project could not be restored: ${err.message}`, true, 9000);
-      return;
+      return false;
     }
+    // The user opened or started another project while this was checked. At
+    // startup that discards the draft; a retry keeps the set-aside copy.
+    if (gen !== projectGen) return !replace;
+    // They began adding sources instead: keep their work, set the old one aside.
+    if (S.project.sources.length && !replace) return false;
+    projectGen++;
     setProject(project);
+    S.obs = new Map();
     S.workspaceId = d.workspaceId || null;
+    S.loadedSources = new Set();
+    S.sourceCounts = {};
+    S.pendingNew = null;
     S.dirty = d.dirty !== false;
     restoring = false;
-    renderSources();
+    goto('sources');
     if (!project.observations.length || !project.sources.some((s) => s.enabled)) {
       toast('Restored your sources. Use New project in the top bar to start over.', false, 7000);
-      return;
+      return true;
     }
     // With a live workspace nothing is searched again; an expired one means a normal refresh.
     await startLoad(S.workspaceId ? [] : null, { step: d.step, dirty: d.dirty });
     if (!S.obs.size) { S.workspaceId = null; updateStepper(); } // load failed or was cancelled; Sources can retry
+    return true;
+  }
+
+  function offerUnrestored() {
+    const d = readDraft(UNRESTORED_KEY);
+    $('#unrestored-card')?.remove();
+    if (!d) return;
+    const title = d.project.settings && d.project.settings.title;
+    const card = el('div', { class: 'card subtle', id: 'unrestored-card' },
+      el('p', { text: `A project you were working on${title ? ` (“${title}”)` : ''} could not be restored: ${plural(d.project.sources.length, 'source')}, ${plural((d.project.observations || []).length, 'observation')}.` }),
+      el('div', { class: 'row-start' },
+        el('button', { type: 'button', class: 'btn btn-primary', text: 'Try again', onclick: async () => {
+          if (S.project.sources.length && !confirm('Replace the project that is open now with the earlier one?')) return;
+          // The open project stays untouched unless the earlier one checks out.
+          if (await restoreDraft(d, true)) {
+            try { localStorage.removeItem(UNRESTORED_KEY); } catch (e) { /* ignore */ }
+            card.remove();
+          }
+        } }),
+        el('button', { type: 'button', class: 'btn', text: 'Discard it', onclick: () => {
+          if (!confirm('Discard the earlier project? This cannot be undone.')) return;
+          try { localStorage.removeItem(UNRESTORED_KEY); } catch (e) { /* ignore */ }
+          card.remove();
+        } })));
+    $('#step-sources').prepend(card);
+  }
+
+  async function resumeDraft() {
+    let d = readDraft(DRAFT_KEY);
+    if (!d) {
+      try { // the older format stored only the project
+        const p = JSON.parse(localStorage.getItem('dp-project') || 'null');
+        if (p && Array.isArray(p.sources) && p.sources.length) d = { project: p, step: 'organize', dirty: true };
+      } catch (e) { /* ignore */ }
+    }
+    if (d && !(await restoreDraft(d))) setAsideDraft(d);
+    // Only now may autosave touch the stored draft: it was restored or set aside.
+    restoring = false;
+    offerUnrestored();
   }
 
   $('#btn-new-project').addEventListener('click', () => {
