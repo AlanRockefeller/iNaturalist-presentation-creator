@@ -208,7 +208,17 @@ def create_app(settings: Settings | None = None, services: Services | None = Non
 
     @app.get("/healthz")
     async def healthz():
-        return {"ok": True, "version": __version__}
+        # Counts only (no ids): the restart wrapper uses them to avoid killing
+        # a deck that is being generated.
+        active = [j for j in svc.jobs.jobs.values() if j.state in ("queued", "running")]
+        return {
+            "ok": True,
+            "version": __version__,
+            "jobs": {
+                "loading": sum(1 for j in active if j.kind == "load"),
+                "generating": sum(1 for j in active if j.kind == "generate"),
+            },
+        }
 
     @app.get("/robots.txt", response_class=HTMLResponse)
     async def robots():

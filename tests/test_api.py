@@ -221,3 +221,8 @@ def test_user_url_with_any_values_loads_only_matching(app_client, fake):
     assert sorted(o["id"] for o in result["project"]["observations"]) == [3]
     sent = fake.api_calls("/v2/observations")[0].url.params
     assert sent["place_id"] == "2" and sent["user_id"] == "alice" and "verifiable" not in sent
+
+
+def test_healthz_reports_active_job_counts(app_client, fake):
+    data = app_client.get("/healthz").json()
+    assert data["ok"] is True and data["jobs"] == {"loading": 0, "generating": 0}

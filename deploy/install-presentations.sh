@@ -5,13 +5,18 @@
 #   https://presentations.dikarya.us/   (FastAPI app, localhost:8031 behind nginx)
 #   https://presentation.dikarya.us/    (301 -> https://presentations.dikarya.us$request_uri)
 #
-# Run as root after reviewing:   sudo bash /tmp/install-presentations.sh
+# Run as root after reviewing. Two ways:
+#   sudo /var/www/presentations/deploy/install-presentations.sh   (in place: the
+#        git checkout at /var/www/presentations is the source; nothing is copied)
+#   sudo bash /tmp/install-presentations.sh                       (first install:
+#        copies from SRC_DIR, default /tmp/presentations-src)
 #
 # Idempotent: safe to re-run for every update. What it does, in order:
 #   1. Pre-flight checks (root, source tree, port, existing nginx conventions).
 #   2. Installs python3-venv / rsync / certbot only if missing (SKIP_APT=1 to skip).
 #   3. Creates the unprivileged system user "presentations" (no shell, no home login).
-#   4. Syncs the application from $SRC_DIR into /var/www/presentations
+#   4. Syncs the application from $SRC_DIR into /var/www/presentations, or uses
+#      it in place when run from there. A .git directory is never touched.
 #      (owner $CODE_OWNER, group presentations, read-only for the service).
 #   5. Creates/updates the virtualenv /var/www/presentations/.venv and installs
 #      requirements.txt; byte-compiles; runs an import check as the service user.
@@ -30,14 +35,24 @@
 #      certbot's webroot method (/var/www/letsencrypt), the same method the other
 #      Dikarya subdomains (labels, images) use. SKIP_CERTBOT=1 disables this; the
 #      site is then served over plain HTTP until a certificate exists.
-#   9. Prints service status, listening port, nginx test result and hostnames.
+#   9. Installs /usr/local/sbin/restart-presentations (root-owned) and
+#      /etc/sudoers.d/presentations so $CODE_OWNER can restart the service, and
+#      only that, after code changes: `sudo /usr/local/sbin/restart-presentations`.
+#  10. Prints service status, listening port, nginx test result and hostnames.
 #
 # Tunables (environment): SRC_DIR CODE_OWNER PORT SKIP_APT SKIP_CERTBOT
 # =============================================================================
 set -Eeuo pipefail
 
 APP_DIR=/var/www/presentations
-SRC_DIR=${SRC_DIR:-/tmp/presentations-src}
+# Default source: the checkout this script lives in, if it is one; otherwise
+# the staging copy in /tmp.
+SCRIPT_ROOT=$(cd "$(dirname "$(realpath "$0")")/.." 2>/dev/null && pwd || true)
+if [[ -z ${SRC_DIR:-} ]]; then
+  if [[ -n $SCRIPT_ROOT && -f $SCRIPT_ROOT/app/main.py ]]; then SRC_DIR=$SCRIPT_ROOT; else SRC_DIR=/tmp/presentations-src; fi
+fi
+RESTART_WRAPPER=/usr/local/sbin/restart-presentations
+SUDOERS_FILE=/etc/sudoers.d/presentations
 SERVICE=presentations
 SERVICE_USER=presentations
 CODE_OWNER=${CODE_OWNER:-tree}
@@ -81,17 +96,22 @@ log "1. Pre-flight checks"
 # ---------------------------------------------------------------------------
 [[ $EUID -eq 0 ]] || die "run as root: sudo bash $0"
 [[ -f $SRC_DIR/app/main.py && -f $SRC_DIR/requirements.txt ]] || die "application source not found in $SRC_DIR (set SRC_DIR=...)"
-[[ $(realpath "$SRC_DIR") != "$(realpath -m "$APP_DIR")" ]] || die "SRC_DIR must not be $APP_DIR"
+IN_PLACE=0
+[[ $(realpath "$SRC_DIR") == "$(realpath -m "$APP_DIR")" ]] && IN_PLACE=1
 id "$CODE_OWNER" &>/dev/null || { warn "user $CODE_OWNER does not exist; code will be owned by root"; CODE_OWNER=root; }
 
 # Root is about to install code from a staging directory (by default in /tmp,
 # which anyone can write to). Refuse if it could have been tampered with.
 src_owner=$(stat -c %U "$SRC_DIR")
 [[ $src_owner == "$CODE_OWNER" || $src_owner == root ]] || die "$SRC_DIR is owned by $src_owner, expected $CODE_OWNER or root"
-bad_owner=$(find "$SRC_DIR" -not -user "$CODE_OWNER" -not -user root -print -quit)
+bad_owner=$(find "$SRC_DIR" -path "$SRC_DIR/.venv" -prune -o -not -user "$CODE_OWNER" -not -user root -print -quit)
 [[ -z $bad_owner ]] || die "$bad_owner in the source tree is owned by an unexpected user"
-writable=$(find "$SRC_DIR" \( -path "$SRC_DIR/.venv" -o -path "$SRC_DIR/var*" \) -prune -o -perm /022 -not -type l -print -quit)
-[[ -z $writable ]] || die "$writable is group/world-writable; fix permissions (chmod -R go-w $SRC_DIR) and re-run"
+if ((IN_PLACE)); then
+  info "mode:        in place ($APP_DIR is the source; permissions are normalized in step 4)"
+else
+  writable=$(find "$SRC_DIR" \( -path "$SRC_DIR/.venv" -o -path "$SRC_DIR/var*" -o -path "$SRC_DIR/.git" \) -prune -o -perm /022 -not -type l -print -quit)
+  [[ -z $writable ]] || die "$writable is group/world-writable; fix permissions (chmod -R go-w $SRC_DIR) and re-run"
+fi
 info "source:      $SRC_DIR (owner $src_owner, $(find "$SRC_DIR/app" -type f | wc -l) app files)"
 info "source hash: $(cd "$SRC_DIR" && find app requirements.txt -type f -not -name '*.pyc' -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -c1-16)"
 
@@ -144,12 +164,16 @@ install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0750 "$STATE_DIR"
 log "4. Application code -> $APP_DIR"
 # ---------------------------------------------------------------------------
 install -d -o "$CODE_OWNER" -g "$SERVICE_USER" -m 0755 "$APP_DIR"
+if ((IN_PLACE)); then
+  info "using $APP_DIR in place"
+else
 rsync -a --delete --no-owner --no-group \
-  --exclude '/.venv/' --exclude '/var/' --exclude '/var-*/' --exclude '__pycache__/' \
+  --exclude '/.git/' --exclude '/.venv/' --exclude '/var/' --exclude '/var-*/' --exclude '__pycache__/' \
   --exclude '.pytest_cache/' --exclude '*.pyc' --exclude '*.pptx' \
   "$SRC_DIR"/ "$APP_DIR"/
+fi
 chown -R "$CODE_OWNER:$SERVICE_USER" "$APP_DIR"
-find "$APP_DIR" -path "$APP_DIR/.venv" -prune -o -type d -exec chmod 0755 {} + -o -type f -exec chmod 0644 {} +
+find "$APP_DIR" \( -path "$APP_DIR/.venv" -o -path "$APP_DIR/.git" \) -prune -o -type d -exec chmod 0755 {} + -o -type f -exec chmod 0644 {} +
 chmod 0755 "$APP_DIR/deploy/install-presentations.sh" 2>/dev/null || true
 info "synced ($(find "$APP_DIR/app" -type f | wc -l) app files)"
 
@@ -164,7 +188,7 @@ fi
 "$APP_DIR/.venv/bin/python" -m pip install -q --disable-pip-version-check -r "$APP_DIR/requirements.txt"
 "$APP_DIR/.venv/bin/python" -m compileall -q "$APP_DIR/app" >/dev/null
 chown -R "$CODE_OWNER:$SERVICE_USER" "$APP_DIR"
-chmod -R go-w "$APP_DIR"
+find "$APP_DIR" -path "$APP_DIR/.git" -prune -o -exec chmod go-w {} +
 # Import check as the service user, before anything is restarted.
 runuser -u "$SERVICE_USER" -- env PRESENTATIONS_WORK_DIR="$STATE_DIR" \
   "$APP_DIR/.venv/bin/python" -c "import sys; sys.path.insert(0, '$APP_DIR'); import app.main; app.main.create_app" \
@@ -483,7 +507,109 @@ fi
 [[ $TLS_STATE == NO* || $TLS_STATE == *FAILED* || $TLS_STATE == *still* ]] && warn "$TLS_STATE"
 
 # ---------------------------------------------------------------------------
-log "9. Status"
+log "9. Restart wrapper for $CODE_OWNER"
+# ---------------------------------------------------------------------------
+# Lets the code owner (and Claude Code running as that user) restart the
+# service after a code change without root, and without being able to do
+# anything else as root. The wrapper never runs application code as root: the
+# import check runs as the service user.
+tmp=$(mktemp)
+cat >"$tmp" <<'WRAPPER'
+#!/usr/bin/env bash
+# restart-presentations: safely restart presentations.service.
+# Installed by /var/www/presentations/deploy/install-presentations.sh; change it
+# there and re-run the installer, do not edit this copy.
+#
+# Usage: sudo /usr/local/sbin/restart-presentations [--force]
+#
+# Exit codes:
+#   0   restarted and healthy
+#   64  bad arguments (only --force is accepted)
+#   69  restarted but /healthz never answered: THE SITE IS DOWN (journal printed)
+#   70  systemctl restart failed (status printed)
+#   75  refused: a presentation is being generated; wait, or use --force
+#   77  not run as root (use sudo)
+#   78  import check failed: NOT restarted, the running site is unaffected
+set -uo pipefail
+APP_DIR=@APP_DIR@
+SERVICE=@SERVICE@
+SERVICE_USER=@SERVICE_USER@
+STATE_DIR=@STATE_DIR@
+PORT=@PORT@
+
+force=0
+case "$#:${1:-}" in
+  0:) ;;
+  1:--force) force=1 ;;
+  *) echo "usage: sudo $0 [--force]" >&2; exit 64 ;;
+esac
+[[ $EUID -eq 0 ]] || { echo "run it with sudo" >&2; exit 77; }
+
+# 1. Import check as the unprivileged service user.
+if ! out=$(cd / && runuser -u "$SERVICE_USER" -- env PYTHONDONTWRITEBYTECODE=1 \
+      PRESENTATIONS_WORK_DIR="$STATE_DIR" "$APP_DIR/.venv/bin/python" \
+      -c "import sys; sys.path.insert(0, '$APP_DIR'); import app.main" 2>&1); then
+  echo "Import check FAILED, so the service was NOT restarted (the site is still up on the old code):" >&2
+  printf '%s\n' "$out" | tail -n 25 >&2
+  exit 78
+fi
+
+# 2. Do not cancel a deck that is being built.
+health=$(curl -fsS --max-time 3 "http://127.0.0.1:${PORT}/healthz" 2>/dev/null || true)
+read -r loading generating < <(python3 -c '
+import json, sys
+try:
+    j = json.loads(sys.argv[1]).get("jobs", {})
+    print(int(j.get("loading", 0)), int(j.get("generating", 0)))
+except Exception:
+    print(0, 0)' "$health")
+if (( generating > 0 && !force )); then
+  echo "Refusing to restart: ${generating} presentation(s) are being generated and would be cancelled." >&2
+  echo "Wait for them to finish, or re-run with --force if losing them is acceptable." >&2
+  exit 75
+fi
+(( loading > 0 )) && echo "note: ${loading} source load(s) in progress will be cancelled; users can reload." >&2
+
+# 3. Restart and wait for the app to answer.
+if ! systemctl restart "$SERVICE"; then
+  systemctl --no-pager status "$SERVICE" 2>&1 | tail -n 15 >&2
+  exit 70
+fi
+for _ in $(seq 1 40); do
+  if body=$(curl -fsS --max-time 2 "http://127.0.0.1:${PORT}/healthz" 2>/dev/null); then
+    echo "restarted and healthy: $body"
+    exit 0
+  fi
+  sleep 0.5
+done
+echo "$SERVICE restarted but is NOT answering on 127.0.0.1:${PORT}. THE SITE IS DOWN. Recent log:" >&2
+journalctl -u "$SERVICE" -n 40 --no-pager >&2
+exit 69
+WRAPPER
+sed -i -e "s#@APP_DIR@#${APP_DIR}#" -e "s#@SERVICE@#${SERVICE}#" -e "s#@SERVICE_USER@#${SERVICE_USER}#" \
+       -e "s#@STATE_DIR@#${STATE_DIR}#" -e "s#@PORT@#${PORT}#" "$tmp"
+bash -n "$tmp" || die "generated restart wrapper has a syntax error"
+if install_file "$tmp" "$RESTART_WRAPPER" 0755; then info "installed $RESTART_WRAPPER"; else info "$RESTART_WRAPPER unchanged"; fi
+
+if [[ $CODE_OWNER == root ]]; then
+  info "code owner is root; no sudoers rule needed"
+else
+  tmp=$(mktemp)
+  cat >"$tmp" <<EOF
+# Managed by install-presentations.sh. Lets ${CODE_OWNER} restart the Dikarya
+# Presentations service and nothing else. "" forbids any other arguments.
+${CODE_OWNER} ALL=(root) NOPASSWD: ${RESTART_WRAPPER} "", ${RESTART_WRAPPER} --force
+EOF
+  visudo -cqf "$tmp" || die "generated sudoers rule failed visudo; not installed"
+  if install_file "$tmp" "$SUDOERS_FILE" 0440; then info "installed $SUDOERS_FILE"; else info "$SUDOERS_FILE unchanged"; fi
+  if ! visudo -cq; then
+    rm -f "$SUDOERS_FILE"
+    die "sudoers became invalid with $SUDOERS_FILE, so it was removed again; sudo is unchanged"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+log "10. Status"
 # ---------------------------------------------------------------------------
 systemctl --no-pager --lines=5 status "$SERVICE" || true
 echo
@@ -496,6 +622,10 @@ info "TLS:            ${TLS_STATE}"
 info "hostnames:      ${DOMAIN} -> app;  ${ALIAS} -> 301 ${DOMAIN}\$request_uri"
 info "code:           ${APP_DIR} (owner ${CODE_OWNER}:${SERVICE_USER})"
 info "temp storage:   ${STATE_DIR} (workspaces, cached originals <=2h, decks <=2h)"
+info "restart:        sudo ${RESTART_WRAPPER}   (allowed for ${CODE_OWNER} via ${SUDOERS_FILE})"
+if [[ -d $APP_DIR/.git ]]; then
+  info "git:            $(git -C "$APP_DIR" -c safe.directory="$APP_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null) @ $(git -C "$APP_DIR" -c safe.directory="$APP_DIR" rev-parse --short HEAD 2>/dev/null)"
+fi
 scheme=http; cert_covers_both && scheme=https
 check() {  # check <url>: status line via the local nginx, bypassing DNS
   local url=$1 host port

@@ -329,36 +329,49 @@ no favorite counts), plus end-to-end API flows.
 ## Production layout
 
 ```
-/var/www/presentations/          code (owner tree, group presentations, read-only to the service)
-  app/  tests/  deploy/  requirements*.txt  README.md
+/var/www/presentations/          git checkout and live code (owner tree, group presentations,
+  app/  tests/  deploy/  ...     read-only to the service)
   .venv/                         virtualenv created by the install script
 /var/lib/presentations/          temporary data (service user only)
   workspaces/  media-cache/  jobs/  state/   (budgets, taxa cache)
 /etc/systemd/system/presentations.service
 /etc/nginx/sites-available/presentations.dikarya.us.conf  (+ symlink in sites-enabled)
 /etc/letsencrypt/live/presentations.dikarya.us/            (both hostnames)
+/usr/local/sbin/restart-presentations                       (root-owned restart wrapper)
+/etc/sudoers.d/presentations                                (lets tree run only that wrapper)
 ```
 
 The service listens only on `127.0.0.1:8031` (Dikarya uses 5000/8000, the image
 service 8017, others 9000).
 
-Logs: `journalctl -u presentations`. Restart: `systemctl restart presentations`
-(this cancels any running load or generation).
+Logs: `journalctl -u presentations`. Restart after a code change:
+`sudo /usr/local/sbin/restart-presentations`, which import-checks the code as the
+service user first and refuses while a presentation is being generated (see
+CLAUDE.md for its exit codes).
 
 ## Deployment
 
-All privileged setup is done by one reviewed script, which is idempotent and is
-re-run for every update:
+**Everyday changes** are made in the `/var/www/presentations` checkout and go live
+as described in CLAUDE.md: templates immediately, Python after
+`sudo /usr/local/sbin/restart-presentations`. No root needed.
+
+**Root-owned pieces** (systemd unit, nginx vhost, TLS, the restart wrapper and
+its sudoers rule, OS packages) come from one reviewed, idempotent script. Run it
+in place from the checkout:
 
 ```bash
-# 1. Stage the code (as the code owner, e.g. tree). The script refuses a staging
-#    tree with group/world-writable files or unexpected owners.
+sudo /var/www/presentations/deploy/install-presentations.sh
+```
+
+For a first install on a new server, stage the code elsewhere and run the script
+from there; it copies the code into `/var/www/presentations` (never touching a
+`.git` directory) and refuses a staging tree with group/world-writable files or
+unexpected owners:
+
+```bash
 rsync -a --delete --exclude .venv --exclude 'var*' ./ /tmp/presentations-src/
 chmod -R go-w /tmp/presentations-src
 cp deploy/install-presentations.sh /tmp/install-presentations.sh
-
-# 2. Review, then run as root
-less /tmp/install-presentations.sh
 sudo bash /tmp/install-presentations.sh
 ```
 
@@ -372,11 +385,13 @@ The script's header lists every step. It:
 - installs and restarts the hardened systemd unit and waits for `/healthz`;
 - writes the dedicated nginx vhost, running `nginx -t` before every reload and
   restoring the previous file if the test fails;
-- sets up TLS.
+- sets up TLS;
+- installs the restart wrapper and the sudoers rule for the code owner.
 
 For TLS, the script reuses `/etc/letsencrypt/live/presentations.dikarya.us` if
-it already covers both names. Otherwise it first proves over HTTP that both DNS
-names reach this server, then requests one certificate with certbot's
+it already covers both names. Otherwise it first confirms that both DNS names
+reach this server (over HTTP, or by public DNS matching dikarya.us, since this
+host has no NAT hairpin), then requests one certificate with certbot's
 **webroot** method (`/var/www/letsencrypt`), as the labels and images subdomains
 do. Until then the site is served over HTTP. The script ends with service
 status, port, the `nginx -t` result, hostnames and redirect checks.
