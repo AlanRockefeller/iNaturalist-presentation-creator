@@ -44,10 +44,20 @@
 # =============================================================================
 set -Eeuo pipefail
 
+# Run from a private copy. Bash reads a script as it executes, so if the sync
+# step rewrote this file (it lives inside the tree it installs) the rest of the
+# run would execute whatever bytes the new file has at that offset.
+if [[ -z ${PRESENTATIONS_INSTALLER_COPY:-} ]]; then
+  self_copy=$(mktemp /tmp/install-presentations.run.XXXXXX)
+  cp -- "$0" "$self_copy"
+  PRESENTATIONS_INSTALLER_COPY=1 PRESENTATIONS_INSTALLER_PATH=$(realpath "$0") exec bash "$self_copy" "$@"
+fi
+rm -f -- "$0"  # the private copy; bash already has it open
+
 APP_DIR=/var/www/presentations
 # Default source: the checkout this script lives in, if it is one; otherwise
 # the staging copy in /tmp.
-SCRIPT_ROOT=$(cd "$(dirname "$(realpath "$0")")/.." 2>/dev/null && pwd || true)
+SCRIPT_ROOT=$(cd "$(dirname "$PRESENTATIONS_INSTALLER_PATH")/.." 2>/dev/null && pwd || true)
 if [[ -z ${SRC_DIR:-} ]]; then
   if [[ -n $SCRIPT_ROOT && -f $SCRIPT_ROOT/app/main.py ]]; then SRC_DIR=$SCRIPT_ROOT; else SRC_DIR=/tmp/presentations-src; fi
 fi
@@ -94,10 +104,13 @@ install_file() {
 # ---------------------------------------------------------------------------
 log "1. Pre-flight checks"
 # ---------------------------------------------------------------------------
-[[ $EUID -eq 0 ]] || die "run as root: sudo bash $0"
+[[ $EUID -eq 0 ]] || die "run as root: sudo $PRESENTATIONS_INSTALLER_PATH"
 [[ -f $SRC_DIR/app/main.py && -f $SRC_DIR/requirements.txt ]] || die "application source not found in $SRC_DIR (set SRC_DIR=...)"
 IN_PLACE=0
 [[ $(realpath "$SRC_DIR") == "$(realpath -m "$APP_DIR")" ]] && IN_PLACE=1
+if ((!IN_PLACE)) && [[ -e $APP_DIR/.git ]]; then
+  die "$APP_DIR is a git checkout, so it is not overwritten from $SRC_DIR. Run the installer from the checkout instead: sudo $APP_DIR/deploy/install-presentations.sh"
+fi
 id "$CODE_OWNER" &>/dev/null || { warn "user $CODE_OWNER does not exist; code will be owned by root"; CODE_OWNER=root; }
 
 # Root is about to install code from a staging directory (by default in /tmp,

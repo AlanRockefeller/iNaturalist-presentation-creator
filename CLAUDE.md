@@ -92,6 +92,12 @@ It is idempotent. Run from the checkout, it uses the code in place and leaves
 unit, vhost, wrapper and sudoers rule, tests nginx with `nginx -t` before any
 reload, and prints a status report. Never run it yourself; it needs root.
 
+Do not create a staging copy in `/tmp` for this server. An old
+`/tmp/install-presentations.sh` once got run from shell history and synced a
+stale tree over the checkout, deleting `.git`. The script now refuses to copy
+over a git checkout and runs from a private copy of itself, but the in-place
+command above is the only one to use here.
+
 ## Git
 
 - `/var/www/presentations` is a clone of
