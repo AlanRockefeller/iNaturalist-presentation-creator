@@ -76,13 +76,15 @@ def annotation_lines(obs: dict, state: ObservationState, project: Project) -> li
     """Text lines for an image slide, in display order.
 
     Each line: {"field", "text", "italic", "size"}. Only the scientific name is
-    italic. An override of "" hides that line for this observation.
+    italic. ``state.show_lines`` turns a line on or off for this observation
+    regardless of the settings; an override of "" also hides it.
     """
     ann = project.settings.annotations
     ov = state.overrides
     lines = []
 
     def add(field: str, enabled: bool, override, default: str, italic: bool, size: int):
+        enabled = state.show_lines.get(field, enabled)  # per-observation choice wins
         if not enabled:
             return
         text = default if override is None else override
@@ -99,6 +101,17 @@ def annotation_lines(obs: dict, state: ObservationState, project: Project) -> li
     return lines
 
 
+def photo_positions(obs: dict, state: ObservationState) -> dict[int, int]:
+    """Photo id -> slide position: ``state.photo_order`` first, then the rest in
+    iNaturalist's order. Mirrored by orderedPhotos() in app.js."""
+    ids = [p["id"] for p in obs.get("photos", [])]
+    present = set(ids)
+    ordered = [pid for pid in state.photo_order if pid in present]
+    chosen = set(ordered)
+    ordered += [pid for pid in ids if pid not in chosen]
+    return {pid: n for n, pid in enumerate(ordered)}
+
+
 def build_slide_plan(project: Project, workspace_obs: dict[int, dict], max_image_slides: int | None = None) -> dict:
     """The exact slide sequence, plus warnings and counts."""
     settings = project.settings
@@ -112,8 +125,10 @@ def build_slide_plan(project: Project, workspace_obs: dict[int, dict], max_image
         obs = workspace_obs.get(tp.observation_id)
         photo = next((p for p in (obs or {}).get("photos", []) if p["id"] == tp.photo_id), None)
         if photo:
+            tp_state = states.get(tp.observation_id)
             title_photo = {"observation_id": tp.observation_id, "photo_id": tp.photo_id,
-                           "url": photo["url"], "position": tp.position}
+                           "url": photo["url"], "position": tp.position,
+                           "rotation": tp_state.rotations.get(tp.photo_id, 0) if tp_state else 0}
         else:
             warnings.append("The title background photo is no longer available on iNaturalist.")
     slides.append({
@@ -150,8 +165,8 @@ def build_slide_plan(project: Project, workspace_obs: dict[int, dict], max_image
                 unavailable_photos += 1
         if not photos:
             continue
-        # Keep the observation's own photo order (iNat position) for its slides.
-        position = {p["id"]: n for n, p in enumerate(obs.get("photos", []))}
+        # The user's photo order if they set one, then iNaturalist's order.
+        position = photo_positions(obs, st)
         photos.sort(key=lambda p: position[p["id"]])
 
         if grouping != "none" and settings.dividers:
@@ -168,13 +183,18 @@ def build_slide_plan(project: Project, workspace_obs: dict[int, dict], max_image
         lines = annotation_lines(obs, st, project)
         observations_used += 1
         for p in photos:
+            rotation = st.rotations.get(p["id"], 0)
+            width, height = p.get("width"), p.get("height")
+            if rotation in (90, 270):
+                width, height = height, width
             slides.append({
                 "kind": "image",
                 "observation_id": oid,
                 "photo_id": p["id"],
                 "url": p["url"],
-                "width": p.get("width"),
-                "height": p.get("height"),
+                "rotation": rotation,
+                "width": width,
+                "height": height,
                 "lines": lines,
                 "notes": _speaker_notes(obs, st, p) if settings.speaker_notes else "",
             })
@@ -395,10 +415,21 @@ class DeckWriter:
         _add_para(tf, True, text, 54, italic=italic, color=color, font=TITLE_FONT, align=PP_ALIGN.CENTER)
         return slide
 
-    def add_image(self, prepared, lines: list[dict], notes: str = ""):
+    def add_image(self, prepared, lines: list[dict], notes: str = "", rotation: int = 0):
         slide = self._new_slide()
-        left, top, w, h = fit_rect(prepared.width, prepared.height)
-        self._picture(slide, prepared.path, prepared.content_type, prepared.ext, left, top, w, h)
+        rotation %= 360
+        if rotation in (90, 270):
+            # Fit the turned photo, then size the frame as the unturned photo:
+            # PowerPoint rotates a picture about its centre.
+            left, top, w, h = fit_rect(prepared.height, prepared.width)
+            cx, cy = left + w // 2, top + h // 2
+            left, top, w, h = cx - h // 2, cy - w // 2, h, w
+        else:
+            left, top, w, h = fit_rect(prepared.width, prepared.height)
+        pic = self._picture(slide, prepared.path, prepared.content_type, prepared.ext, left, top, w, h)
+        if rotation:
+            # Rotating the picture keeps the original bytes; nothing is re-encoded.
+            pic.rot = float(rotation)  # the <p:pic> element; same as Picture.rotation
         if lines:
             color, shadow = _text_colors(self.background)
             box_w = int(SLIDE_W * 0.8)
@@ -451,7 +482,7 @@ def write_pptx(
             if prepared is None:
                 skipped += 1
             else:
-                writer.add_image(prepared, spec.get("lines", []), spec.get("notes", ""))
+                writer.add_image(prepared, spec.get("lines", []), spec.get("notes", ""), spec.get("rotation", 0))
         if progress:
             progress(n, total)
     media_total[0] = writer._media_n

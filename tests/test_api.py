@@ -52,7 +52,9 @@ def test_full_flow_two_overlapping_sources_to_pptx(app_client, fake):
     assert result["summary"]["auto_added"] == 4
     project = result["project"]
     assert {o["id"] for o in project["observations"]} == {1, 2, 3, 4}
-    assert all(sorted(o["selected_photo_ids"]) == sorted(o["known_photo_ids"]) for o in project["observations"])
+    # only the first photo of each observation starts selected
+    assert all(o["selected_photo_ids"] == o["known_photo_ids"][:1] for o in project["observations"])
+    next(o for o in project["observations"] if o["id"] == 1)["selected_photo_ids"] = [11, 12]
     wid = result["workspace_id"]
 
     # favorites sort, ungrouped
@@ -90,7 +92,7 @@ def test_saved_project_refresh_finds_new_and_unavailable(app_client, fake):
     project = _new_project(tc, _source(tc, "https://www.inaturalist.org/observations?taxon_id=47170", "a", username="alice"), _source(tc, URL_B, "b"))
     first = _load(tc, project)
     saved = tc.post("/api/project/export", json={"project": first["project"]}).json()
-    assert saved["format"] == "dikarya-presentation" and saved["schema_version"] == 1
+    assert saved["format"] == "dikarya-presentation" and saved["schema_version"] == 4
     text = json.dumps(saved)
     assert "square.jpg" not in text and "faves_count" not in text
 
@@ -244,3 +246,14 @@ def test_add_skips_observations_only_a_removed_source_matched(app_client, fake):
         "observation_ids": [3, 4], "selected_photo_ids": {}, "placement": "append", "ignore_ids": [],
     }).json()["project"]
     assert {o["id"] for o in added["observations"]} == {1, 2}
+
+
+def test_resume_with_live_workspace_does_not_search_again(app_client, fake):
+    tc = app_client
+    _seed(fake)
+    first = _load(tc, _new_project(tc, _source(tc, URL_A, "a")))
+    before = len(fake.api_calls("/v2/observations"))
+    resumed = _load(tc, first["project"], first["workspace_id"], [])
+    assert len(fake.api_calls("/v2/observations")) == before
+    assert not resumed["first_load"] and resumed["summary"]["new"] == 0
+    assert {o["id"] for o in resumed["observations"]} == {1, 2}

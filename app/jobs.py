@@ -331,7 +331,8 @@ class JobManager:
 
         title_image = None
         if title_spec and title_spec["photo_id"] in paths:
-            title_image = title_background(paths[title_spec["photo_id"]], work / "title.jpg", title_spec.get("position", "center"))
+            title_image = title_background(paths[title_spec["photo_id"]], work / "title.jpg",
+                                           title_spec.get("position", "center"), rotation=title_spec.get("rotation", 0))
 
         prepared = {}
         images = [s for s in plan["slides"] if s["kind"] == "image"]

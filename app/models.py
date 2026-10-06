@@ -13,12 +13,14 @@ from typing import Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 PROJECT_FORMAT = "dikarya-presentation"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 4
 PROJECT_EXTENSION = ".dikarya-presentation.json"
 
 SortKey = Literal["taxonomic", "favorites", "observed_on", "created_at", "name", "original", "random", "custom"]
 Grouping = Literal["none", "kingdom", "phylum", "class", "order", "family", "genus", "source"]
 SOURCE_ID_PATTERN = r"^[A-Za-z0-9_-]{1,40}$"
+Rotation = Literal[0, 90, 180, 270]
+LineField = Literal["scientific", "common_name", "date", "location", "observer"]
 
 _LIMITS = {"sources": 20, "observations": 10_000, "photos": 200, "ignored": 50_000}
 
@@ -98,6 +100,14 @@ class ObservationState(_Model):
     selected_photo_ids: list[int] = Field(default_factory=list, max_length=_LIMITS["photos"])
     known_photo_ids: list[int] = Field(default_factory=list, max_length=_LIMITS["photos"])
     overrides: AnnotationOverrides = Field(default_factory=AnnotationOverrides)
+    # Clockwise rotation in degrees chosen by the user, by photo id. 0 is not stored.
+    rotations: dict[int, Rotation] = Field(default_factory=dict, max_length=_LIMITS["photos"])
+    # Include (true) or leave out (false) a slide line for this observation,
+    # whatever Presentation Settings say. Missing = follow the setting.
+    show_lines: dict[LineField, bool] = Field(default_factory=dict)
+    # The user's order for this observation's photos (ids). Photos not listed
+    # follow in iNaturalist's order. Empty = iNaturalist's order.
+    photo_order: list[int] = Field(default_factory=list, max_length=_LIMITS["photos"])
     source_ids: list[str] = Field(default_factory=list, max_length=_LIMITS["sources"])
     status: Literal["active", "unavailable"] = "active"
     last_inat_name: Optional[str] = Field(default=None, max_length=300)
@@ -152,7 +162,7 @@ class SortRequest(ProjectRequest):
 
 class AddObservationsRequest(ProjectRequest):
     observation_ids: list[int] = Field(max_length=_LIMITS["observations"])
-    # Per-observation photo choice from the review dialog; missing = all photos.
+    # Per-observation photo choice from the review dialog; missing = first photo only.
     selected_photo_ids: dict[str, list[int]] = Field(default_factory=dict)
     placement: Literal["sorted", "append"] = "sorted"
     ignore_ids: list[int] = Field(default_factory=list, max_length=_LIMITS["observations"])

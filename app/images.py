@@ -190,13 +190,19 @@ def prepare_for_slide(src: Path, work_dir: Path) -> PreparedImage:
         return PreparedImage(out, rgb.width, rgb.height, "image/jpeg", "jpg")
 
 
-def title_background(src: Path, out: Path, position: str = "center", max_width: int = 3840) -> PreparedImage:
+ROTATE_CLOCKWISE = {90: Image.Transpose.ROTATE_270, 180: Image.Transpose.ROTATE_180, 270: Image.Transpose.ROTATE_90}
+
+
+def title_background(src: Path, out: Path, position: str = "center", max_width: int = 3840,
+                     rotation: int = 0) -> PreparedImage:
     """Full-bleed 16:9 crop, desaturated and darkened so a title reads on a projector.
 
     The title slide is the only place a photo is ever cropped.
     """
     with Image.open(src) as im:
         im = ImageOps.exif_transpose(im).convert("RGB")
+        if rotation in ROTATE_CLOCKWISE:
+            im = im.transpose(ROTATE_CLOCKWISE[rotation])
         # Never upscale beyond what the source supports for a 16:9 cover crop.
         cover_w = min(im.width, int(im.height * 16 / 9))
         width = max(640, min(max_width, cover_w))

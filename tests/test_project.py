@@ -37,12 +37,13 @@ def test_first_refresh_reports_everything_new_without_adding():
     assert summary["membership"]["2"] == ["a", "b"]
 
 
-def test_add_observations_selects_all_photos_and_respects_choices():
+def test_add_observations_selects_first_photo_and_respects_choices():
     pr = base_project()
     obs = norm(make_obs(1, 47692, photos=((11, 10, 10), (12, 10, 10), (13, 10, 10))), make_obs(2, 47602, photos=((21, 5, 5),)))
     pr = add_observations(pr, [1, 2], obs, {1: ["a"], 2: ["a", "b"]}, selected={2: []}, placement="append")
     st = {s.id: s for s in pr.observations}
-    assert st[1].selected_photo_ids == [11, 12, 13]
+    assert st[1].selected_photo_ids == [11]  # only the first photo by default
+    assert st[1].known_photo_ids == [11, 12, 13]
     assert st[2].selected_photo_ids == []
     assert st[2].source_ids == ["a", "b"]
     assert pr.order == [1, 2]
@@ -74,7 +75,8 @@ def saved_project():
         make_obs(2, 47701, photos=((21, 10, 10),)),
         make_obs(3, 47602, photos=((31, 10, 10), (32, 10, 10))),
     )
-    pr = add_observations(pr, [1, 2, 3], obs, {1: ["a"], 2: ["a"], 3: ["b"]}, placement="append")
+    pr = add_observations(pr, [1, 2, 3], obs, {1: ["a"], 2: ["a"], 3: ["b"]},
+                          selected={1: [11, 12]}, placement="append")
     states = {s.id: s for s in pr.observations}
     states[2] = states[2].model_copy(update={"overrides": AnnotationOverrides(scientific="Psilocybe alimapensis nom. prov.")})
     states[3] = states[3].model_copy(update={"selected_photo_ids": [32]})
@@ -160,7 +162,7 @@ def test_save_load_roundtrip_has_everything_and_no_photos():
     pr = ignore_observations(pr, [99])
     data = project_to_json(pr)
     text = json.dumps(data)
-    assert data["format"] == "dikarya-presentation" and data["schema_version"] == 1
+    assert data["format"] == "dikarya-presentation" and data["schema_version"] == 4
     assert "base64" not in text and "square.jpg" not in text and "faves_count" not in text
     loaded = load_project(json.loads(text))
     assert loaded.order == [3, 1, 2]
@@ -234,3 +236,36 @@ def test_load_normalizes_inconsistent_order_and_dupes():
 ])
 def test_safe_filename(title, expected):
     assert safe_filename(title, ".pptx") == expected
+
+
+def test_v1_file_migrates_and_single_user_url_source_becomes_username():
+    pr = load_project({
+        "format": "dikarya-presentation", "schema_version": 1,
+        "sources": [{"id": "a", "type": "url",
+                     "url": "https://www.inaturalist.org/observations?taxon_id=47170&user_id=alan_rockefeller"}],
+        "observations": [{"id": 1, "selected_photo_ids": [5]}],
+    })
+    assert pr.schema_version == 4
+    assert pr.sources[0].type == "username" and pr.sources[0].username == "alan_rockefeller"
+    assert pr.observations[0].rotations == {} and pr.observations[0].show_lines == {}
+
+
+def test_rotations_are_kept_only_for_known_photos():
+    pr = load_project({
+        "format": "dikarya-presentation", "schema_version": 2,
+        "observations": [{"id": 1, "selected_photo_ids": [5], "known_photo_ids": [5, 6],
+                          "rotations": {"5": 90, "6": 0, "7": 180}}],
+    })
+    assert pr.observations[0].rotations == {5: 90}
+    assert json.loads(json.dumps(project_to_json(pr)))["observations"][0]["rotations"] == {"5": 90}
+    with pytest.raises(ProjectError):
+        load_project({"format": "dikarya-presentation", "schema_version": 2,
+                      "observations": [{"id": 1, "rotations": {"5": 45}}]})
+
+
+def test_photo_order_keeps_only_known_photos_once():
+    pr = load_project({
+        "format": "dikarya-presentation", "schema_version": 4,
+        "observations": [{"id": 1, "known_photo_ids": [5, 6, 7], "photo_order": [7, 9, 7, 5]}],
+    })
+    assert pr.observations[0].photo_order == [7, 5]

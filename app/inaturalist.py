@@ -285,13 +285,28 @@ def default_label(params: dict[str, str], username: str | None = None) -> str:
     return (label or "iNaturalist search")[:80]
 
 
+def single_user_login(params: dict[str, str]) -> str | None:
+    """The login when the search is limited to exactly one user, else None.
+
+    A numeric user id is not a login, so it does not count.
+    """
+    values = {v.strip().lower(): v.strip() for key in ("user_id", "user_login") for v in params.get(key, "").split(",") if v.strip()}
+    if len(values) != 1:
+        return None
+    login = next(iter(values.values()))
+    if not USERNAME_RE.match(login) or login.isdigit():
+        return None
+    return login
+
+
 def build_source(url: str, username: str | None = None) -> dict:
     """A source from an observations URL plus an optional iNaturalist username.
 
     The URL is required. A username restricts the search to that person's
     observations and marks the source as the presenter's own photos (type
-    "username"), which turns the observer credit off by default. Returns the
-    same shape as ``parse_source_input``.
+    "username"), which turns the observer credit off by default. A URL that
+    already filters to one user by login counts as if that username were
+    given. Returns the same shape as ``parse_source_input``.
     """
     username = (username or "").strip().lstrip("@")
     if username and (not USERNAME_RE.match(username) or username.isdigit()):
@@ -308,7 +323,9 @@ def build_source(url: str, username: str | None = None) -> dict:
             "the link to a filtered iNaturalist observations search in the URL box."
         )
     if not username:
-        return parsed
+        username = single_user_login(parsed["params"])
+        if not username:
+            return parsed
     params = dict(parsed["params"])
     existing = params.get("user_id") or params.get("user_login")
     if existing and existing.lower() != username.lower():

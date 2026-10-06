@@ -37,7 +37,9 @@ small JSON project file; the server holds only short-lived temporary data.
    labeled and disabled.
 2. **Select & Organize**: one card per observation with its name, common name,
    date, place, observer, a visible favorite count (♥ 17) and a checkbox for every
-   photo. Sort (taxonomic, favorites, observation date, date added, name,
+   photo. Only the first photo of each observation starts checked; tick others to
+   add more slides. ↺ / ↻ on a photo (or R / Shift+R in the viewer) rotates it on
+   its slide. Sort (taxonomic, favorites, observation date, date added, name,
    iNaturalist order, random), group (kingdom … genus, or source), filter by minimum
    favorites, drag to reorder, edit the name or any annotation line. Click a photo
    to inspect it at 1024 px, zooming to the full-resolution original only when
@@ -49,7 +51,7 @@ small JSON project file; the server holds only short-lived temporary data.
    dividers and annotations. Dragging a photo slide moves its whole observation.
 5. **Generate**: the server downloads the full-quality photos, builds the deck with
    progress (`Downloading photos: 47 / 218`, `Building slides: …`), and offers the
-   download.
+   download, with a button to save the project file next to it.
 
 ## Architecture
 
@@ -129,7 +131,10 @@ The add-source form has two fields: an **observations URL** (required) and an
 - With a username, the search is restricted to that user (`user_id=<login>` is
   added, keeping every other filter) and the source is a `username` source,
   meaning "the presenter's own photos". A URL that already filters by a
-  different user is refused. A bare username typed into the URL box is refused
+  different user is refused. A URL that already filters to exactly one user by
+  login (`user_id=<login>`, `user_login=<login>` or `/observations/<login>`) is
+  treated the same as entering that username; a numeric user id or several
+  users leave it a `url` source. A bare username typed into the URL box is refused
   too, because on its own it would load a whole account.
 - Each source records `type` (`username` | `url`), the original `input`, the
   canonical `url` (always `https://www.inaturalist.org/observations?...`, including
@@ -152,7 +157,7 @@ kB. Photos and full iNaturalist metadata are **not** embedded.
 ```json
 {
   "format": "dikarya-presentation",
-  "schema_version": 1,
+  "schema_version": 4,
   "saved_at": "2026-10-06T03:40:00Z",
   "app_version": "1.0.0",
   "sources": [
@@ -178,6 +183,7 @@ kB. Photos and full iNaturalist metadata are **not** embedded.
   },
   "observations": [
     {"id": 123, "selected_photo_ids": [456, 457], "known_photo_ids": [456, 457, 458],
+     "rotations": {"457": 90}, "show_lines": {"common_name": true}, "photo_order": [457, 456],
      "overrides": {"scientific": "Psilocybe alimapensis nom. prov.", "common_name": null,
                    "date": null, "location": null, "observer": null},
      "source_ids": ["s1a2b3c4d5e6", "s0f9e8d7c6b5"], "status": "active",
@@ -194,6 +200,15 @@ kB. Photos and full iNaturalist metadata are **not** embedded.
   user's explicit choice.
 - `sort.key = "custom"` marks a hand-arranged order. `base_key` records the
   automatic sort that new observations are inserted by.
+- `show_lines`: per-observation choice to show (`true`) or leave out (`false`)
+  a slide line (`scientific`, `common_name`, `date`, `location`, `observer`),
+  whatever the presentation settings say; missing lines follow the settings.
+  Added in schema 3.
+- `photo_order`: the user's order for the observation's photos (dragged on the
+  Select & Organize step); photos not listed follow in iNaturalist's order.
+  Slides use this order. Added in schema 4.
+- `rotations`: clockwise degrees (90, 180 or 270) by photo id; unrotated photos
+  are left out. Added in schema 2; a schema 1 file loads with none.
 - `known_photo_ids` / `last_inat_name` exist only so a refresh can report deleted
   or new photos and changed identifications.
 - **Validation** (`project.load_project`): wrong `format`, missing or non-integer
@@ -225,14 +240,14 @@ Opening a project file (or pressing *Refresh from iNaturalist*):
    - observations that are new to the project (and not previously ignored) are
      **reported, not added**, with per-source counts and a unique total.
 5. A summary dialog shows the counts. When there are new observations it offers
-   **Add selected**, **Add all** or **Ignore**, with all photos checked by
-   default and placement either *by the current sort* (each new observation goes
+   **Add selected**, **Add all** or **Ignore**, with the first photo of each
+   checked by default and placement either *by the current sort* (each new observation goes
    right after its nearest predecessor in the automatic sort, so a hand-made
    order is preserved) or *at the end*. Ignored ids are stored and not offered
    again.
 
-The very first load of a project with no observations adds everything, all
-photos selected, in default taxonomic order.
+The very first load of a project with no observations adds everything, with the
+first photo of each selected, in default taxonomic order.
 
 ## PowerPoint generation rules
 
@@ -243,7 +258,9 @@ photos selected, in default taxonomic order.
 - **Full resolution**: the iNaturalist `original` (typically up to 2048 px) is
   embedded **byte-for-byte**. It is re-encoded (JPEG q95, 4:4:4) only when
   necessary: EXIF rotation (PowerPoint ignores the orientation tag), CMYK, or a
-  format PowerPoint cannot show (WebP).
+  format PowerPoint cannot show (WebP). A photo the user rotated is still
+  embedded unchanged; the picture is turned on the slide (so it can be turned
+  back in PowerPoint) and sized so the turned photo fits without cropping.
 - **Annotation** (lower-left, small margin, no backing box): the scientific/taxon
   name in *italic* ~28 pt. Optional lines below it at 18 pt: English common name,
   date (`November 14, 2026`), iNaturalist place description, observer
@@ -411,6 +428,5 @@ it under the terms of the GNU General Public License as published by the Free
 Software Foundation, either version 3 of the License, or (at your option) any
 later version. See [LICENSE](LICENSE) for the full text.
 
-This program is distributed in the hope that it will be useful, but WITHOUT ANY
-WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
-PARTICULAR PURPOSE.
+This program comes with a warranty: I guarantee it will work perfectly. If it
+doesn't do exactly what you want, let me know and I'll add the feature.
