@@ -17,6 +17,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from starlette.concurrency import run_in_threadpool
 
 from . import __version__
 from .config import Settings, get_settings
@@ -242,7 +243,7 @@ def create_app(settings: Settings | None = None, services: Services | None = Non
         except (ValueError, UnicodeDecodeError):
             raise HTTPException(422, "That file is not valid JSON.") from None
         try:
-            project = load_project(data)
+            project = await run_in_threadpool(load_project, data)
         except ProjectError as exc:
             raise HTTPException(422, str(exc)) from None
         return {"project": project.model_dump(mode="json"), "observer_default": observer_default(project)}
@@ -251,7 +252,7 @@ def create_app(settings: Settings | None = None, services: Services | None = Non
     async def export_project(request: Request):
         try:
             data = json.loads(await request.body())
-            project = load_project(data.get("project") if isinstance(data, dict) else None)
+            project = await run_in_threadpool(load_project, data.get("project") if isinstance(data, dict) else None)
         except ProjectError as exc:
             raise HTTPException(422, str(exc)) from None
         except (ValueError, UnicodeDecodeError):
@@ -261,7 +262,7 @@ def create_app(settings: Settings | None = None, services: Services | None = Non
     # -- jobs ----------------------------------------------------------------
 
     @app.post("/api/load")
-    async def start_load(body: LoadRequest, request: Request):
+    def start_load(body: LoadRequest, request: Request):
         project = checked(body.project)
         try:
             job = svc.jobs.start_load(client_key(request), project, body.workspace_id, body.refresh_source_ids)
@@ -270,7 +271,7 @@ def create_app(settings: Settings | None = None, services: Services | None = Non
         return job.public()
 
     @app.post("/api/generate")
-    async def start_generate(body: ProjectRequest, request: Request):
+    def start_generate(body: ProjectRequest, request: Request):
         project = checked(body.project)
         try:
             job = svc.jobs.start_generate(client_key(request), project, body.workspace_id)
@@ -307,35 +308,41 @@ def create_app(settings: Settings | None = None, services: Services | None = Non
     # -- organising ----------------------------------------------------------
 
     @app.post("/api/sort")
-    async def sort(body: SortRequest):
+    def sort(body: SortRequest):
         project = checked(body.project)
         ws = workspace(body.workspace_id)
         order = sort_ids(project.order, ws["observations"], project, body.key, body.direction, ws, body.seed)
         return {"order": order}
 
     @app.post("/api/observations/add")
-    async def add(body: AddObservationsRequest):
+    def add(body: AddObservationsRequest):
         project = checked(body.project)
         ws = workspace(body.workspace_id)
+        # Only sources still in the project count. An observation that only a
+        # removed source matched is not added; it would otherwise end up with no
+        # source and show in every view.
+        order_ids = {s.id: i for i, s in enumerate(project.sources)}
         membership: dict[int, list[str]] = {}
         for sid, ids in ws["source_results"].items():
+            if sid not in order_ids:
+                continue
             for oid in ids:
                 membership.setdefault(oid, []).append(sid)
-        order_ids = {s.id: i for i, s in enumerate(project.sources)}
         for oid in membership:
-            membership[oid].sort(key=lambda s: order_ids.get(s, 99))
+            membership[oid].sort(key=lambda s: order_ids[s])
+        observation_ids = [i for i in body.observation_ids if i in membership]
         selected = {}
         for k, v in body.selected_photo_ids.items():
             if str(k).isdigit():
                 selected[int(k)] = [int(p) for p in v][:200]
-        project = add_observations(project, body.observation_ids, ws["observations"], membership,
+        project = add_observations(project, observation_ids, ws["observations"], membership,
                                    selected, body.placement, ws)
         if body.ignore_ids:
             project = ignore_observations(project, body.ignore_ids)
         return {"project": project.model_dump(mode="json")}
 
     @app.post("/api/plan")
-    async def plan(body: ProjectRequest):
+    def plan(body: ProjectRequest):
         project = checked(body.project)
         ws = workspace(body.workspace_id)
         return build_slide_plan(project, ws["observations"], settings.max_image_slides)

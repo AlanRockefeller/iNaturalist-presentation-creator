@@ -274,6 +274,14 @@
     p.order = p.order.filter((id) => !dropped.has(id));
     if (p.settings.title_photo && dropped.has(p.settings.title_photo.observation_id)) p.settings.title_photo = null;
     S.loadedSources.delete(sourceId);
+    if (S.pendingNew) {
+      // New observations waiting for review that only this source matched can no longer be added.
+      const m = S.pendingNew.membership || {};
+      S.pendingNew.new_ids = (S.pendingNew.new_ids || []).filter((id) =>
+        (m[String(id)] || []).some((sid) => sid !== sourceId && p.sources.some((s) => s.id === sid)));
+      if (S.pendingNew.new_by_source) delete S.pendingNew.new_by_source[sourceId];
+      if (!S.pendingNew.new_ids.length) S.pendingNew = null;
+    }
     reindex();
     return dropped.size;
   }

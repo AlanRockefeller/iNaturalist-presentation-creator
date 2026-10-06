@@ -1,10 +1,12 @@
+import httpx
 import pytest
 
+from app.images import MediaFetcher
 from app.inaturalist import (
     INatError, OBSERVATION_FIELDS, TooManyResults, format_taxon_name, normalize_observation,
 )
 from app.ratelimit import BudgetExceeded, ByteBudget, DailyBudget, RateLimiter
-from tests.conftest import make_obs
+from tests.conftest import PHOTO_HOST, make_obs
 
 
 def test_pagination_uses_max_per_page_and_fields(client, fake):
@@ -158,3 +160,15 @@ def test_rejected_filter_is_named(client, fake):
     with pytest.raises(INatError) as exc:
         client.search({"verifiable": "any"}, 100)
     assert '"verifiable" filter' in str(exc.value)
+
+
+def test_spent_byte_budget_stops_photo_downloads(settings, fake):
+    fake.add(make_obs(1, 47170, photos=((11, 800, 600), (12, 800, 600))))
+    budget = ByteBudget(10, 10 ** 12)
+    media = MediaFetcher(settings, budget, http=httpx.Client(transport=httpx.MockTransport(fake.handler)))
+    base = f"https://{PHOTO_HOST}/photos/{{}}/square.jpg"
+    media.fetch_original(11, base.format(11))  # larger than the allowance: it goes over once
+    assert budget.remaining()[0] == 0
+    with pytest.raises(BudgetExceeded):
+        media.fetch_original(12, base.format(12))
+    assert len(fake.photo_requests) == 1

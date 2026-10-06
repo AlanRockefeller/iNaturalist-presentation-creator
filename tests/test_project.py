@@ -193,6 +193,11 @@ def test_save_load_roundtrip_has_everything_and_no_photos():
         {"id": "../../etc", "type": "url", "url": URL_MX}]}, "invalid"),
     ({"format": "dikarya-presentation", "schema_version": 1, "sources": [
         {"id": "x", "type": "url", "url": URL_MX}, {"id": "x", "type": "url", "url": URL_CR}]}, "duplicate"),
+    # A username source with a bad URL is refused, not widened to the whole account.
+    ({"format": "dikarya-presentation", "schema_version": 1, "sources": [
+        {"id": "x", "type": "username", "username": "alan_rockefeller", "url": "ignored"}]}, "not valid"),
+    ({"format": "dikarya-presentation", "schema_version": 1, "sources": [
+        {"id": "x", "type": "username", "username": "alan_rockefeller", "url": ""}]}, "not valid"),
     ({"format": "dikarya-presentation", "schema_version": 1, "observations": [{"id": i} for i in range(1, 10_002)]}, "invalid"),
 ])
 def test_invalid_project_files_rejected(data, msg):
@@ -204,7 +209,8 @@ def test_invalid_project_files_rejected(data, msg):
 def test_load_normalizes_inconsistent_order_and_dupes():
     pr = load_project({
         "format": "dikarya-presentation", "schema_version": 1,
-        "sources": [{"id": "a", "type": "username", "username": USER, "url": "ignored", "input": USER}],
+        "sources": [{"id": "a", "type": "username", "username": USER,
+                     "url": "https://www.inaturalist.org/observations?user_id=alan_rockefeller", "input": USER}],
         "observations": [{"id": 1, "selected_photo_ids": [5], "source_ids": ["a", "zzz"]}, {"id": 2}, {"id": 1}],
         "order": [2, 2, 77],
         "settings": {"title_photo": {"observation_id": 42, "photo_id": 1}},

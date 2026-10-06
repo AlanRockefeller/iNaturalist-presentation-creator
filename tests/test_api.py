@@ -226,3 +226,21 @@ def test_user_url_with_any_values_loads_only_matching(app_client, fake):
 def test_healthz_reports_active_job_counts(app_client, fake):
     data = app_client.get("/healthz").json()
     assert data["ok"] is True and data["jobs"] == {"loading": 0, "generating": 0}
+
+
+def test_add_skips_observations_only_a_removed_source_matched(app_client, fake):
+    tc = app_client
+    _seed(fake)
+    project = _new_project(tc, _source(tc, URL_A, "a"))
+    first = _load(tc, project)
+    project = first["project"]
+    project["sources"].append(_source(tc, URL_B, "b"))
+    second = _load(tc, project, first["workspace_id"], ["b"])
+    assert sorted(second["summary"]["new_ids"]) == [3, 4]
+    project = second["project"]
+    project["sources"] = [s for s in project["sources"] if s["id"] != "b"]  # removed before review
+    added = tc.post("/api/observations/add", json={
+        "project": project, "workspace_id": second["workspace_id"],
+        "observation_ids": [3, 4], "selected_photo_ids": {}, "placement": "append", "ignore_ids": [],
+    }).json()["project"]
+    assert {o["id"] for o in added["observations"]} == {1, 2}

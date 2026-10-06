@@ -47,12 +47,14 @@ set -Eeuo pipefail
 # Run from a private copy. Bash reads a script as it executes, so if the sync
 # step rewrote this file (it lives inside the tree it installs) the rest of the
 # run would execute whatever bytes the new file has at that offset.
-if [[ -z ${PRESENTATIONS_INSTALLER_COPY:-} ]]; then
+# The copy is recognised by its own path, never by a flag alone, so a variable
+# left in the environment cannot make this delete the real script.
+if [[ ${PRESENTATIONS_INSTALLER_COPY:-} != "$0" || -z ${PRESENTATIONS_INSTALLER_PATH:-} ]]; then
   self_copy=$(mktemp /tmp/install-presentations.run.XXXXXX)
   cp -- "$0" "$self_copy"
-  PRESENTATIONS_INSTALLER_COPY=1 PRESENTATIONS_INSTALLER_PATH=$(realpath "$0") exec bash "$self_copy" "$@"
+  PRESENTATIONS_INSTALLER_COPY=$self_copy PRESENTATIONS_INSTALLER_PATH=$(realpath "$0") exec bash "$self_copy" "$@"
 fi
-rm -f -- "$0"  # the private copy; bash already has it open
+rm -f -- "$PRESENTATIONS_INSTALLER_COPY"  # the private copy; bash already has it open
 
 APP_DIR=/var/www/presentations
 # Default source: the checkout this script lives in, if it is one; otherwise

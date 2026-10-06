@@ -12,7 +12,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from .inaturalist import SourceError, build_source, parse_source_input, username_url
+from .inaturalist import SourceError, build_source, parse_source_input
 from .models import (
     PROJECT_FORMAT, SCHEMA_VERSION, ObservationState, Project, Source,
 )
@@ -77,11 +77,7 @@ def normalize_project(project: Project) -> Project:
             if src.type == "username":
                 if not src.username:
                     raise SourceError("a username source needs a username")
-                try:
-                    parsed = build_source(src.url, src.username)
-                except SourceError:
-                    # Missing or unusable URL: fall back to all of this user's observations.
-                    parsed = build_source(username_url(src.username), src.username)
+                parsed = build_source(src.url, src.username)
             else:
                 parsed = parse_source_input(src.url)
         except SourceError as exc:
@@ -111,7 +107,8 @@ def normalize_project(project: Project) -> Project:
             "source_ids": [s for s in dict.fromkeys(st.source_ids) if s in source_ids],
         }))
     order = [i for i in dict.fromkeys(project.order) if i in seen_obs]
-    order += [s.id for s in states if s.id not in set(order)]
+    in_order = set(order)
+    order += [s.id for s in states if s.id not in in_order]
     settings = project.settings
     if settings.title_photo and settings.title_photo.observation_id not in seen_obs:
         settings = settings.model_copy(update={"title_photo": None})
@@ -228,7 +225,8 @@ def refresh_project(
         current = [p["id"] for p in obs.get("photos", [])]
         current_set = set(current)
         missing = [pid for pid in st.selected_photo_ids if pid not in current_set]
-        new_photos = [pid for pid in current if pid not in set(st.known_photo_ids)]
+        known_photos = set(st.known_photo_ids)
+        new_photos = [pid for pid in current if pid not in known_photos]
         if missing:
             summary["missing_photos"][str(st.id)] = missing
         if new_photos and st.known_photo_ids:
@@ -296,7 +294,8 @@ def add_observations(
         obs = observations[oid]
         photo_ids = [p["id"] for p in obs.get("photos", [])]
         chosen = selected.get(oid)
-        chosen = photo_ids if chosen is None else [p for p in chosen if p in set(photo_ids)]
+        available = set(photo_ids)
+        chosen = photo_ids if chosen is None else [p for p in chosen if p in available]
         new_states.append(ObservationState(
             id=oid,
             selected_photo_ids=chosen,
@@ -313,7 +312,8 @@ def add_observations(
         order = project.order + new_ids
     else:
         order = insert_sorted(project.order, new_ids, observations, project, workspace)
-    ignored = [i for i in project.ignored_observation_ids if i not in set(new_ids)]
+    added = set(new_ids)
+    ignored = [i for i in project.ignored_observation_ids if i not in added]
     return project.model_copy(update={"order": order, "ignored_observation_ids": ignored})
 
 

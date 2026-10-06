@@ -82,7 +82,9 @@ class MediaFetcher:
             if cached:
                 os.utime(cached)  # refresh TTL
                 return cached
-            self.budget.check(0)
+            # Refuse once the allowance is spent. check(0) can never fail because
+            # remaining() clamps at zero, so ask for at least one byte.
+            self.budget.check(1)
             ext = url.rsplit(".", 1)[-1].lower()
             final = self.cache_dir / f"{int(photo_id)}.{ext}"
             fd, tmp = tempfile.mkstemp(dir=self.cache_dir, prefix=f"{int(photo_id)}.", suffix=".part")
@@ -104,18 +106,20 @@ class MediaFetcher:
                                 fh.seek(0)
                                 fh.truncate()
                                 total = 0
-                                for chunk in resp.iter_bytes(256 * 1024):
-                                    total += len(chunk)
-                                    if total > self.settings.max_image_bytes:
-                                        raise ImageFetchError(f"Photo {photo_id} is too large.")
-                                    fh.write(chunk)
+                                try:
+                                    for chunk in resp.iter_bytes(256 * 1024):
+                                        total += len(chunk)
+                                        if total > self.settings.max_image_bytes:
+                                            raise ImageFetchError(f"Photo {photo_id} is too large.")
+                                        fh.write(chunk)
+                                finally:
+                                    # Count every byte received, even from an aborted attempt.
+                                    self.budget.add(total)
                             break
                         except (httpx.HTTPError,) as exc:
-                            self.budget.add(total)
                             if attempt == 2:
                                 raise ImageFetchError(f"Photo {photo_id} could not be downloaded.") from exc
                             time.sleep(2 * (attempt + 1))
-                self.budget.add(total)
                 _verify_image(Path(tmp), photo_id)
                 os.replace(tmp, final)
                 return final

@@ -158,7 +158,8 @@ def insert_sorted(
     direction = sort.direction if sort.key not in ("custom", "random") else sort.base_direction
     if key in ("custom", "random"):
         key, direction = "taxonomic", "asc"
-    new_set = [i for i in dict.fromkeys(new_ids) if i not in set(current_order)]
+    existing = set(current_order)
+    new_set = [i for i in dict.fromkeys(new_ids) if i not in existing]
     full = sort_ids(list(current_order) + new_set, obs_map, project, key, direction, workspace)
     order = list(current_order)
     new_lookup = set(new_set)
