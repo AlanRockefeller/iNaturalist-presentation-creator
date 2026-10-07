@@ -38,7 +38,8 @@ def _deck(settings_kw=None, sources=None):
         make_obs(3, 47602, faves=2, user="carol", photos=((301, 1000, 1000),)),
     )
     pr = project(*(sources or [source("a", "alice")]), **(settings_kw or {}))
-    pr = add_observations(pr, [1, 2, 3], obs, {1: ["a"], 2: ["a"], 3: ["a"]}, placement="append")
+    pr = add_observations(pr, [1, 2, 3], obs, {1: ["a"], 2: ["a"], 3: ["a"]},
+                          selected={1: [101, 102, 103]}, placement="append")
     return pr, obs
 
 
@@ -109,6 +110,18 @@ def test_annotation_fields_overrides_and_observer_rules():
     edited = st[1].model_copy(update={"overrides": AnnotationOverrides(scientific="Hygrocybe sp. nov.", location="", date="Fall 2026")})
     texts = [l["text"] for l in annotation_lines(obs[1], edited, pr)]
     assert texts == ["Hygrocybe sp. nov.", "Witch's Hat", "Fall 2026"]
+
+
+def test_per_observation_lines_override_the_settings():
+    pr, obs = _deck()  # defaults: scientific on, common name and date off
+    st = {s.id: s for s in pr.observations}
+    picked = st[1].model_copy(update={"show_lines": {"common_name": True, "scientific": False}})
+    assert [l["text"] for l in annotation_lines(obs[1], picked, pr)] == ["Witch's Hat"]
+    assert [l["text"] for l in annotation_lines(obs[1], st[1], pr)] == ["Hygrocybe conica"]  # others follow settings
+    pr = pr.model_copy(update={"observations": [picked if s.id == 1 else s for s in pr.observations]})
+    plan = build_slide_plan(pr, obs)
+    first = next(s for s in plan["slides"] if s.get("observation_id") == 1)
+    assert [l["text"] for l in first["lines"]] == ["Witch's Hat"]
 
 
 def test_format_date():
@@ -273,3 +286,78 @@ def test_speaker_notes_have_link_not_faves(tmp_path):
     notes = prs.slides[1].notes_slide.notes_text_frame.text
     assert "https://www.inaturalist.org/observations/1" in notes and "CC BY" in notes
     assert "17" not in notes
+
+
+def test_rotated_photo_fits_slide_without_crop_or_reencoding(tmp_path):
+    pr, obs = _deck()
+    st = {s.id: s for s in pr.observations}
+    st[1] = st[1].model_copy(update={"rotations": {101: 90, 102: 180}})
+    pr = pr.model_copy(update={"observations": list(st.values())})
+    imgs = _images(tmp_path, obs)
+    plan = build_slide_plan(pr, obs)
+    spec = {s["photo_id"]: s for s in plan["slides"] if s["kind"] == "image"}
+    assert (spec[101]["rotation"], spec[101]["width"], spec[101]["height"]) == (90, 3000, 4000)
+    assert (spec[102]["rotation"], spec[102]["width"], spec[102]["height"]) == (180, 2000, 3000)
+    out = tmp_path / "deck.pptx"
+    write_pptx(plan, imgs, None, out)
+    prs = Presentation(str(out))
+    slides = {s["photo_id"]: prs.slides[i] for i, s in enumerate(plan["slides"]) if s["kind"] == "image"}
+    (pic,) = _pictures(slides[101])
+    assert pic.rotation == 90 and pic.crop_left == pic.crop_top == 0
+    assert abs(pic.width / pic.height - 4000 / 3000) < 0.01  # frame is the unturned photo
+    # Turned about its centre, it shows 3000 x 4000 and fills the slide height.
+    shown_w, shown_h = pic.height, pic.width
+    cx, cy = pic.left + pic.width / 2, pic.top + pic.height / 2
+    assert abs(cx - prs.slide_width / 2) <= 2 and abs(cy - prs.slide_height / 2) <= 2
+    assert shown_h <= prs.slide_height and prs.slide_height - shown_h <= 2 and shown_w <= prs.slide_width
+    (pic,) = _pictures(slides[102])
+    assert pic.rotation == 180
+    with zipfile.ZipFile(out) as z:
+        media = {z.read(i) for i in z.infolist() if i.filename.startswith("ppt/media/")}
+    assert media == {imgs[pid].path.read_bytes() for pid in imgs}
+
+
+def test_title_background_follows_rotation(tmp_path):
+    src = tmp_path / "t.jpg"
+    im = Image.new("RGB", (1000, 2000), (255, 0, 0))
+    im.paste((0, 0, 255), (0, 0, 1000, 1000))  # top half blue
+    im.save(src, "JPEG", quality=95)
+    out = title_background(src, tmp_path / "bg.jpg", rotation=90)
+    with Image.open(out.path) as bg:
+        left = bg.getpixel((10, bg.height // 2))
+        right = bg.getpixel((bg.width - 10, bg.height // 2))
+    assert right[2] > right[0] and left[0] > left[2]  # turned clockwise: blue top is now on the right
+
+
+def test_custom_photo_order_sets_slide_order():
+    pr, obs = _deck()
+    st = {s.id: s for s in pr.observations}
+    st[1] = st[1].model_copy(update={"photo_order": [103, 999]})  # 999 is not a photo of it
+    pr = pr.model_copy(update={"observations": list(st.values())})
+    plan = build_slide_plan(pr, obs)
+    assert [s["photo_id"] for s in plan["slides"] if s.get("observation_id") == 1] == [103, 101, 102]
+
+
+def test_only_expected_image_formats_are_parsed(tmp_path):
+    from app.images import ImageFetchError, _verify_image, open_image
+
+    for fmt in ("JPEG", "PNG", "GIF", "WEBP"):
+        path = tmp_path / f"ok.{fmt.lower()}.jpg"
+        Image.new("RGB", (20, 10), (1, 2, 3)).save(path, fmt)
+        _verify_image(path, 1)
+        with open_image(path) as im:
+            assert im.format == fmt
+    mpo = tmp_path / "mpo.jpg"
+    Image.new("RGB", (20, 10)).save(mpo, "MPO", save_all=True, append_images=[Image.new("RGB", (20, 10))])
+    with open_image(mpo) as im:
+        assert im.format == "MPO"
+
+    eps = tmp_path / "evil.jpg"  # EPS would hand the file to Ghostscript
+    eps.write_bytes(b"%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 10 10\nshowpage\n")
+    tiff = tmp_path / "tiff.jpg"
+    Image.new("RGB", (20, 10)).save(tiff, "TIFF")
+    for bad in (eps, tiff):
+        with pytest.raises(ImageFetchError):
+            _verify_image(bad, 7)
+        with pytest.raises(Exception):
+            prepare_for_slide(bad, tmp_path / "work")

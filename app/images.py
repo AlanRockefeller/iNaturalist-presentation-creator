@@ -31,11 +31,21 @@ from .ratelimit import ByteBudget
 log = logging.getLogger(__name__)
 
 Image.MAX_IMAGE_PIXELS = 120_000_000  # bound decompression bombs
+# The formats iNaturalist serves. Pillow picks a parser from a file's contents,
+# not its name, so only these parsers are ever tried on downloaded bytes: a
+# file named .jpg that holds anything else (EPS, which runs Ghostscript, TIFF,
+# and so on) is rejected before any other parser touches it.
+IMAGE_FORMATS = ("JPEG", "PNG", "GIF", "WEBP")  # parsers Image.open may try
+DETECTED_FORMATS = {"JPEG", "MPO", "PNG", "GIF", "WEBP"}  # MPO comes from the JPEG parser
 EMBEDDABLE = {"JPEG": ("image/jpeg", "jpg"), "MPO": ("image/jpeg", "jpg"), "PNG": ("image/png", "png"), "GIF": ("image/gif", "gif")}
 
 
 class ImageFetchError(Exception):
     """A photo could not be downloaded. Message is user-safe."""
+
+
+class DownloadCancelled(Exception):
+    """The job that wanted this photo was cancelled."""
 
 
 @dataclass
@@ -70,8 +80,16 @@ class MediaFetcher:
                 return p
         return None
 
-    def fetch_original(self, photo_id: int, api_url: str) -> Path:
-        """Download (or reuse the cached) original of a photo; returns its path."""
+    def fetch_original(self, photo_id: int, api_url: str, cancelled=None) -> Path:
+        """Download (or reuse the cached) original of a photo; returns its path.
+
+        ``cancelled`` (optional, returns bool) is checked before the download and
+        between chunks and retries; DownloadCancelled is raised when it is true.
+        """
+        def stop_if_cancelled():
+            if cancelled and cancelled():
+                raise DownloadCancelled()
+
         url = photo_url(api_url, "original")
         if not url:
             raise ImageFetchError(f"Photo {photo_id} has an untrusted URL and was skipped.")
@@ -82,6 +100,7 @@ class MediaFetcher:
             if cached:
                 os.utime(cached)  # refresh TTL
                 return cached
+            stop_if_cancelled()
             # Refuse once the allowance is spent. check(0) can never fail because
             # remaining() clamps at zero, so ask for at least one byte.
             self.budget.check(1)
@@ -108,6 +127,7 @@ class MediaFetcher:
                                 total = 0
                                 try:
                                     for chunk in resp.iter_bytes(256 * 1024):
+                                        stop_if_cancelled()
                                         total += len(chunk)
                                         if total > self.settings.max_image_bytes:
                                             raise ImageFetchError(f"Photo {photo_id} is too large.")
@@ -120,6 +140,7 @@ class MediaFetcher:
                             if attempt == 2:
                                 raise ImageFetchError(f"Photo {photo_id} could not be downloaded.") from exc
                             time.sleep(2 * (attempt + 1))
+                            stop_if_cancelled()
                 _verify_image(Path(tmp), photo_id)
                 os.replace(tmp, final)
                 return final
@@ -152,9 +173,18 @@ class MediaFetcher:
             total -= size
 
 
+def open_image(path: Path) -> Image.Image:
+    """Image.open limited to IMAGE_FORMATS. Use it for every downloaded file."""
+    im = Image.open(path, formats=IMAGE_FORMATS)
+    if im.format not in DETECTED_FORMATS:  # belt and braces: formats= already ensures this
+        im.close()
+        raise Image.UnidentifiedImageError(f"unexpected image format {im.format!r}")
+    return im
+
+
 def _verify_image(path: Path, photo_id: int) -> None:
     try:
-        with Image.open(path) as im:
+        with open_image(path) as im:
             im.verify()
     except Exception as exc:  # Pillow raises many types for bad data
         raise ImageFetchError(f"Photo {photo_id} is not a readable image.") from exc
@@ -162,7 +192,7 @@ def _verify_image(path: Path, photo_id: int) -> None:
 
 def prepare_for_slide(src: Path, work_dir: Path) -> PreparedImage:
     """Return something PowerPoint can embed, re-encoding only when necessary."""
-    with Image.open(src) as im:
+    with open_image(src) as im:
         fmt = (im.format or "").upper()
         orientation = 1
         try:
@@ -190,13 +220,19 @@ def prepare_for_slide(src: Path, work_dir: Path) -> PreparedImage:
         return PreparedImage(out, rgb.width, rgb.height, "image/jpeg", "jpg")
 
 
-def title_background(src: Path, out: Path, position: str = "center", max_width: int = 3840) -> PreparedImage:
+ROTATE_CLOCKWISE = {90: Image.Transpose.ROTATE_270, 180: Image.Transpose.ROTATE_180, 270: Image.Transpose.ROTATE_90}
+
+
+def title_background(src: Path, out: Path, position: str = "center", max_width: int = 3840,
+                     rotation: int = 0) -> PreparedImage:
     """Full-bleed 16:9 crop, desaturated and darkened so a title reads on a projector.
 
     The title slide is the only place a photo is ever cropped.
     """
-    with Image.open(src) as im:
+    with open_image(src) as im:
         im = ImageOps.exif_transpose(im).convert("RGB")
+        if rotation in ROTATE_CLOCKWISE:
+            im = im.transpose(ROTATE_CLOCKWISE[rotation])
         # Never upscale beyond what the source supports for a 16:9 cover crop.
         cover_w = min(im.width, int(im.height * 16 / 9))
         width = max(640, min(max_width, cover_w))

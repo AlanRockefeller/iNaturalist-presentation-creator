@@ -48,21 +48,31 @@ class RateLimiter:
         self._sleep = sleep
         self._lock = threading.Lock()
         self._next = 0.0
+        self._hold = 0.0  # no request may start before this (backoff after a 429)
 
     def wait(self) -> float:
-        with self._lock:
-            now = self._clock()
-            start = max(now, self._next)
-            self._next = start + self.min_interval
-        delay = start - now
-        if delay > 0:
-            self._sleep(delay)
-        return delay
+        waited = 0.0
+        while True:
+            with self._lock:
+                now = self._clock()
+                start = max(now, self._next, self._hold)
+                self._next = start + self.min_interval
+            delay = start - now
+            if delay > 0:
+                self._sleep(delay)
+                waited += delay
+            with self._lock:
+                # A penalty that arrived while this thread slept also applies to it:
+                # queue again behind the new hold instead of going at the old time.
+                if self._hold <= start:
+                    return waited
 
     def penalize(self, seconds: float) -> None:
-        """Push every future request back, e.g. after a 429 with Retry-After."""
+        """Push every request back, including ones already waiting, e.g. after a
+        429 with Retry-After."""
         with self._lock:
-            self._next = max(self._next, self._clock() + max(0.0, seconds))
+            self._hold = max(self._hold, self._clock() + max(0.0, seconds))
+            self._next = max(self._next, self._hold)
 
 
 class DailyBudget:

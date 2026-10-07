@@ -166,11 +166,17 @@ html.dark .badge.url { background: #355245; color: var(--text); }
 .group-head { font-family: var(--serif); font-size: 1.45rem; font-weight: 600; margin: 14px 2px 0; padding-bottom: 4px; border-bottom: 2px solid var(--journal-gold); display: flex; align-items: baseline; gap: 10px; }
 .group-head small { font-family: var(--sans); font-size: .72rem; text-transform: uppercase; letter-spacing: .08em; color: var(--text-mute); font-weight: 600; }
 .group-head.italic span.name { font-style: italic; }
+.group-head .group-remove { margin-left: auto; align-self: center; width: 28px; height: 28px; padding: 0; border: 1px solid transparent; border-radius: 6px; background: none; color: var(--danger); font: 700 1.05rem/1 var(--sans); font-style: normal; cursor: pointer; }
+.group-head .group-remove:hover, .group-head .group-remove:focus-visible { border-color: var(--danger); background: color-mix(in srgb, var(--danger) 12%, transparent); }
 
 .obs { display: grid; grid-template-columns: 28px 26px minmax(220px, 330px) 1fr; gap: 12px; padding: 12px 14px 12px 6px; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); content-visibility: auto; contain-intrinsic-size: auto 150px; }
 .obs.filtered { opacity: .45; }
 .obs.unavailable { border-style: dashed; background: var(--panel-2); }
 .obs.dragging { opacity: .4; }
+.thumb[draggable=true] { cursor: grab; }
+.thumb.dragging { opacity: .4; }
+.thumb.drop-before { box-shadow: -4px 0 0 var(--journal-gold); }
+.thumb.drop-after { box-shadow: 4px 0 0 var(--journal-gold); }
 .obs.drop-before { box-shadow: 0 -3px 0 var(--journal-gold); }
 .obs.drop-after { box-shadow: 0 3px 0 var(--journal-gold); }
 .handle { cursor: grab; color: var(--text-mute); font-size: 1.2rem; user-select: none; display: flex; flex-direction: column; align-items: center; gap: 4px; padding-top: 2px; }
@@ -195,20 +201,27 @@ html.dark .chip.warn { background: #4a241c; color: #ffb4a4; border-color: #7a3a2
 .obs-actions { display: flex; gap: 8px; margin-top: 4px; font-size: .78rem; }
 .obs-actions button, .obs-actions a { background: none; border: 0; padding: 0; color: var(--accent); cursor: pointer; font: inherit; text-decoration: underline; }
 .ann-edit { display: grid; grid-template-columns: auto 1fr; gap: 4px 8px; margin-top: 6px; font-size: .8rem; align-items: center; }
-.ann-edit input { min-height: 30px; padding: 4px 8px; font-size: .85rem; }
+.ann-edit input[type=text] { min-height: 30px; padding: 4px 8px; font-size: .85rem; }
+.ann-edit .ann-line { display: flex; align-items: center; gap: 6px; white-space: nowrap; cursor: pointer; }
+.ann-edit .ann-line input { margin: 0; accent-color: var(--journal-green); }
 .thumbs { display: flex; flex-wrap: wrap; gap: 8px; align-content: flex-start; }
 .thumb { position: relative; width: 112px; height: 112px; border-radius: 8px; overflow: hidden; background: var(--panel-2); border: 2px solid transparent; cursor: zoom-in; flex: none; }
 .thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .thumb.selected { border-color: var(--journal-gold); }
 .thumb:not(.selected) img { opacity: .38; filter: grayscale(.6); }
 .thumb input { position: absolute; top: 5px; left: 5px; width: 18px; height: 18px; margin: 0; accent-color: var(--journal-green); cursor: pointer; }
+.thumb .rot-btns { position: absolute; top: 4px; right: 4px; display: flex; gap: 3px; opacity: 0; transition: opacity .12s; }
+.thumb:hover .rot-btns, .thumb:focus-within .rot-btns { opacity: 1; }
+@media (hover: none) { .thumb .rot-btns { opacity: 1; } }
+.thumb .rot-btns button { width: 24px; height: 24px; padding: 0; border: 0; border-radius: 5px; background: rgba(0, 0, 0, .62); color: #fff; font-size: 15px; line-height: 24px; cursor: pointer; }
+.thumb .rot-btns button:hover { background: var(--journal-gold); color: var(--journal-dark); }
 .thumb.missing { border-color: var(--danger); cursor: default; display: flex; align-items: center; justify-content: center; text-align: center; font-size: .72rem; color: var(--danger); padding: 6px; }
 .thumb.title-pick::after { content: "Title"; position: absolute; bottom: 4px; right: 4px; font-size: .62rem; background: var(--journal-gold); color: var(--journal-dark); padding: 0 5px; border-radius: 4px; font-weight: 700; }
 .sentinel { height: 1px; }
 
 /* ---- title photo ---- */
 .title-photo { display: flex; gap: 14px; align-items: flex-start; font-weight: 400; }
-.title-photo-preview { width: 240px; aspect-ratio: 16 / 9; border-radius: 8px; overflow: hidden; background: #111; display: flex; align-items: center; justify-content: center; flex: none; border: 1px solid var(--line); }
+.title-photo-preview { position: relative; container-type: size; width: 240px; aspect-ratio: 16 / 9; border-radius: 8px; overflow: hidden; background: #111; display: flex; align-items: center; justify-content: center; flex: none; border: 1px solid var(--line); }
 .title-photo-preview img { width: 100%; height: 100%; object-fit: cover; filter: saturate(.55) brightness(.5); }
 .picker-scroll { max-height: 62vh; overflow-y: auto; }
 .picker-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 8px; padding: 4px; }
@@ -222,6 +235,18 @@ html.dark .chip.warn { background: #4a241c; color: #ffb4a4; border-color: #7a3a2
 .pslide .num { position: absolute; top: -9px; left: -6px; background: var(--journal-dark); color: #fff; font-size: .66rem; font-weight: 700; padding: 1px 6px; border-radius: 6px; z-index: 2; }
 .slide { aspect-ratio: 16 / 9; width: 100%; position: relative; overflow: hidden; border-radius: 4px; container-type: size; box-shadow: 0 1px 4px rgba(0, 0, 0, .35); content-visibility: auto; contain-intrinsic-size: auto 135px; }
 .slide.bg-black { background: #000; color: #fff; }
+/* User rotation, clockwise. In the 16:9 slide boxes a quarter turn swaps the
+   image box's width and height (container units) around the centre. */
+.rot-90 { transform: rotate(90deg); }
+.rot-180 { transform: rotate(180deg); }
+.rot-270 { transform: rotate(270deg); }
+.slide img.rot-90, .slide img.rot-270, .title-photo-preview img.rot-90, .title-photo-preview img.rot-270 {
+  position: absolute; inset: auto; width: 100cqh; height: 100cqw; left: calc(50cqw - 50cqh); top: calc(50cqh - 50cqw);
+}
+.slide .cover.rot-90.focus-top, .slide .cover.rot-270.focus-bottom { object-position: 20% 50%; }
+.slide .cover.rot-90.focus-bottom, .slide .cover.rot-270.focus-top { object-position: 80% 50%; }
+.slide .cover.rot-180.focus-top { object-position: 50% 80%; }
+.slide .cover.rot-180.focus-bottom { object-position: 50% 20%; }
 .slide.bg-white { background: #fff; color: #111; outline: 1px solid var(--line); }
 .slide .photo { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
 .slide .cover.focus-top { object-position: 50% 20%; }
@@ -259,6 +284,7 @@ html.dark .warning { background: #3b3320; border-color: #6a5a36; color: var(--jo
 .progress.indeterminate .bar { width: 35% !important; animation: indet 1.2s ease-in-out infinite; }
 @keyframes indet { 0% { margin-left: -35%; } 100% { margin-left: 100%; } }
 .result-ok { margin-top: 18px; padding: 14px 16px; border-radius: 8px; background: #e3f1e7; border: 1px solid #b4d8c0; }
+.result-actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
 html.dark .result-ok { background: #1f3d2b; border-color: #355245; }
 .result-err { margin-top: 18px; padding: 14px 16px; border-radius: 8px; background: #fbe3dc; border: 1px solid #f0b7a8; color: #8a2e1e; }
 html.dark .result-err { background: #4a241c; border-color: #7a3a2c; color: #ffb4a4; }
@@ -276,6 +302,9 @@ html.dark .result-err { background: #4a241c; border-color: #7a3a2c; color: #ffb4
 .review-controls { display: flex; gap: 12px; align-items: center; margin: 8px 0; flex-wrap: wrap; }
 .review-scroll { overflow-y: auto; min-height: 120px; flex: 1; padding-right: 4px; }
 .review-list { display: flex; flex-direction: column; gap: 8px; }
+.obs { scroll-margin: 230px 0 90px; } /* clear the sticky bars when scrolled to by keyboard */
+.obs.kb-current { border-color: var(--journal-gold); box-shadow: 0 0 0 2px var(--journal-gold); }
+.thumb.kb-photo { outline: 3px solid var(--text); outline-offset: 2px; }
 .review-list .obs { grid-template-columns: 26px minmax(200px, 300px) 1fr; padding-left: 12px; }
 .review-list .thumb { width: 90px; height: 90px; }
 

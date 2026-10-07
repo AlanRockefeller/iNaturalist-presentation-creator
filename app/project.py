@@ -12,7 +12,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from .inaturalist import SourceError, build_source, parse_source_input
+from .inaturalist import SourceError, build_source
 from .models import (
     PROJECT_FORMAT, SCHEMA_VERSION, ObservationState, Project, Source,
 )
@@ -34,6 +34,15 @@ def _migrate(data: dict) -> dict:
     """Upgrade older schema versions in place. Version 1 is the first release,
     so this is the hook future versions extend (v1 -> v2 -> ...)."""
     version = data.get("schema_version")
+    if version == 1:
+        # v2 added per-photo rotations; a v1 file simply has none.
+        data["schema_version"] = version = 2
+    if version == 2:
+        # v3 added per-observation show_lines; a v2 file simply has none.
+        data["schema_version"] = version = 3
+    if version == 3:
+        # v4 added per-observation photo_order; a v3 file simply has none.
+        data["schema_version"] = version = 4
     if version == SCHEMA_VERSION:
         return data
     raise ProjectError(f"Unsupported project schema version {version!r}.")
@@ -74,12 +83,10 @@ def normalize_project(project: Project) -> Project:
             raise ProjectError("The project file contains duplicate source ids.")
         seen_ids.add(src.id)
         try:
-            if src.type == "username":
-                if not src.username:
-                    raise SourceError("a username source needs a username")
-                parsed = build_source(src.url, src.username)
-            else:
-                parsed = parse_source_input(src.url)
+            if src.type == "username" and not src.username:
+                raise SourceError("a username source needs a username")
+            # build_source also recognises a URL that filters to a single user.
+            parsed = build_source(src.url, src.username if src.type == "username" else None)
         except SourceError as exc:
             raise ProjectError(f"Source {src.label or src.id!r} is not valid: {exc}") from None
         sources.append(src.model_copy(update={
@@ -104,6 +111,8 @@ def normalize_project(project: Project) -> Project:
         states.append(st.model_copy(update={
             "known_photo_ids": known,
             "selected_photo_ids": selected,
+            "rotations": {pid: r for pid, r in st.rotations.items() if r and pid in known},
+            "photo_order": [pid for pid in dict.fromkeys(st.photo_order) if pid in known],
             "source_ids": [s for s in dict.fromkeys(st.source_ids) if s in source_ids],
         }))
     order = [i for i in dict.fromkeys(project.order) if i in seen_obs]
@@ -280,12 +289,25 @@ def add_observations(
     selected: dict[int, list[int]] | None = None,
     placement: str = "sorted",
     workspace: dict | None = None,
+    max_observations: int | None = None,
 ) -> Project:
-    """Add observations (all photos selected unless ``selected`` says otherwise)."""
+    """Add observations (first photo selected unless ``selected`` says otherwise).
+
+    Raises ProjectError if the project would hold more than ``max_observations``,
+    so it never grows past what a project file may contain.
+    """
     from .sorting import insert_sorted
 
     selected = selected or {}
     existing = {s.id for s in project.observations}
+    if max_observations is not None:
+        adding = len({oid for oid in ids if oid not in existing and oid in observations})
+        if len(existing) + adding > max_observations:
+            room = max(0, max_observations - len(existing))
+            raise ProjectError(
+                f"A project can hold {max_observations:,} observations. This one has {len(existing):,}, "
+                f"so {room:,} more can be added, not {adding:,}. Select fewer, or remove some first."
+            )
     stamp = now_iso()
     new_states = []
     for oid in dict.fromkeys(ids):
@@ -295,7 +317,7 @@ def add_observations(
         photo_ids = [p["id"] for p in obs.get("photos", [])]
         chosen = selected.get(oid)
         available = set(photo_ids)
-        chosen = photo_ids if chosen is None else [p for p in chosen if p in available]
+        chosen = photo_ids[:1] if chosen is None else [p for p in chosen if p in available]
         new_states.append(ObservationState(
             id=oid,
             selected_photo_ids=chosen,

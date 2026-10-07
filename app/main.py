@@ -335,8 +335,11 @@ def create_app(settings: Settings | None = None, services: Services | None = Non
         for k, v in body.selected_photo_ids.items():
             if str(k).isdigit():
                 selected[int(k)] = [int(p) for p in v][:200]
-        project = add_observations(project, observation_ids, ws["observations"], membership,
-                                   selected, body.placement, ws)
+        try:
+            project = add_observations(project, observation_ids, ws["observations"], membership,
+                                       selected, body.placement, ws, settings.max_observations_per_project)
+        except ProjectError as exc:
+            raise HTTPException(422, str(exc)) from None
         if body.ignore_ids:
             project = ignore_observations(project, body.ignore_ids)
         return {"project": project.model_dump(mode="json")}

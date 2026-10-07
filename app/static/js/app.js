@@ -81,7 +81,7 @@
   function newProject() {
     return {
       format: 'dikarya-presentation',
-      schema_version: 1,
+      schema_version: 4,
       sources: [],
       settings: {
         title: '', presenter: '', background: 'black', title_photo: null,
@@ -109,6 +109,10 @@
     plan: null,
   };
 
+  // Bumped whenever the user starts or opens another project. A request that
+  // finishes after that belongs to the old project, so its result is dropped.
+  let projectGen = 0;
+
   function setProject(project) {
     S.project = project;
     reindex();
@@ -120,11 +124,22 @@
     S.dirty = true;
     autosave();
   }
-  const autosave = debounce(() => {
+  // The work in progress is kept in this browser so leaving the page loses
+  // nothing: the project, the step, the server workspace (reused on return,
+  // so iNaturalist is not searched again) and whether it was saved to a file.
+  const DRAFT_KEY = 'dp-draft';
+  let restoring = true; // until startup has restored (or found no) draft; never overwrite it before then
+  function saveDraft() {
+    if (restoring) return;
     try {
-      localStorage.setItem('dp-project', JSON.stringify(S.project));
+      if (!S.project.sources.length) { localStorage.removeItem(DRAFT_KEY); return; }
+      localStorage.setItem(DRAFT_KEY, JSON.stringify({
+        project: S.project, step: S.step, workspaceId: S.workspaceId, dirty: S.dirty, savedAt: Date.now(),
+      }));
+      localStorage.removeItem('dp-project'); // the older draft format
     } catch (e) { /* storage full or unavailable: project files still work */ }
-  }, 800);
+  }
+  const autosave = debounce(saveDraft, 800);
 
   // Mirrors of small server rules, used only for immediate display.
   function effectiveName(id) {
@@ -149,19 +164,25 @@
     const en = enabledSourceIds();
     return !st.source_ids.some((sid) => en.has(sid));
   }
-  function groupLabel(id) {
+  const GROUP_RANKS = ['kingdom', 'phylum', 'class', 'order', 'family', 'genus'];
+  // The group an observation is listed under, like group_of() in sorting.py:
+  // the label is shown, the key tells apart groups that share a label (two
+  // sources with the same label, or one genus name under two families).
+  function groupOf(id) {
     const g = S.project.settings.grouping;
-    if (g === 'none') return '';
     const o = S.obs.get(id);
-    if (!o) return '';
+    if (g === 'none' || !o) return { key: '', label: '' };
     if (g === 'source') {
       const st = S.states.get(id);
       const en = enabledSourceIds();
       const ids = (st && st.source_ids) || [];
       const src = S.project.sources.find((s) => ids.includes(s.id) && en.has(s.id)) || S.project.sources.find((s) => ids.includes(s.id));
-      return src ? (src.label || src.url) : 'Other observations';
+      return src ? { key: `source:${src.id}`, label: src.label || src.url } : { key: 'other', label: 'Other observations' };
     }
-    return (o.ranks && o.ranks[g]) || 'Unclassified';
+    const ranks = o.ranks || {};
+    if (!ranks[g]) return { key: 'unclassified', label: 'Unclassified' };
+    const path = GROUP_RANKS.slice(0, GROUP_RANKS.indexOf(g) + 1).map((r) => ranks[r] || '');
+    return { key: JSON.stringify(path), label: ranks[g] };
   }
   const GROUP_NAMES = { kingdom: 'Kingdom', phylum: 'Phylum', class: 'Class', order: 'Order', family: 'Family', genus: 'Genus', source: 'Source' };
 
@@ -194,6 +215,7 @@
   function goto(step) {
     if (step !== 'sources' && !hasObservations()) return;
     S.step = step;
+    autosave();
     STEPS.forEach((s) => { $(`#step-${s}`).hidden = s !== step; });
     updateStepper();
     window.scrollTo({ top: 0 });
@@ -239,8 +261,10 @@
     }
     const btn = $('#btn-add-source');
     btn.disabled = true;
+    const gen = projectGen;
     try {
       const parsed = await api('/api/sources/parse', { method: 'POST', body: { url, username } });
+      if (gen !== projectGen) return; // the project was replaced while this was checked
       if (S.project.sources.some((s) => s.url === parsed.url)) {
         $('#source-error').textContent = 'That source is already in the project.';
         return;
@@ -349,10 +373,27 @@
   let loadJobId = null;
   let loadCancelled = false;
 
+  // Poll a job until it ends. A dropped connection or a server restart in
+  // progress (502/503/504) is retried for a few minutes, because the job keeps
+  // running on the server; only "unknown job" (404) and other errors end it.
   async function pollJob(id, onProgress) {
+    let last = { state: 'running', done: 0, total: 0, message: '' };
+    let failingSince = null;
     for (;;) {
-      await new Promise((r) => setTimeout(r, 900));
-      const job = await api(`/api/jobs/${encodeURIComponent(id)}`);
+      await new Promise((r) => setTimeout(r, failingSince ? 3000 : 900));
+      let job;
+      try {
+        job = await api(`/api/jobs/${encodeURIComponent(id)}`);
+      } catch (err) {
+        const temporary = !err.status || [502, 503, 504].includes(err.status);
+        if (!temporary) throw err;
+        failingSince = failingSince || Date.now();
+        if (Date.now() - failingSince > 5 * 60 * 1000) throw err;
+        onProgress({ ...last, message: 'Lost contact with the server. Retrying…' });
+        continue;
+      }
+      failingSince = null;
+      last = job;
       onProgress(job);
       if (['done', 'error', 'cancelled'].includes(job.state)) return job;
     }
@@ -365,7 +406,7 @@
     bar.style.width = `${Math.min(100, Math.round((100 * done) / total))}%`;
   }
 
-  async function startLoad(refreshSourceIds) {
+  async function startLoad(refreshSourceIds, resume = null) {
     const modal = $('#load-modal');
     $('#load-message').textContent = 'Starting…';
     setBar($('#load-bar'), 0, 0);
@@ -387,7 +428,7 @@
       });
       if (final.state === 'cancelled' || loadCancelled) { toast('Loading cancelled.'); return; }
       if (final.state !== 'done') throw new Error(final.error || 'Loading failed.');
-      applyLoadResult(final.result);
+      applyLoadResult(final.result, resume);
     } catch (err) {
       toast(err.message, true, 9000);
     } finally {
@@ -401,7 +442,7 @@
     if (loadJobId) { try { await api(`/api/jobs/${encodeURIComponent(loadJobId)}`, { method: 'DELETE' }); } catch (e) { /* ignore */ } }
   });
 
-  function applyLoadResult(result) {
+  function applyLoadResult(result, resume = null) {
     setProject(result.project);
     S.obs = new Map(result.observations.map((o) => [o.id, o]));
     S.workspaceId = result.workspace_id;
@@ -409,7 +450,13 @@
     S.sourceCounts = result.source_results;
     markDirty();
     const sum = result.summary;
-    if (result.first_load) {
+    if (resume) {
+      // Back where the user left off. New observations wait behind the Review button.
+      S.dirty = resume.dirty !== false;
+      S.pendingNew = sum.new ? sum : null;
+      goto(STEPS.includes(resume.step) && resume.step !== 'sources' ? resume.step : 'organize');
+      toast(`Restored your work${sum.new ? `; ${plural(sum.new, 'new observation')} to review` : ''}. Use New project in the top bar to start over.`, false, 7000);
+    } else if (result.first_load) {
       S.pendingNew = null;
       toast(`Loaded ${plural(sum.auto_added || 0, 'observation')} from iNaturalist.`);
       goto('organize');
@@ -474,14 +521,28 @@
         if ((o.faves_count || 0) < minF) { hiddenFaves++; continue; }
       }
       if (!findMatches(id, needle)) continue;
-      const g = groupLabel(id);
-      if (S.project.settings.grouping !== 'none' && g && g !== lastGroup) {
-        items.push({ type: 'group', label: g });
-        lastGroup = g;
+      const g = groupOf(id);
+      if (S.project.settings.grouping !== 'none' && g.label && g.key !== lastGroup) {
+        items.push({ type: 'group', key: g.key, label: g.label });
+        lastGroup = g.key;
       }
       items.push({ type: 'obs', id, pos: posOf.get(id) });
     }
     return { items, hiddenFaves, hiddenSources };
+  }
+
+  // Removes the observations listed under a group heading (those hidden by the
+  // filters stay), like "Remove from project" on each card.
+  function removeGroup(key, label) {
+    const ids = new Set(organizeItems().items.filter((it) => it.type === 'obs' && groupOf(it.id).key === key).map((it) => it.id));
+    if (!ids.size) return;
+    if (!confirm(`Remove ${plural(ids.size, 'observation')} in ${label} from the project?`)) return;
+    const p = S.project;
+    p.observations = p.observations.filter((s) => !ids.has(s.id));
+    p.order = p.order.filter((x) => !ids.has(x));
+    if (p.settings.title_photo && ids.has(p.settings.title_photo.observation_id)) p.settings.title_photo = null;
+    reindex(); markDirty(); renderOrganize(true);
+    toast(`Removed ${plural(ids.size, 'observation')} in ${label}.`);
   }
 
   function renderOrganize(keepCount = false) {
@@ -493,10 +554,16 @@
     listRenderer = chunkRender($('#obs-list'), $('#obs-sentinel'), items, (item) => {
       if (item.type === 'group') {
         const g = S.project.settings.grouping;
+        const rank = (GROUP_NAMES[g] || 'group').toLowerCase();
         return el('div', { class: 'group-head' + (g === 'genus' && item.label !== 'Unclassified' ? ' italic' : '') },
-          el('small', { text: GROUP_NAMES[g] || '' }), el('span', { class: 'name', text: item.label }));
+          el('small', { text: GROUP_NAMES[g] || '' }), el('span', { class: 'name', text: item.label }),
+          el('button', {
+            type: 'button', class: 'group-remove', text: '✕',
+            title: `Remove every observation in this ${rank} from the project`, 'aria-label': `Remove ${rank} ${item.label}`,
+            onclick: () => removeGroup(item.key, item.label),
+          }));
       }
-      const card = obsCard(item.id, item.pos);
+      const card = kbDecorate(obsCard(item.id, item.pos));
       renderedCards.set(item.id, card);
       return card;
     }, min);
@@ -526,10 +593,100 @@
     }
   }
 
+  // ------------------------------------------------ keyboard on Select & Organize
+  // Up/Down: observation. Left/Right: photo. Shift+Left/Right: move that photo.
+  // Space: include or leave out that photo. Enter: open it in the viewer. The current card and photo are outlined.
+  const KB = { id: null, idx: 0 };
+  function kbDecorate(card) {
+    if (Number(card.dataset.id) !== KB.id) return card;
+    card.classList.add('kb-current');
+    const thumb = $$('.thumbs .thumb:not(.missing)', card)[KB.idx];
+    if (thumb) thumb.classList.add('kb-photo');
+    return card;
+  }
+  function kbMark() {
+    $$('#obs-list .kb-current, #obs-list .kb-photo').forEach((x) => x.classList.remove('kb-current', 'kb-photo'));
+    const card = KB.id === null ? null : renderedCards.get(KB.id);
+    if (!card || !card.isConnected) return null;
+    return kbDecorate(card);
+  }
+  function kbMoveObs(d) {
+    const cards = $$('#obs-list .obs');
+    if (!cards.length) return;
+    let i = cards.findIndex((c) => Number(c.dataset.id) === KB.id);
+    if (i < 0) {
+      // Nothing current yet (or it was filtered out): start at the first card on screen.
+      i = cards.findIndex((c) => c.getBoundingClientRect().top > 200);
+      if (i < 0) i = 0;
+    } else {
+      i = Math.max(0, Math.min(cards.length - 1, i + d));
+    }
+    KB.id = Number(cards[i].dataset.id);
+    KB.idx = 0;
+    const card = kbMark();
+    if (card) card.scrollIntoView({ block: 'nearest' }); // more cards render as the list scrolls
+  }
+  function kbPhotos() {
+    const o = KB.id === null ? null : S.obs.get(KB.id);
+    const st = KB.id === null ? null : S.states.get(KB.id);
+    return o && st && st.status === 'active' ? orderedPhotos(KB.id) : [];
+  }
+  function kbMovePhoto(d) {
+    const photos = kbPhotos();
+    if (!photos.length) return;
+    KB.idx = Math.max(0, Math.min(photos.length - 1, KB.idx + d));
+    const card = kbMark();
+    const thumb = card && $('.kb-photo', card);
+    if (thumb) thumb.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  }
+  function kbShiftPhoto(d) {
+    const photos = kbPhotos();
+    const to = KB.idx + d;
+    if (!photos[KB.idx] || to < 0 || to >= photos.length) return;
+    movePhoto(KB.id, photos[KB.idx].id, to);
+    KB.idx = to;
+    refreshCard(KB.id);
+  }
+  function kbToggle() {
+    const p = kbPhotos()[KB.idx];
+    if (!p) return;
+    const st = S.states.get(KB.id);
+    setPhotoSelected(st, p.id, !st.selected_photo_ids.includes(p.id));
+    refreshCard(KB.id);
+  }
+  document.addEventListener('keydown', (e) => {
+    if (S.step !== 'organize' || e.ctrlKey || e.metaKey || e.altKey) return;
+    if (!$('#viewer').hidden || $$('.modal').some((m) => !m.hidden)) return;
+    const t = e.target;
+    if (t.closest && t.closest('input:not([type=checkbox]), textarea, select, [contenteditable]')) return;
+    const k = e.key;
+    // On a focused button, link or checkbox, Space and Enter keep their usual meaning.
+    const activator = t.closest && t.closest('button, a, input');
+    if (k === 'ArrowDown') kbMoveObs(1);
+    else if (k === 'ArrowUp') kbMoveObs(-1);
+    else if (k === 'ArrowRight' && e.shiftKey) kbShiftPhoto(1);
+    else if (k === 'ArrowLeft' && e.shiftKey) kbShiftPhoto(-1);
+    else if (k === 'ArrowRight') kbMovePhoto(1);
+    else if (k === 'ArrowLeft') kbMovePhoto(-1);
+    else if (k === ' ' && !activator && KB.id !== null) kbToggle();
+    else if (k === 'Enter' && !activator && kbPhotos()[KB.idx]) Viewer.open(KB.id, KB.idx, stateAdapter(KB.id), null);
+    else return;
+    e.preventDefault();
+  });
+  // Clicking a card (or one of its photos) makes it current, so keys carry on from there.
+  $('#obs-list').addEventListener('click', (e) => {
+    const card = e.target.closest('.obs');
+    if (!card) return;
+    KB.id = Number(card.dataset.id);
+    const thumb = e.target.closest('.thumb:not(.missing)');
+    KB.idx = thumb ? Math.max(0, $$('.thumbs .thumb:not(.missing)', card).indexOf(thumb)) : 0;
+    kbMark();
+  }, true);
+
   function refreshCard(id) {
     const old = renderedCards.get(id);
     if (old && old.isConnected) {
-      const card = obsCard(id, Number(old.dataset.pos));
+      const card = kbDecorate(obsCard(id, Number(old.dataset.pos)));
       old.replaceWith(card);
       renderedCards.set(id, card);
     }
@@ -553,9 +710,48 @@
     markDirty();
   }
 
+  // Clockwise rotation (0, 90, 180 or 270) chosen for a photo; ObservationState.rotations.
+  function rotationOf(st, pid) {
+    return (st && st.rotations && st.rotations[String(pid)]) || 0;
+  }
+  function rotatePhoto(st, pid, delta) {
+    const r = (rotationOf(st, pid) + delta + 360) % 360;
+    st.rotations = st.rotations || {};
+    if (r) st.rotations[String(pid)] = r; else delete st.rotations[String(pid)];
+    markDirty();
+  }
+  const rotClass = (r) => (r ? `rot-${r}` : '');
+
+  // An observation's photos in slide order: the user's photo_order, then the rest
+  // in iNaturalist's order. Mirror of presentation.photo_positions().
+  function orderedPhotos(id) {
+    const o = S.obs.get(id);
+    if (!o) return [];
+    const st = S.states.get(id);
+    const custom = (st && st.photo_order) || [];
+    if (!custom.length) return o.photos;
+    const byId = new Map(o.photos.map((p) => [p.id, p]));
+    const out = custom.filter((pid) => byId.has(pid)).map((pid) => byId.get(pid));
+    const used = new Set(out.map((p) => p.id));
+    return out.concat(o.photos.filter((p) => !used.has(p.id)));
+  }
+  // Put photo pid at position `to` of the observation's photo order.
+  function movePhoto(id, pid, to) {
+    const ids = orderedPhotos(id).map((p) => p.id).filter((x) => x !== pid);
+    ids.splice(Math.max(0, Math.min(ids.length, to)), 0, pid);
+    const natural = S.obs.get(id).photos.map((p) => p.id);
+    S.states.get(id).photo_order = ids.every((x, i) => x === natural[i]) ? [] : ids;
+    markDirty();
+  }
+  let photoDrag = null; // {id, pid} while a photo thumbnail is dragged
+  let photoMark = null;
+  const clearPhotoMark = () => { if (photoMark) photoMark.classList.remove('drop-before', 'drop-after'); photoMark = null; };
+
   const stateAdapter = (id) => ({
     isSelected: (pid) => S.states.get(id).selected_photo_ids.includes(pid),
     toggle: (pid, on) => { setPhotoSelected(S.states.get(id), pid, on); refreshCard(id); },
+    rotation: (pid) => rotationOf(S.states.get(id), pid),
+    rotate: (pid, delta) => { rotatePhoto(S.states.get(id), pid, delta); refreshCard(id); },
   });
 
   function moveObservation(id, targetId, after) {
@@ -610,16 +806,18 @@
       );
     }
 
-    const photos = o.photos;
+    const photos = review ? o.photos : orderedPhotos(id);
     const selCount = photos.filter((p) => adapter.isSelected(p.id)).length;
     const missing = review ? [] : st.selected_photo_ids.filter((pid) => !photos.some((p) => p.id === pid));
     const card = el('div', { class: 'obs', dataset: { id: String(id), pos: String(pos || 0) } });
 
     const box = el('input', {
-      type: 'checkbox', checked: selCount === photos.length && photos.length > 0,
-      indeterminate: selCount > 0 && selCount < photos.length,
-      title: 'Select or deselect all photos of this observation', 'aria-label': 'Select all photos of this observation',
-      onchange: (e) => { photos.forEach((p) => adapter.toggle(p.id, e.target.checked)); if (review) refreshReviewCard(id); },
+      type: 'checkbox', checked: selCount > 0,
+      title: 'Include this observation (its first photo). Tick more photos to add them.', 'aria-label': 'Include this observation',
+      onchange: (e) => {
+        if (e.target.checked) { if (photos.length) adapter.toggle(photos[0].id, true); } else photos.forEach((p) => adapter.toggle(p.id, false));
+        if (review) refreshReviewCard(id);
+      },
     });
 
     // name (editable)
@@ -697,15 +895,59 @@
     const tp = S.project.settings.title_photo;
     photos.forEach((p, idx) => {
       const sel = adapter.isSelected(p.id);
+      const rot = adapter.rotation ? adapter.rotation(p.id) : 0;
+      const turn = (delta, label, glyph) => el('button', {
+        type: 'button', text: glyph, title: `Rotate ${label}`, 'aria-label': `Rotate photo ${idx + 1} ${label}`,
+        onclick: (e) => { e.stopPropagation(); adapter.rotate(p.id, delta); },
+      });
       const t = el('div', { class: 'thumb' + (sel ? ' selected' : '') + (tp && tp.photo_id === p.id ? ' title-pick' : '') },
-        el('img', { src: photoSize(p.url, 'small'), loading: 'lazy', decoding: 'async', alt: `Photo ${idx + 1} of ${name}`, width: 112, height: 112 }),
+        el('img', { class: rotClass(rot), src: photoSize(p.url, 'small'), loading: 'lazy', decoding: 'async', alt: `Photo ${idx + 1} of ${name}`, width: 112, height: 112 }),
         el('input', {
           type: 'checkbox', checked: sel, title: 'Include this photo', 'aria-label': `Include photo ${idx + 1}`,
           onclick: (e) => e.stopPropagation(),
           onchange: (e) => { adapter.toggle(p.id, e.target.checked); if (review) refreshReviewCard(id); },
         }),
+        adapter.rotate ? el('div', { class: 'rot-btns' }, turn(-90, 'left', '↺'), turn(90, 'right', '↻')) : null,
       );
       t.addEventListener('click', () => Viewer.open(id, idx, adapter, review ? () => refreshReviewCard(id) : null));
+      if (!review && photos.length > 1) {
+        // Drag a photo onto another of the same observation to change their slide order.
+        t.draggable = true;
+        t.title = 'Click to enlarge. Drag to change the order of this observation\'s photos.';
+        t.addEventListener('dragstart', (e) => {
+          e.stopPropagation();
+          photoDrag = { id, pid: p.id };
+          t.classList.add('dragging');
+          e.dataTransfer.effectAllowed = 'move';
+          e.dataTransfer.setData('text/plain', String(p.id));
+        });
+        t.addEventListener('dragend', () => { photoDrag = null; t.classList.remove('dragging'); clearPhotoMark(); });
+        t.addEventListener('dragover', (e) => {
+          if (!photoDrag || photoDrag.id !== id) return;
+          e.preventDefault();
+          e.stopPropagation();
+          if (photoDrag.pid === p.id) { clearPhotoMark(); return; }
+          const r = t.getBoundingClientRect();
+          const after = e.clientX > r.left + r.width / 2;
+          if (photoMark !== t) clearPhotoMark();
+          photoMark = t;
+          t.classList.toggle('drop-after', after);
+          t.classList.toggle('drop-before', !after);
+        });
+        t.addEventListener('drop', (e) => {
+          if (!photoDrag || photoDrag.id !== id) return;
+          e.preventDefault();
+          e.stopPropagation();
+          const after = t.classList.contains('drop-after');
+          const moving = photoDrag.pid;
+          clearPhotoMark();
+          photoDrag = null;
+          if (moving === p.id) return;
+          const rest = photos.map((q) => q.id).filter((x) => x !== moving);
+          movePhoto(id, moving, rest.indexOf(p.id) + (after ? 1 : 0));
+          refreshCard(id);
+        });
+      }
       thumbs.append(t);
     });
     missing.forEach((pid) => {
@@ -734,20 +976,47 @@
     const o = S.obs.get(id);
     const user = o.user || {};
     const fields = [
+      ['scientific', 'Scientific name', o.inat_name || ''],
       ['common_name', 'Common name', o.common_name || ''],
       ['date', 'Date', formatDate(o.observed_on)],
       ['location', 'Location', o.place_guess || ''],
       ['observer', 'Observer', (user.name || user.login) ? `Photo: ${user.name || user.login}` : ''],
     ];
+    // A line's checkbox starts from Presentation Settings; a different choice is
+    // stored for this observation only (ObservationState.show_lines).
+    const settingOn = (key) => (key === 'observer' ? observerEnabled() : !!S.project.settings.annotations[key]);
+    st.show_lines = st.show_lines || {};
     const grid = el('div', { class: 'ann-edit' });
     fields.forEach(([key, label, def]) => {
       const cur = st.overrides[key];
-      grid.append(el('label', { text: label }), el('input', {
-        type: 'text', value: cur === null || cur === undefined ? '' : cur, placeholder: def || '(empty)', maxLength: 300,
-        onchange: (e) => { const v = e.target.value.trim(); st.overrides[key] = v === '' ? null : v; markDirty(); },
-      }));
+      const own = st.show_lines[key];
+      const input = el('input', {
+        type: 'text', value: cur === null || cur === undefined ? '' : cur, placeholder: def || '(empty)', maxLength: 300, 'aria-label': label,
+        onchange: (e) => {
+          const v = e.target.value.trim();
+          // Same rule as the name's "edit" button: the iNaturalist name itself is no override.
+          st.overrides[key] = v === '' || (key === 'scientific' && v === def) ? null : v;
+          markDirty();
+          if (key === 'scientific') {
+            // Redraw the card so its heading shows the new name, and keep this editor open.
+            refreshCard(id);
+            const fresh = renderedCards.get(id);
+            if (fresh && fresh !== card) toggleAnnEdit(fresh, id);
+          }
+        },
+      });
+      grid.append(el('label', { class: 'ann-line' },
+        el('input', {
+          type: 'checkbox', checked: own === undefined ? settingOn(key) : own,
+          title: `Show the ${label.toLowerCase()} on this observation's slides`,
+          onchange: (e) => {
+            if (e.target.checked === settingOn(key)) delete st.show_lines[key]; else st.show_lines[key] = e.target.checked;
+            markDirty();
+          },
+        }),
+        label), input);
     });
-    grid.append(el('span'), el('span', { class: 'muted small', text: 'Leave blank to use the iNaturalist value. Which lines appear is set in Presentation Settings.' }));
+    grid.append(el('span'), el('span', { class: 'muted small', text: 'Tick a line to show it on this observation\'s slides, even if it is off in Presentation Settings. Leave text blank to use the iNaturalist value.' }));
     info.append(grid);
   }
 
@@ -804,21 +1073,29 @@
     $('#min-faves').value = String(s.min_faves || 0);
   }
 
+  let sortSeq = 0;
   async function applySort(key, direction) {
     const sort = S.project.settings.sort;
     if (key === 'custom') { key = sort.base_key; direction = sort.base_direction; }
+    const gen = projectGen;
+    const seq = ++sortSeq;
     try {
       const res = await api('/api/sort', {
         method: 'POST',
         body: { project: S.project, workspace_id: S.workspaceId, key, direction, seed: Math.floor(Math.random() * 1e9) },
       });
-      S.project.order = res.order;
+      // Drop it if the project was replaced or a newer sort was asked for.
+      if (gen !== projectGen || seq !== sortSeq) return;
+      // Observations added or removed meanwhile: keep exactly the current ones.
+      const order = res.order.filter((id) => S.states.has(id));
+      const placed = new Set(order);
+      S.project.order = order.concat(S.project.order.filter((id) => !placed.has(id)));
       sort.key = key;
       sort.direction = direction;
       if (key !== 'random') { sort.base_key = key; sort.base_direction = direction; }
       markDirty();
       renderOrganize();
-    } catch (err) { handleApiError(err); }
+    } catch (err) { if (gen === projectGen && seq === sortSeq) handleApiError(err); }
   }
 
   $('#sort-key').addEventListener('change', (e) => {
@@ -883,11 +1160,25 @@
     const img = $('#viewer-img');
     let ctx = null; // {id, idx, adapter, after}
     let scale = 1; let tx = 0; let ty = 0; let fitScale = 1;
-    let W = 1; let H = 1; let showing = 'large';
+    // W x H is the photo as shown (after rotation); IW x IH is the <img> element.
+    let W = 1; let H = 1; let IW = 1; let IH = 1; let rot = 0; let showing = 'large';
 
-    function photo() { return S.obs.get(ctx.id).photos[ctx.idx]; }
+    const vPhotos = () => orderedPhotos(ctx.id); // same order as the card's thumbnails
+    function photo() { return vPhotos()[ctx.idx]; }
+    function setSize(w, h) {
+      IW = w; IH = h;
+      rot = ctx.adapter.rotation ? ctx.adapter.rotation(photo().id) : 0;
+      [W, H] = rot === 90 || rot === 270 ? [IH, IW] : [IW, IH];
+      img.style.width = `${IW}px`;
+      img.style.height = `${IH}px`;
+    }
     function apply() {
-      img.style.transform = `translate(${tx}px, ${ty}px) scale(${scale})`;
+      // Rotate about the top-left corner, then shift so the turned photo starts at 0,0.
+      const turn = {
+        0: '', 90: `translate(${IH}px, 0) rotate(90deg)`,
+        180: `translate(${IW}px, ${IH}px) rotate(180deg)`, 270: `translate(0, ${IW}px) rotate(270deg)`,
+      }[rot];
+      img.style.transform = `translate(${tx}px, ${ty}px) scale(${scale}) ${turn}`;
       const pct = Math.round(scale * 100);
       $('#v-zoom-label').textContent = Math.abs(scale - fitScale) < 0.001 ? 'Fit' : `${pct}%`;
       // Load the original only when the large image would be upscaled.
@@ -925,31 +1216,34 @@
     function show() {
       const o = S.obs.get(ctx.id);
       const p = photo();
-      W = p.width || 1024; H = p.height || 1024;
       showing = 'large';
-      img.style.width = `${W}px`;
-      img.style.height = `${H}px`;
+      setSize(p.width || 1024, p.height || 1024);
       img.src = photoSize(p.url, 'large');
       img.onload = () => {
         if (!p.width) { // dimensions unknown: use the large image's aspect
-          W = img.naturalWidth; H = img.naturalHeight;
-          img.style.width = `${W}px`; img.style.height = `${H}px`;
+          setSize(img.naturalWidth, img.naturalHeight);
           fit();
         }
       };
       img.alt = `Photo ${ctx.idx + 1} of ${o.inat_name || 'observation'}`;
       $('#viewer-name').textContent = (S.states.has(ctx.id) ? effectiveName(ctx.id) : o.inat_name) || 'Observation';
-      $('#viewer-count').textContent = `photo ${ctx.idx + 1} of ${o.photos.length}${p.license ? ' · ' + p.license.toUpperCase() : ''}`;
+      $('#viewer-count').textContent = `photo ${ctx.idx + 1} of ${vPhotos().length}${p.license ? ' · ' + p.license.toUpperCase() : ''}`;
       $('#v-selected').checked = ctx.adapter.isSelected(p.id);
+      $('#v-rot-left').hidden = $('#v-rot-right').hidden = !ctx.adapter.rotate;
       $('#v-prev').disabled = ctx.idx === 0;
-      $('#v-next').disabled = ctx.idx >= o.photos.length - 1;
+      $('#v-next').disabled = ctx.idx >= vPhotos().length - 1;
       const strip = $('#viewer-strip');
-      strip.replaceChildren(...o.photos.map((q, i) => el('button', {
+      strip.replaceChildren(...vPhotos().map((q, i) => el('button', {
         type: 'button', class: (i === ctx.idx ? 'current' : '') + (ctx.adapter.isSelected(q.id) ? ' sel' : ''),
         onclick: () => { ctx.idx = i; show(); }, 'aria-label': `Photo ${i + 1}`,
-      }, el('img', { src: q.url, alt: '' }))));
+      }, el('img', { class: rotClass(ctx.adapter.rotation ? ctx.adapter.rotation(q.id) : 0), src: q.url, alt: '' }))));
       label();
       fit();
+    }
+    function turn(delta) {
+      if (!ctx.adapter.rotate) return;
+      ctx.adapter.rotate(photo().id, delta);
+      show();
     }
     function open(id, idx, adapter, after) {
       ctx = { id, idx, adapter, after };
@@ -967,9 +1261,8 @@
       if (after) after();
     }
     function step(d) {
-      const o = S.obs.get(ctx.id);
       const i = ctx.idx + d;
-      if (i >= 0 && i < o.photos.length) { ctx.idx = i; show(); }
+      if (i >= 0 && i < vPhotos().length) { ctx.idx = i; show(); }
     }
     function toggle() {
       const p = photo();
@@ -987,6 +1280,8 @@
     $('#v-zoom-out').addEventListener('click', () => zoomAt(1 / 1.5));
     $('#v-zoom-fit').addEventListener('click', fit);
     $('#v-zoom-100').addEventListener('click', () => zoomAt(1 / scale));
+    $('#v-rot-left').addEventListener('click', () => turn(-90));
+    $('#v-rot-right').addEventListener('click', () => turn(90));
     $('#v-selected').addEventListener('change', (e) => { if (ctx.adapter.isSelected(photo().id) !== e.target.checked) toggle(); });
     stage.addEventListener('wheel', (e) => {
       e.preventDefault();
@@ -1017,6 +1312,7 @@
     document.addEventListener('keydown', (e) => {
       if (!ctx) return;
       if (e.target.tagName === 'INPUT' && e.target.type === 'text') return;
+      if (e.ctrlKey || e.metaKey || e.altKey) return; // leave browser shortcuts such as Ctrl+R alone
       const k = e.key;
       if (k === 'Escape') close();
       else if (k === 'ArrowLeft') step(-1);
@@ -1026,6 +1322,8 @@
       else if (k === '-') zoomAt(1 / 1.5);
       else if (k === '0') fit();
       else if (k === '1') zoomAt(1 / scale);
+      else if (k === 'r') turn(90);
+      else if (k === 'R') turn(-90);
       else return;
       e.preventDefault();
     });
@@ -1066,7 +1364,7 @@
     box.replaceChildren();
     const o = tp && S.obs.get(tp.observation_id);
     const p = o && o.photos.find((q) => q.id === tp.photo_id);
-    if (p) box.append(el('img', { src: photoSize(p.url, 'medium'), alt: 'Title background' }));
+    if (p) box.append(el('img', { class: rotClass(rotationOf(S.states.get(tp.observation_id), p.id)), src: photoSize(p.url, 'medium'), alt: 'Title background' }));
     else box.append(el('span', { class: 'muted small', text: tp ? 'Photo unavailable' : 'None' }));
     $('#btn-clear-title').disabled = !tp;
   }
@@ -1110,7 +1408,7 @@
         $('#picker-modal').hidden = true;
         renderTitlePhoto();
       },
-    }, el('img', { src: photoSize(p.url, 'small'), loading: 'lazy', alt: effectiveName(id) })), 0, 120);
+    }, el('img', { class: rotClass(rotationOf(S.states.get(id), p.id)), src: photoSize(p.url, 'small'), loading: 'lazy', alt: effectiveName(id) })), 0, 120);
     if (!items.length) $('#picker-grid').append(el('p', { class: 'muted', text: 'No photos match.' }));
   }
   $('#btn-pick-title').addEventListener('click', () => { $('#picker-modal').hidden = false; renderPicker(); });
@@ -1129,7 +1427,7 @@
     if (spec.kind === 'title') {
       if (spec.photo) {
         slide.classList.add('has-photo');
-        slide.append(el('img', { class: `cover focus-${spec.photo.position || 'center'}`, src: photoSize(spec.photo.url, 'medium'), loading: 'lazy', alt: '' }));
+        slide.append(el('img', { class: `cover focus-${spec.photo.position || 'center'} ${rotClass(spec.photo.rotation)}`, src: photoSize(spec.photo.url, 'medium'), loading: 'lazy', alt: '' }));
       }
       slide.append(el('div', { class: 'center' },
         el('div', { class: 't-title', text: spec.title }),
@@ -1140,7 +1438,7 @@
         spec.rank_label ? el('div', { class: 'd-rank', text: spec.rank_label.toUpperCase() }) : null,
         el('div', { class: 'd-name' + (spec.italic ? ' italic' : ''), text: spec.text })));
     } else {
-      slide.append(el('img', { class: 'photo', src: photoSize(spec.url, 'medium'), loading: 'lazy', decoding: 'async', alt: '' }));
+      slide.append(el('img', { class: `photo ${rotClass(spec.rotation)}`, src: photoSize(spec.url, 'medium'), loading: 'lazy', decoding: 'async', alt: '' }));
       if (spec.lines.length) {
         slide.append(el('div', { class: 'ann' }, spec.lines.map((l) => el('div', { class: l.size >= 28 ? 'l28' : 'l18', text: l.text }))));
       }
@@ -1245,7 +1543,13 @@
         const link = el('a', { class: 'btn btn-gold btn-lg', href: final.download_url, download: final.filename, text: `Download ${final.filename}` });
         out.replaceChildren(el('div', { class: 'result-ok' },
           el('p', { text: `Your presentation is ready: ${plural(final.result.slides, 'slide')}, ${mb} MB. The file is deleted from the server after two hours.` }),
-          link,
+          el('div', { class: 'result-actions' },
+            link,
+            el('button', {
+              type: 'button', class: 'btn btn-lg', text: 'Download project file (.json)',
+              title: 'Save your selections, order and settings so you can reopen and update this presentation later',
+              onclick: saveProjectFile,
+            })),
           final.warnings.length ? el('ul', { class: 'small' }, final.warnings.map((w) => el('li', { text: w }))) : null));
         link.click();
       } else {
@@ -1319,7 +1623,8 @@
       $('#review-new-title').textContent = `${plural(ids.length, 'unique new observation')} to review`;
       const chips = $('#review-by-source');
       chips.replaceChildren(...S.project.sources.filter((s) => (sum.new_by_source || {})[s.id]).map((s) => el('span', { class: 'chip', text: `${s.label}: ${n(sum.new_by_source[s.id])} new` })));
-      reviewSel = new Map(ids.map((id) => [id, new Set(S.obs.get(id).photos.map((p) => p.id))]));
+      // Like add_observations: only the first photo of each starts selected.
+      reviewSel = new Map(ids.map((id) => [id, new Set(S.obs.get(id).photos.slice(0, 1).map((p) => p.id))]));
       $('#review-all').checked = true;
       if (reviewRenderer) reviewRenderer.disconnect();
       reviewRenderer = chunkRender($('#review-list'), $('#review-sentinel'), ids, (id) => obsCard(id, 0, reviewAdapter(id)), 0, 40);
@@ -1331,7 +1636,7 @@
 
   $('#review-all').addEventListener('change', (e) => {
     for (const id of S.reviewIds || []) {
-      reviewSel.set(id, e.target.checked ? new Set(S.obs.get(id).photos.map((p) => p.id)) : new Set());
+      reviewSel.set(id, e.target.checked ? new Set(S.obs.get(id).photos.slice(0, 1).map((p) => p.id)) : new Set());
     }
     const count = reviewRenderer ? reviewRenderer.count : 0;
     reviewRenderer.disconnect();
@@ -1342,6 +1647,13 @@
   async function addReviewed(ids, ignoreIds) {
     const selected = {};
     ids.forEach((id) => { selected[String(id)] = [...(reviewSel.get(id) || [])]; });
+    // The server returns the whole project, so nothing may change it until the
+    // reply is in: the dialog stays open (and covers the page) meanwhile.
+    const modal = $('#review-modal');
+    const buttons = $$('button', modal);
+    modal.dataset.busy = '1';
+    buttons.forEach((b) => { b.disabled = true; });
+    const gen = projectGen;
     try {
       const res = await api('/api/observations/add', {
         method: 'POST',
@@ -1350,6 +1662,7 @@
           selected_photo_ids: selected, placement: $('#review-placement').value, ignore_ids: ignoreIds,
         },
       });
+      if (gen !== projectGen) return; // another project was opened meanwhile
       setProject(res.project);
       markDirty();
       const remaining = (S.reviewIds || []).filter((id) => !S.states.has(id) && !S.project.ignored_observation_ids.includes(id));
@@ -1359,10 +1672,19 @@
       if (ids.length) toast(`Added ${plural(ids.length, 'observation')}.`);
       else if (ignoreIds.length) toast(`Ignored ${plural(ignoreIds.length, 'observation')}; they won't be offered again.`);
       goto(S.step === 'sources' ? 'organize' : S.step);
-    } catch (err) { handleApiError(err); }
+    } catch (err) {
+      handleApiError(err);
+    } finally {
+      delete modal.dataset.busy;
+      buttons.forEach((b) => { b.disabled = false; });
+      updateReviewButtons();
+    }
   }
   $('#btn-review-add-all').addEventListener('click', () => {
-    for (const id of S.reviewIds) reviewSel.set(id, new Set(S.obs.get(id).photos.map((p) => p.id)));
+    // Every observation goes in; keep photo choices made here, else its first photo.
+    for (const id of S.reviewIds) {
+      if (!reviewSel.get(id) || !reviewSel.get(id).size) reviewSel.set(id, new Set(S.obs.get(id).photos.slice(0, 1).map((p) => p.id)));
+    }
     addReviewed(S.reviewIds.slice(), []);
   });
   $('#btn-review-add-selected').addEventListener('click', () => {
@@ -1377,18 +1699,19 @@
   $$('.modal').forEach((m) => {
     m.addEventListener('click', (e) => {
       if (e.target === m || e.target.closest('[data-close]')) {
-        if (m.id === 'load-modal') return;
+        if (m.id === 'load-modal' || m.dataset.busy) return;
         m.hidden = true;
         if (m.id === 'review-modal') updateStats();
       }
     });
   });
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') $$('.modal').forEach((m) => { if (m.id !== 'load-modal') m.hidden = true; });
+    if (e.key === 'Escape') $$('.modal').forEach((m) => { if (m.id !== 'load-modal' && !m.dataset.busy) m.hidden = true; });
   });
 
   // ---------------------------------------------------------------- save / open
-  $('#btn-save-project').addEventListener('click', async () => {
+  $('#btn-save-project').addEventListener('click', saveProjectFile);
+  async function saveProjectFile() {
     if (!S.project.sources.length) { toast('Add a source before saving a project.', true); return; }
     try {
       const data = await api('/api/project/export', { method: 'POST', body: { project: S.project } });
@@ -1400,9 +1723,10 @@
       a.remove();
       setTimeout(() => URL.revokeObjectURL(a.href), 5000);
       S.dirty = false;
+      saveDraft();
       toast('Project saved. Open it here later to refresh it from iNaturalist.');
     } catch (err) { toast(err.message, true); }
-  });
+  }
 
   $('#btn-open-project').addEventListener('click', () => {
     if (S.dirty && S.project.observations.length && !confirm('Open another project? Unsaved changes to this one will be lost.')) return;
@@ -1413,14 +1737,17 @@
     e.target.value = '';
     if (!file) return;
     if (file.size > 8 * 1024 * 1024) { toast('That file is too large to be a project file.', true); return; }
+    const gen = projectGen;
     try {
       const text = await file.text();
       const res = await api('/api/project/validate', { method: 'POST', raw: text });
+      if (gen !== projectGen) return; // New project (or another file) was chosen meanwhile
       openProject(res.project);
-    } catch (err) { toast(err.message, true, 9000); }
+    } catch (err) { if (gen === projectGen) toast(err.message, true, 9000); }
   });
 
   function openProject(project) {
+    projectGen++; // cancels a draft restore still in progress
     setProject(project);
     S.obs = new Map();
     S.workspaceId = null;
@@ -1441,26 +1768,104 @@
     if (S.dirty && S.project.observations.length) { e.preventDefault(); e.returnValue = ''; }
   });
 
-  function offerRestore() {
-    let saved = null;
-    try { saved = JSON.parse(localStorage.getItem('dp-project') || 'null'); } catch (e) { saved = null; }
-    if (!saved || !Array.isArray(saved.sources) || !saved.sources.length) return;
-    const count = (saved.observations || []).length;
-    const card = el('div', { class: 'card subtle' },
-      el('p', {}, `Resume the project you were working on in this browser${saved.settings && saved.settings.title ? ` (“${saved.settings.title}”)` : ''}: ${plural(saved.sources.length, 'source')}, ${plural(count, 'observation')}?`),
+  window.addEventListener('pagehide', saveDraft);
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') saveDraft(); });
+
+  // A draft that could not be restored is moved here, so autosaving whatever the
+  // user does next can never delete it. A card offers to try again or discard it.
+  const UNRESTORED_KEY = 'dp-draft-unrestored';
+
+  function readDraft(key) {
+    try {
+      const d = JSON.parse(localStorage.getItem(key) || 'null');
+      return d && d.project && Array.isArray(d.project.sources) && d.project.sources.length ? d : null;
+    } catch (e) { return null; }
+  }
+  function setAsideDraft(d) {
+    try { localStorage.setItem(UNRESTORED_KEY, JSON.stringify(d)); } catch (e) { /* ignore */ }
+  }
+
+  // Validate a draft and continue it. Returns false if it could not be restored.
+  // `replace` = the user asked for it in place of the open project.
+  async function restoreDraft(d, replace = false) {
+    const gen = projectGen;
+    let project;
+    try {
+      project = (await api('/api/project/validate', { method: 'POST', body: d.project })).project;
+    } catch (err) {
+      toast(`Your last project could not be restored: ${err.message}`, true, 9000);
+      return false;
+    }
+    // The user opened or started another project while this was checked. At
+    // startup that discards the draft; a retry keeps the set-aside copy.
+    if (gen !== projectGen) return !replace;
+    // They began adding sources instead: keep their work, set the old one aside.
+    if (S.project.sources.length && !replace) return false;
+    projectGen++;
+    setProject(project);
+    S.obs = new Map();
+    S.workspaceId = d.workspaceId || null;
+    S.loadedSources = new Set();
+    S.sourceCounts = {};
+    S.pendingNew = null;
+    S.dirty = d.dirty !== false;
+    restoring = false;
+    goto('sources');
+    if (!project.observations.length || !project.sources.some((s) => s.enabled)) {
+      toast('Restored your sources. Use New project in the top bar to start over.', false, 7000);
+      return true;
+    }
+    // With a live workspace nothing is searched again; an expired one means a normal refresh.
+    await startLoad(S.workspaceId ? [] : null, { step: d.step, dirty: d.dirty });
+    if (!S.obs.size) { S.workspaceId = null; updateStepper(); } // load failed or was cancelled; Sources can retry
+    return true;
+  }
+
+  function offerUnrestored() {
+    const d = readDraft(UNRESTORED_KEY);
+    $('#unrestored-card')?.remove();
+    if (!d) return;
+    const title = d.project.settings && d.project.settings.title;
+    const card = el('div', { class: 'card subtle', id: 'unrestored-card' },
+      el('p', { text: `A project you were working on${title ? ` (“${title}”)` : ''} could not be restored: ${plural(d.project.sources.length, 'source')}, ${plural((d.project.observations || []).length, 'observation')}.` }),
       el('div', { class: 'row-start' },
-        el('button', { type: 'button', class: 'btn btn-primary', text: 'Resume', onclick: async () => {
-          card.remove();
-          try {
-            const res = await api('/api/project/validate', { method: 'POST', body: saved });
-            openProject(res.project);
-          } catch (err) { toast(err.message, true); }
+        el('button', { type: 'button', class: 'btn btn-primary', text: 'Try again', onclick: async () => {
+          if (S.project.sources.length && !confirm('Replace the project that is open now with the earlier one?')) return;
+          // The open project stays untouched unless the earlier one checks out.
+          if (await restoreDraft(d, true)) {
+            try { localStorage.removeItem(UNRESTORED_KEY); } catch (e) { /* ignore */ }
+            card.remove();
+          }
         } }),
-        el('button', { type: 'button', class: 'btn', text: 'Start a new project', onclick: () => { card.remove(); try { localStorage.removeItem('dp-project'); } catch (e) { /* ignore */ } } })));
+        el('button', { type: 'button', class: 'btn', text: 'Discard it', onclick: () => {
+          if (!confirm('Discard the earlier project? This cannot be undone.')) return;
+          try { localStorage.removeItem(UNRESTORED_KEY); } catch (e) { /* ignore */ }
+          card.remove();
+        } })));
     $('#step-sources').prepend(card);
   }
 
+  async function resumeDraft() {
+    let d = readDraft(DRAFT_KEY);
+    if (!d) {
+      try { // the older format stored only the project
+        const p = JSON.parse(localStorage.getItem('dp-project') || 'null');
+        if (p && Array.isArray(p.sources) && p.sources.length) d = { project: p, step: 'organize', dirty: true };
+      } catch (e) { /* ignore */ }
+    }
+    if (d && !(await restoreDraft(d))) setAsideDraft(d);
+    // Only now may autosave touch the stored draft: it was restored or set aside.
+    restoring = false;
+    offerUnrestored();
+  }
+
+  $('#btn-new-project').addEventListener('click', () => {
+    if (S.dirty && S.project.observations.length && !confirm('Start a new project? Unsaved changes to this one will be lost.')) return;
+    try { localStorage.removeItem(DRAFT_KEY); localStorage.removeItem('dp-project'); } catch (e) { /* ignore */ }
+    openProject(newProject());
+  });
+
   renderSources();
   updateStepper();
-  offerRestore();
+  resumeDraft();
 })();
