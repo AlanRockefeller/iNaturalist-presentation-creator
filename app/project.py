@@ -289,12 +289,25 @@ def add_observations(
     selected: dict[int, list[int]] | None = None,
     placement: str = "sorted",
     workspace: dict | None = None,
+    max_observations: int | None = None,
 ) -> Project:
-    """Add observations (first photo selected unless ``selected`` says otherwise)."""
+    """Add observations (first photo selected unless ``selected`` says otherwise).
+
+    Raises ProjectError if the project would hold more than ``max_observations``,
+    so it never grows past what a project file may contain.
+    """
     from .sorting import insert_sorted
 
     selected = selected or {}
     existing = {s.id for s in project.observations}
+    if max_observations is not None:
+        adding = len({oid for oid in ids if oid not in existing and oid in observations})
+        if len(existing) + adding > max_observations:
+            room = max(0, max_observations - len(existing))
+            raise ProjectError(
+                f"A project can hold {max_observations:,} observations. This one has {len(existing):,}, "
+                f"so {room:,} more can be added, not {adding:,}. Select fewer, or remove some first."
+            )
     stamp = now_iso()
     new_states = []
     for oid in dict.fromkeys(ids):

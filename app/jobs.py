@@ -19,11 +19,11 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .config import Settings
-from .images import ImageFetchError, MediaFetcher, prepare_for_slide, title_background
+from .images import DownloadCancelled, ImageFetchError, MediaFetcher, prepare_for_slide, title_background
 from .inaturalist import INatClient, INatError, SourceError, source_params
 from .models import Project
 from .presentation import build_slide_plan, write_pptx
-from .project import add_observations, refresh_project, safe_filename
+from .project import ProjectError, add_observations, refresh_project, safe_filename
 from .ratelimit import BudgetExceeded
 from .workspace import WorkspaceExpired, WorkspaceStore
 
@@ -250,7 +250,11 @@ class JobManager:
             sort = project.settings.sort
             key = sort.key if sort.key not in ("custom",) else "taxonomic"
             ordered = sort_ids(ids, observations, project, key, sort.direction, workspace)
-            project = add_observations(project, ordered, observations, membership, placement="append")
+            try:
+                project = add_observations(project, ordered, observations, membership, placement="append",
+                                           max_observations=s.max_observations_per_project)
+            except ProjectError as exc:
+                raise JobFailed(str(exc)) from None
             summary["auto_added"] = len(ids)
             summary["new_ids"], summary["new"] = [], 0
             summary["new_by_source"] = {k: 0 for k in summary["new_by_source"]}
@@ -308,8 +312,18 @@ class JobManager:
         failures: list[str] = []
         total = len(photos)
         job.progress("download", 0, total, f"Downloading photos: 0 / {total}")
+        def fetch(pid: int, url: str) -> Path:
+            # Queued downloads that start after a cancel stop at once; running
+            # ones stop at their next chunk (see MediaFetcher.fetch_original).
+            if job.cancel_event.is_set():
+                raise JobCancelled()
+            try:
+                return self.media.fetch_original(pid, url, cancelled=job.cancel_event.is_set)
+            except DownloadCancelled:
+                raise JobCancelled() from None
+
         with ThreadPoolExecutor(self.settings.media_concurrency, thread_name_prefix="media") as pool:
-            futures = {pool.submit(self.media.fetch_original, pid, url): pid for pid, url in photos.items()}
+            futures = {pool.submit(fetch, pid, url): pid for pid, url in photos.items()}
             done = 0
             try:
                 for fut in as_completed(futures):

@@ -81,7 +81,7 @@
   function newProject() {
     return {
       format: 'dikarya-presentation',
-      schema_version: 3,
+      schema_version: 4,
       sources: [],
       settings: {
         title: '', presenter: '', background: 'black', title_photo: null,
@@ -108,6 +108,10 @@
     step: 'sources',
     plan: null,
   };
+
+  // Bumped whenever the user starts or opens another project. A request that
+  // finishes after that belongs to the old project, so its result is dropped.
+  let projectGen = 0;
 
   function setProject(project) {
     S.project = project;
@@ -160,19 +164,25 @@
     const en = enabledSourceIds();
     return !st.source_ids.some((sid) => en.has(sid));
   }
-  function groupLabel(id) {
+  const GROUP_RANKS = ['kingdom', 'phylum', 'class', 'order', 'family', 'genus'];
+  // The group an observation is listed under, like group_of() in sorting.py:
+  // the label is shown, the key tells apart groups that share a label (two
+  // sources with the same label, or one genus name under two families).
+  function groupOf(id) {
     const g = S.project.settings.grouping;
-    if (g === 'none') return '';
     const o = S.obs.get(id);
-    if (!o) return '';
+    if (g === 'none' || !o) return { key: '', label: '' };
     if (g === 'source') {
       const st = S.states.get(id);
       const en = enabledSourceIds();
       const ids = (st && st.source_ids) || [];
       const src = S.project.sources.find((s) => ids.includes(s.id) && en.has(s.id)) || S.project.sources.find((s) => ids.includes(s.id));
-      return src ? (src.label || src.url) : 'Other observations';
+      return src ? { key: `source:${src.id}`, label: src.label || src.url } : { key: 'other', label: 'Other observations' };
     }
-    return (o.ranks && o.ranks[g]) || 'Unclassified';
+    const ranks = o.ranks || {};
+    if (!ranks[g]) return { key: 'unclassified', label: 'Unclassified' };
+    const path = GROUP_RANKS.slice(0, GROUP_RANKS.indexOf(g) + 1).map((r) => ranks[r] || '');
+    return { key: JSON.stringify(path), label: ranks[g] };
   }
   const GROUP_NAMES = { kingdom: 'Kingdom', phylum: 'Phylum', class: 'Class', order: 'Order', family: 'Family', genus: 'Genus', source: 'Source' };
 
@@ -251,8 +261,10 @@
     }
     const btn = $('#btn-add-source');
     btn.disabled = true;
+    const gen = projectGen;
     try {
       const parsed = await api('/api/sources/parse', { method: 'POST', body: { url, username } });
+      if (gen !== projectGen) return; // the project was replaced while this was checked
       if (S.project.sources.some((s) => s.url === parsed.url)) {
         $('#source-error').textContent = 'That source is already in the project.';
         return;
@@ -361,10 +373,27 @@
   let loadJobId = null;
   let loadCancelled = false;
 
+  // Poll a job until it ends. A dropped connection or a server restart in
+  // progress (502/503/504) is retried for a few minutes, because the job keeps
+  // running on the server; only "unknown job" (404) and other errors end it.
   async function pollJob(id, onProgress) {
+    let last = { state: 'running', done: 0, total: 0, message: '' };
+    let failingSince = null;
     for (;;) {
-      await new Promise((r) => setTimeout(r, 900));
-      const job = await api(`/api/jobs/${encodeURIComponent(id)}`);
+      await new Promise((r) => setTimeout(r, failingSince ? 3000 : 900));
+      let job;
+      try {
+        job = await api(`/api/jobs/${encodeURIComponent(id)}`);
+      } catch (err) {
+        const temporary = !err.status || [502, 503, 504].includes(err.status);
+        if (!temporary) throw err;
+        failingSince = failingSince || Date.now();
+        if (Date.now() - failingSince > 5 * 60 * 1000) throw err;
+        onProgress({ ...last, message: 'Lost contact with the server. Retrying…' });
+        continue;
+      }
+      failingSince = null;
+      last = job;
       onProgress(job);
       if (['done', 'error', 'cancelled'].includes(job.state)) return job;
     }
@@ -492,10 +521,10 @@
         if ((o.faves_count || 0) < minF) { hiddenFaves++; continue; }
       }
       if (!findMatches(id, needle)) continue;
-      const g = groupLabel(id);
-      if (S.project.settings.grouping !== 'none' && g && g !== lastGroup) {
-        items.push({ type: 'group', label: g });
-        lastGroup = g;
+      const g = groupOf(id);
+      if (S.project.settings.grouping !== 'none' && g.label && g.key !== lastGroup) {
+        items.push({ type: 'group', key: g.key, label: g.label });
+        lastGroup = g.key;
       }
       items.push({ type: 'obs', id, pos: posOf.get(id) });
     }
@@ -504,8 +533,8 @@
 
   // Removes the observations listed under a group heading (those hidden by the
   // filters stay), like "Remove from project" on each card.
-  function removeGroup(label) {
-    const ids = new Set(organizeItems().items.filter((it) => it.type === 'obs' && groupLabel(it.id) === label).map((it) => it.id));
+  function removeGroup(key, label) {
+    const ids = new Set(organizeItems().items.filter((it) => it.type === 'obs' && groupOf(it.id).key === key).map((it) => it.id));
     if (!ids.size) return;
     if (!confirm(`Remove ${plural(ids.size, 'observation')} in ${label} from the project?`)) return;
     const p = S.project;
@@ -531,7 +560,7 @@
           el('button', {
             type: 'button', class: 'group-remove', text: '✕',
             title: `Remove every observation in this ${rank} from the project`, 'aria-label': `Remove ${rank} ${item.label}`,
-            onclick: () => removeGroup(item.label),
+            onclick: () => removeGroup(item.key, item.label),
           }));
       }
       const card = kbDecorate(obsCard(item.id, item.pos));
@@ -1044,21 +1073,29 @@
     $('#min-faves').value = String(s.min_faves || 0);
   }
 
+  let sortSeq = 0;
   async function applySort(key, direction) {
     const sort = S.project.settings.sort;
     if (key === 'custom') { key = sort.base_key; direction = sort.base_direction; }
+    const gen = projectGen;
+    const seq = ++sortSeq;
     try {
       const res = await api('/api/sort', {
         method: 'POST',
         body: { project: S.project, workspace_id: S.workspaceId, key, direction, seed: Math.floor(Math.random() * 1e9) },
       });
-      S.project.order = res.order;
+      // Drop it if the project was replaced or a newer sort was asked for.
+      if (gen !== projectGen || seq !== sortSeq) return;
+      // Observations added or removed meanwhile: keep exactly the current ones.
+      const order = res.order.filter((id) => S.states.has(id));
+      const placed = new Set(order);
+      S.project.order = order.concat(S.project.order.filter((id) => !placed.has(id)));
       sort.key = key;
       sort.direction = direction;
       if (key !== 'random') { sort.base_key = key; sort.base_direction = direction; }
       markDirty();
       renderOrganize();
-    } catch (err) { handleApiError(err); }
+    } catch (err) { if (gen === projectGen && seq === sortSeq) handleApiError(err); }
   }
 
   $('#sort-key').addEventListener('change', (e) => {
@@ -1610,6 +1647,13 @@
   async function addReviewed(ids, ignoreIds) {
     const selected = {};
     ids.forEach((id) => { selected[String(id)] = [...(reviewSel.get(id) || [])]; });
+    // The server returns the whole project, so nothing may change it until the
+    // reply is in: the dialog stays open (and covers the page) meanwhile.
+    const modal = $('#review-modal');
+    const buttons = $$('button', modal);
+    modal.dataset.busy = '1';
+    buttons.forEach((b) => { b.disabled = true; });
+    const gen = projectGen;
     try {
       const res = await api('/api/observations/add', {
         method: 'POST',
@@ -1618,6 +1662,7 @@
           selected_photo_ids: selected, placement: $('#review-placement').value, ignore_ids: ignoreIds,
         },
       });
+      if (gen !== projectGen) return; // another project was opened meanwhile
       setProject(res.project);
       markDirty();
       const remaining = (S.reviewIds || []).filter((id) => !S.states.has(id) && !S.project.ignored_observation_ids.includes(id));
@@ -1627,7 +1672,13 @@
       if (ids.length) toast(`Added ${plural(ids.length, 'observation')}.`);
       else if (ignoreIds.length) toast(`Ignored ${plural(ignoreIds.length, 'observation')}; they won't be offered again.`);
       goto(S.step === 'sources' ? 'organize' : S.step);
-    } catch (err) { handleApiError(err); }
+    } catch (err) {
+      handleApiError(err);
+    } finally {
+      delete modal.dataset.busy;
+      buttons.forEach((b) => { b.disabled = false; });
+      updateReviewButtons();
+    }
   }
   $('#btn-review-add-all').addEventListener('click', () => {
     // Every observation goes in; keep photo choices made here, else its first photo.
@@ -1648,14 +1699,14 @@
   $$('.modal').forEach((m) => {
     m.addEventListener('click', (e) => {
       if (e.target === m || e.target.closest('[data-close]')) {
-        if (m.id === 'load-modal') return;
+        if (m.id === 'load-modal' || m.dataset.busy) return;
         m.hidden = true;
         if (m.id === 'review-modal') updateStats();
       }
     });
   });
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') $$('.modal').forEach((m) => { if (m.id !== 'load-modal') m.hidden = true; });
+    if (e.key === 'Escape') $$('.modal').forEach((m) => { if (m.id !== 'load-modal' && !m.dataset.busy) m.hidden = true; });
   });
 
   // ---------------------------------------------------------------- save / open
@@ -1686,11 +1737,13 @@
     e.target.value = '';
     if (!file) return;
     if (file.size > 8 * 1024 * 1024) { toast('That file is too large to be a project file.', true); return; }
+    const gen = projectGen;
     try {
       const text = await file.text();
       const res = await api('/api/project/validate', { method: 'POST', raw: text });
+      if (gen !== projectGen) return; // New project (or another file) was chosen meanwhile
       openProject(res.project);
-    } catch (err) { toast(err.message, true, 9000); }
+    } catch (err) { if (gen === projectGen) toast(err.message, true, 9000); }
   });
 
   function openProject(project) {
@@ -1721,7 +1774,6 @@
   // A draft that could not be restored is moved here, so autosaving whatever the
   // user does next can never delete it. A card offers to try again or discard it.
   const UNRESTORED_KEY = 'dp-draft-unrestored';
-  let projectGen = 0; // bumped when the user starts or opens another project
 
   function readDraft(key) {
     try {

@@ -44,6 +44,10 @@ class ImageFetchError(Exception):
     """A photo could not be downloaded. Message is user-safe."""
 
 
+class DownloadCancelled(Exception):
+    """The job that wanted this photo was cancelled."""
+
+
 @dataclass
 class PreparedImage:
     path: Path
@@ -76,8 +80,16 @@ class MediaFetcher:
                 return p
         return None
 
-    def fetch_original(self, photo_id: int, api_url: str) -> Path:
-        """Download (or reuse the cached) original of a photo; returns its path."""
+    def fetch_original(self, photo_id: int, api_url: str, cancelled=None) -> Path:
+        """Download (or reuse the cached) original of a photo; returns its path.
+
+        ``cancelled`` (optional, returns bool) is checked before the download and
+        between chunks and retries; DownloadCancelled is raised when it is true.
+        """
+        def stop_if_cancelled():
+            if cancelled and cancelled():
+                raise DownloadCancelled()
+
         url = photo_url(api_url, "original")
         if not url:
             raise ImageFetchError(f"Photo {photo_id} has an untrusted URL and was skipped.")
@@ -88,6 +100,7 @@ class MediaFetcher:
             if cached:
                 os.utime(cached)  # refresh TTL
                 return cached
+            stop_if_cancelled()
             # Refuse once the allowance is spent. check(0) can never fail because
             # remaining() clamps at zero, so ask for at least one byte.
             self.budget.check(1)
@@ -114,6 +127,7 @@ class MediaFetcher:
                                 total = 0
                                 try:
                                     for chunk in resp.iter_bytes(256 * 1024):
+                                        stop_if_cancelled()
                                         total += len(chunk)
                                         if total > self.settings.max_image_bytes:
                                             raise ImageFetchError(f"Photo {photo_id} is too large.")
@@ -126,6 +140,7 @@ class MediaFetcher:
                             if attempt == 2:
                                 raise ImageFetchError(f"Photo {photo_id} could not be downloaded.") from exc
                             time.sleep(2 * (attempt + 1))
+                            stop_if_cancelled()
                 _verify_image(Path(tmp), photo_id)
                 os.replace(tmp, final)
                 return final

@@ -269,3 +269,13 @@ def test_photo_order_keeps_only_known_photos_once():
         "observations": [{"id": 1, "known_photo_ids": [5, 6, 7], "photo_order": [7, 9, 7, 5]}],
     })
     assert pr.observations[0].photo_order == [7, 5]
+
+
+def test_add_observations_refuses_to_pass_the_project_limit():
+    pr = base_project()
+    obs = norm(make_obs(1, 47692), make_obs(2, 47602), make_obs(3, 47702))
+    pr = add_observations(pr, [1], obs, {1: ["a"]}, placement="append", max_observations=2)
+    with pytest.raises(ProjectError) as exc:
+        add_observations(pr, [1, 2, 3], obs, {2: ["a"], 3: ["a"]}, placement="append", max_observations=2)
+    assert "1 more can be added, not 2" in str(exc.value)
+    assert len(add_observations(pr, [2], obs, {2: ["a"]}, placement="append", max_observations=2).observations) == 2
