@@ -235,8 +235,8 @@ def title_background(src: Path, out: Path, position: str = "center", max_width: 
             im = im.transpose(ROTATE_CLOCKWISE[rotation])
         # Never upscale beyond what the source supports for a 16:9 cover crop.
         cover_w = min(im.width, int(im.height * 16 / 9))
-        width = max(640, min(max_width, cover_w))
-        height = round(width * 9 / 16)
+        width = max(1, min(max_width, cover_w))
+        height = max(1, round(width * 9 / 16))
         centering = {"top": (0.5, 0.2), "bottom": (0.5, 0.8)}.get(position, (0.5, 0.5))
         im = ImageOps.fit(im, (width, height), method=Image.LANCZOS, centering=centering)
         im = ImageEnhance.Color(im).enhance(0.55)

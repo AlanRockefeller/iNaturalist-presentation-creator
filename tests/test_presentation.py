@@ -317,6 +317,14 @@ def test_rotated_photo_fits_slide_without_crop_or_reencoding(tmp_path):
     assert media == {imgs[pid].path.read_bytes() for pid in imgs}
 
 
+def test_title_background_never_upscales_a_small_photo(tmp_path):
+    src = _jpeg(tmp_path / "small.jpg", 400, 300)
+    out = title_background(src, tmp_path / "bg.jpg")
+    assert (out.width, out.height) == (400, 225)
+    with Image.open(out.path) as im:
+        assert im.size == (400, 225)
+
+
 def test_title_background_follows_rotation(tmp_path):
     src = tmp_path / "t.jpg"
     im = Image.new("RGB", (1000, 2000), (255, 0, 0))

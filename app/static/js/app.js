@@ -407,6 +407,7 @@
   }
 
   async function startLoad(refreshSourceIds, resume = null) {
+    const gen = projectGen;
     const modal = $('#load-modal');
     $('#load-message').textContent = 'Starting…';
     setBar($('#load-bar'), 0, 0);
@@ -428,9 +429,10 @@
       });
       if (final.state === 'cancelled' || loadCancelled) { toast('Loading cancelled.'); return; }
       if (final.state !== 'done') throw new Error(final.error || 'Loading failed.');
+      if (gen !== projectGen) return; // another project was opened meanwhile
       applyLoadResult(final.result, resume);
     } catch (err) {
-      toast(err.message, true, 9000);
+      if (gen === projectGen) toast(err.message, true, 9000);
     } finally {
       modal.hidden = true;
       loadJobId = null;
@@ -1624,8 +1626,14 @@
       const chips = $('#review-by-source');
       chips.replaceChildren(...S.project.sources.filter((s) => (sum.new_by_source || {})[s.id]).map((s) => el('span', { class: 'chip', text: `${s.label}: ${n(sum.new_by_source[s.id])} new` })));
       // Like add_observations: only the first photo of each starts selected.
-      reviewSel = new Map(ids.map((id) => [id, new Set(S.obs.get(id).photos.slice(0, 1).map((p) => p.id))]));
-      $('#review-all').checked = true;
+      // Reopening a review put off with "Decide later" keeps the choices made then.
+      const prev = newOnly ? reviewSel : new Map();
+      reviewSel = new Map(ids.map((id) => {
+        const photos = S.obs.get(id).photos;
+        const kept = prev.has(id) ? photos.filter((p) => prev.get(id).has(p.id)) : photos.slice(0, 1);
+        return [id, new Set(kept.map((p) => p.id))];
+      }));
+      $('#review-all').checked = ids.every((id) => reviewSel.get(id).size);
       if (reviewRenderer) reviewRenderer.disconnect();
       reviewRenderer = chunkRender($('#review-list'), $('#review-sentinel'), ids, (id) => obsCard(id, 0, reviewAdapter(id)), 0, 40);
       updateReviewButtons();
