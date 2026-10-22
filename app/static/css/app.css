@@ -223,7 +223,7 @@ html.dark .chip.warn { background: #4a241c; color: #ffb4a4; border-color: #7a3a2
 .title-photo { display: flex; gap: 14px; align-items: flex-start; font-weight: 400; }
 .title-photo-preview { position: relative; container-type: size; width: 240px; aspect-ratio: 16 / 9; border-radius: 8px; overflow: hidden; background: #111; display: flex; align-items: center; justify-content: center; flex: none; border: 1px solid var(--line); }
 .title-photo-preview img { width: 100%; height: 100%; object-fit: cover; filter: saturate(.55) brightness(.5); }
-.picker-scroll { max-height: 62vh; overflow-y: auto; }
+.picker-scroll { max-height: 62vh; overflow-y: auto; overscroll-behavior: contain; }
 .picker-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 8px; padding: 4px; }
 .picker-grid button { border: 2px solid transparent; padding: 0; border-radius: 8px; overflow: hidden; aspect-ratio: 1; cursor: pointer; background: var(--panel-2); }
 .picker-grid button:hover, .picker-grid button.current { border-color: var(--journal-gold); }
@@ -300,7 +300,9 @@ html.dark .result-err { background: #4a241c; border-color: #7a3a2c; color: #ffb4
 .review-summary { display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px; }
 .review-summary .big { font-size: 1.05rem; }
 .review-controls { display: flex; gap: 12px; align-items: center; margin: 8px 0; flex-wrap: wrap; }
-.review-scroll { overflow-y: auto; min-height: 120px; flex: 1; padding-right: 4px; }
+/* The box is capped at 92vh; this column must be allowed to shrink so the list scrolls inside it. */
+#review-new { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.review-scroll { overflow-y: auto; overscroll-behavior: contain; min-height: 120px; flex: 1; padding-right: 4px; }
 .review-list { display: flex; flex-direction: column; gap: 8px; }
 .obs { scroll-margin: 230px 0 90px; } /* clear the sticky bars when scrolled to by keyboard */
 .obs.kb-current { border-color: var(--journal-gold); box-shadow: 0 0 0 2px var(--journal-gold); }

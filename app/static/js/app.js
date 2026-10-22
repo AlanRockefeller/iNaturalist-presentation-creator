@@ -1591,7 +1591,7 @@
   function updateReviewButtons() {
     const chosen = [...reviewSel.values()].filter((s) => s.size).length;
     $('#btn-review-add-selected').textContent = `Add selected (${n(chosen)})`;
-    $('#btn-review-add-selected').disabled = chosen === 0;
+    $('#btn-review-add-selected').disabled = chosen === 0 || !!$('#review-modal').dataset.busy;
   }
 
   function showReview(sum, newOnly = false) {
@@ -1645,14 +1645,17 @@
   });
 
   async function addReviewed(ids, ignoreIds) {
+    const modal = $('#review-modal');
+    if (modal.dataset.busy) return; // one request at a time
     const selected = {};
     ids.forEach((id) => { selected[String(id)] = [...(reviewSel.get(id) || [])]; });
     // The server returns the whole project, so nothing may change it until the
-    // reply is in: the dialog stays open (and covers the page) meanwhile.
-    const modal = $('#review-modal');
+    // reply is in: the dialog stays open (and covers the page) meanwhile, and
+    // the list is inert so photo choices, including cards rendered later, can't change.
     const buttons = $$('button', modal);
     modal.dataset.busy = '1';
     buttons.forEach((b) => { b.disabled = true; });
+    $('#review-new').inert = true;
     const gen = projectGen;
     try {
       const res = await api('/api/observations/add', {
@@ -1676,6 +1679,7 @@
       handleApiError(err);
     } finally {
       delete modal.dataset.busy;
+      $('#review-new').inert = false;
       buttons.forEach((b) => { b.disabled = false; });
       updateReviewButtons();
     }
