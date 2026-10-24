@@ -28,6 +28,7 @@
       <a href="https://dikarya.us/finder">Observation Finder</a>
     </div>
     <div class="topnav-actions">
+      <button type="button" class="btn btn-ghost-dark" id="btn-new-project" title="Clear this project and start over">New project</button>
       <button type="button" class="btn btn-ghost-dark" id="btn-open-project" title="Open a saved .dikarya-presentation.json file">Open project</button>
       <button type="button" class="btn btn-gold" id="btn-save-project" title="Download this project as a small JSON file">Save project</button>
       <button type="button" class="icon-btn" id="btn-theme" title="Toggle dark mode" aria-label="Toggle dark mode">
@@ -71,7 +72,6 @@
         </label>
         <button type="submit" class="btn btn-primary" id="btn-add-source">Add source</button>
       </form>
-      <p class="muted small">Enter your username when these are your own photos. The search is limited to your observations, and the photo credit line starts off. Leave it blank for searches that include other people's photos; their names are then credited on each slide.</p>
       <p class="form-error" id="source-error" role="alert"></p>
       <ul class="source-list" id="source-list"></ul>
       <p class="empty-note" id="sources-empty">No sources yet.</p>
@@ -141,7 +141,7 @@
     </div>
     <div class="statusline">
       <span id="org-stats"></span>
-      <span class="muted small">Drag ⠿ to reorder. Click a photo to inspect it.</span>
+      <span class="muted small">Drag ⠿ to reorder. Click a photo to inspect it. Drag a photo to change its slide order. Keys: <kbd>↑</kbd> <kbd>↓</kbd> observations, <kbd>←</kbd> <kbd>→</kbd> photos, <kbd>Shift</kbd>+<kbd>←</kbd> <kbd>→</kbd> move a photo, <kbd>Space</kbd> include, <kbd>Enter</kbd> enlarge.</span>
     </div>
     <div id="obs-list" class="obs-list" aria-live="polite"></div>
     <div id="obs-sentinel" class="sentinel"></div>
@@ -273,7 +273,7 @@
       <h3 id="review-new-title"></h3>
       <div id="review-by-source" class="chips"></div>
       <div class="review-controls">
-        <label class="check"><input type="checkbox" id="review-all" checked> Select all</label>
+        <label class="check"><input type="checkbox" id="review-all" checked> Select all (first photo of each)</label>
         <span class="muted small">New observations are not added until you choose.</span>
         <span class="grow"></span>
         <label class="small">Place them
@@ -305,6 +305,8 @@
       <button type="button" class="vbtn" id="v-zoom-in" title="Zoom in (+)">+</button>
       <button type="button" class="vbtn" id="v-zoom-fit" title="Fit (0)">Fit</button>
       <button type="button" class="vbtn" id="v-zoom-100" title="Actual pixels (1)">1:1</button>
+      <button type="button" class="vbtn" id="v-rot-left" title="Rotate left (Shift+R)" aria-label="Rotate left">↺</button>
+      <button type="button" class="vbtn" id="v-rot-right" title="Rotate right (R)" aria-label="Rotate right">↻</button>
       <label class="vcheck"><input type="checkbox" id="v-selected"> Include <kbd>space</kbd></label>
       <button type="button" class="vbtn" id="v-close" title="Close (Esc)">×</button>
     </div>

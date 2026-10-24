@@ -172,3 +172,51 @@ def test_spent_byte_budget_stops_photo_downloads(settings, fake):
     with pytest.raises(BudgetExceeded):
         media.fetch_original(12, base.format(12))
     assert len(fake.photo_requests) == 1
+
+
+def test_backoff_also_delays_requests_already_waiting():
+    t = [0.0]
+    penalized = []
+
+    def sleep(d):
+        if not penalized:  # a 429 elsewhere arrives while this request sleeps
+            penalized.append(True)
+            rl.penalize(10)
+        t[0] += d
+
+    rl = RateLimiter(1.0, clock=lambda: t[0], sleep=sleep)
+    rl.wait()
+    waited = rl.wait()  # reserved t=1, but the penalty holds everything until t=10
+    assert t[0] == pytest.approx(10.0) and waited == pytest.approx(10.0)
+
+
+def test_backoff_requeues_waiters_from_the_hold_not_the_old_queue_tail():
+    t = [0.0]
+    penalized = []
+
+    def sleep(d):
+        if not penalized:
+            penalized.append(True)
+            rl._next = 21.0  # 19 more requests have queued behind this one
+            rl.penalize(10)
+        t[0] += d
+
+    rl = RateLimiter(1.0, clock=lambda: t[0], sleep=sleep)
+    rl.wait()
+    rl.wait()  # reserved t=1; after the penalty it goes first at t=10, not at t=21
+    assert t[0] == pytest.approx(10.0)
+
+
+def test_cancelled_download_stops_before_and_during_streaming(settings, fake):
+    from app.images import DownloadCancelled
+
+    fake.add(make_obs(1, 47170, photos=((11, 800, 600), (12, 800, 600))))
+    media = MediaFetcher(settings, ByteBudget(10 ** 12, 10 ** 12), http=httpx.Client(transport=httpx.MockTransport(fake.handler)))
+    base = f"https://{PHOTO_HOST}/photos/{{}}/square.jpg"
+    with pytest.raises(DownloadCancelled):
+        media.fetch_original(11, base.format(11), cancelled=lambda: True)
+    assert fake.photo_requests == []
+    calls = []
+    with pytest.raises(DownloadCancelled):  # cancelled after the request started
+        media.fetch_original(12, base.format(12), cancelled=lambda: calls.append(1) or len(calls) > 1)
+    assert media.cached_path(12) is None and not list(settings.media_cache_dir.glob("*.part"))

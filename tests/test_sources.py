@@ -152,3 +152,25 @@ def test_build_source_rejections(url, username, msg):
     with pytest.raises(SourceError) as exc:
         build_source(url, username)
     assert msg in str(exc.value)
+
+
+@pytest.mark.parametrize("url,login", [
+    ("https://www.inaturalist.org/observations?user_id=alan_rockefeller&taxon_id=47170", "alan_rockefeller"),
+    ("https://www.inaturalist.org/observations?user_login=alan_rockefeller&place_id=1", "alan_rockefeller"),
+    ("https://www.inaturalist.org/observations/alan_rockefeller?taxon_id=47170", "alan_rockefeller"),
+])
+def test_url_filtered_to_one_user_is_a_username_source(url, login):
+    src = build_source(url)
+    assert src["type"] == "username" and src["username"] == login
+    assert src["params"]["user_id"] == login and "user_login" not in src["params"]
+    assert src["params"]["taxon_id" if "taxon_id" in url else "place_id"]
+
+
+@pytest.mark.parametrize("url", [
+    "https://www.inaturalist.org/observations?user_id=alan_rockefeller,bob&taxon_id=47170",  # two users
+    "https://www.inaturalist.org/observations?user_id=12345&taxon_id=47170",  # numeric id, not a login
+    "https://www.inaturalist.org/observations?taxon_id=47170",
+])
+def test_url_without_exactly_one_login_stays_a_url_source(url):
+    src = build_source(url)
+    assert src["type"] == "url" and src["username"] is None
