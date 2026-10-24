@@ -49,11 +49,13 @@ class RateLimiter:
         self._lock = threading.Lock()
         self._next = 0.0
         self._hold = 0.0  # no request may start before this (backoff after a 429)
+        self._generation = 0  # bumped when a penalty voids every pending reservation
 
     def wait(self) -> float:
         waited = 0.0
         while True:
             with self._lock:
+                generation = self._generation
                 now = self._clock()
                 start = max(now, self._next, self._hold)
                 self._next = start + self.min_interval
@@ -64,15 +66,21 @@ class RateLimiter:
             with self._lock:
                 # A penalty that arrived while this thread slept also applies to it:
                 # queue again behind the new hold instead of going at the old time.
-                if self._hold <= start:
+                if generation == self._generation:
                     return waited
 
     def penalize(self, seconds: float) -> None:
         """Push every request back, including ones already waiting, e.g. after a
         429 with Retry-After."""
         with self._lock:
-            self._hold = max(self._hold, self._clock() + max(0.0, seconds))
-            self._next = max(self._next, self._hold)
+            # At least one interval, so the queue restarting at the hold still keeps
+            # the spacing from a request that has just started.
+            hold = self._clock() + max(self.min_interval, seconds)
+            if hold > self._hold:
+                # Every waiter queues again from the new hold, in the order it wakes,
+                # so none is pushed behind reservations made before the penalty.
+                self._hold = self._next = hold
+                self._generation += 1
 
 
 class DailyBudget:
