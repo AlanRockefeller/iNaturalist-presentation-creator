@@ -191,11 +191,12 @@ def build_slide_plan(project: Project, workspace_obs: dict[int, dict], max_image
         photos.sort(key=lambda p: position[p["id"]])
 
         if grouping != "none" and settings.dividers:
-            # By group key, like the Select & Organize headings: two groups can
-            # share a label (one genus name in two families, two sources).
+            # A new divider for each new group, as in Select & Organize: two
+            # groups can share a label (one genus name in two families, two
+            # sources), so the key is compared as well as the label.
             group_key, label = group_of(obs, st, grouping, project)
-            if group_key != current_group:
-                current_group = group_key
+            if (group_key, label) != current_group:
+                current_group = (group_key, label)
                 slides.append({
                     "kind": "divider",
                     "text": label,

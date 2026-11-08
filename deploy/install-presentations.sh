@@ -120,7 +120,8 @@ id "$CODE_OWNER" &>/dev/null || { warn "user $CODE_OWNER does not exist; code wi
 # which anyone can write to). Refuse if it could have been tampered with.
 src_owner=$(stat -c %U "$SRC_DIR")
 [[ $src_owner == "$CODE_OWNER" || $src_owner == root ]] || die "$SRC_DIR is owned by $src_owner, expected $CODE_OWNER or root"
-bad_owner=$(find "$SRC_DIR" -path "$SRC_DIR/.venv" -prune -o -not -user "$CODE_OWNER" -not -user root -print -quit)
+# .claude/ holds Claude Code worktrees: other checkouts, not code installed here.
+bad_owner=$(find "$SRC_DIR" \( -path "$SRC_DIR/.venv" -o -path "$SRC_DIR/.claude" \) -prune -o -not -user "$CODE_OWNER" -not -user root -print -quit)
 [[ -z $bad_owner ]] || die "$bad_owner in the source tree is owned by an unexpected user"
 if ((IN_PLACE)); then
   info "mode:        in place ($APP_DIR is the source; permissions are normalized in step 4)"
@@ -189,7 +190,9 @@ rsync -a --delete --no-owner --no-group \
   "$SRC_DIR"/ "$APP_DIR"/
 fi
 chown -R "$CODE_OWNER:$SERVICE_USER" "$APP_DIR"
-find "$APP_DIR" \( -path "$APP_DIR/.venv" -o -path "$APP_DIR/.git" \) -prune -o -type d -exec chmod 0755 {} + -o -type f -exec chmod 0644 {} +
+# Not .claude/: its worktrees keep their own file modes (an executable script
+# made 0644 would show up there as a change).
+find "$APP_DIR" \( -path "$APP_DIR/.venv" -o -path "$APP_DIR/.git" -o -path "$APP_DIR/.claude" \) -prune -o -type d -exec chmod 0755 {} + -o -type f -exec chmod 0644 {} +
 chmod 0755 "$APP_DIR/deploy/install-presentations.sh" 2>/dev/null || true
 info "synced ($(find "$APP_DIR/app" -type f | wc -l) app files)"
 
@@ -204,7 +207,7 @@ fi
 "$APP_DIR/.venv/bin/python" -m pip install -q --disable-pip-version-check -r "$APP_DIR/requirements.txt"
 "$APP_DIR/.venv/bin/python" -m compileall -q "$APP_DIR/app" >/dev/null
 chown -R "$CODE_OWNER:$SERVICE_USER" "$APP_DIR"
-find "$APP_DIR" -path "$APP_DIR/.git" -prune -o -exec chmod go-w {} +
+find "$APP_DIR" \( -path "$APP_DIR/.git" -o -path "$APP_DIR/.claude" \) -prune -o -exec chmod go-w {} +
 # Start-up check as the service user, before anything is restarted: import the
 # app and build it, so an error in create_app() is caught too, not only at import.
 runuser -u "$SERVICE_USER" -- env PRESENTATIONS_WORK_DIR="$STATE_DIR" \
@@ -544,7 +547,8 @@ cat >"$tmp" <<'WRAPPER'
 #   64  bad arguments (only --force is accepted)
 #   69  restarted but /healthz never answered: THE SITE IS DOWN (journal printed)
 #   70  systemctl restart failed (status printed)
-#   75  refused: a presentation is being generated; wait, or use --force
+#   75  refused: a presentation is being generated, or the service is running
+#       but /healthz did not answer so that is unknown; wait, or use --force
 #   77  not run as root (use sudo)
 #   78  start-up check failed: NOT restarted, the running site is unaffected
 set -uo pipefail
@@ -580,7 +584,16 @@ for _ in 1 2 3; do
   health=""
   sleep 1
 done
-[[ -n $health ]] || echo "note: /healthz did not answer, so running jobs could not be checked; the site looks down, restarting." >&2
+if [[ -z $health ]]; then
+  # Not running: nothing can be generating, and restarting is what a down site
+  # needs. Running but silent: whether a deck is being built is unknown.
+  if systemctl is-active --quiet "$SERVICE" && (( !force )); then
+    echo "Refusing to restart: the service is running but /healthz did not answer, so it is unknown whether a presentation is being generated." >&2
+    echo "Check it (journalctl -u $SERVICE), or re-run with --force if cancelling one is acceptable." >&2
+    exit 75
+  fi
+  echo "note: /healthz did not answer; restarting." >&2
+fi
 read -r loading generating < <(python3 -c '
 import json, sys
 try:

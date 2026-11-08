@@ -345,3 +345,15 @@ def test_saved_file_leaves_out_default_observation_fields():
     assert data["settings"]["annotations"]["observer"] is None  # settings stay complete
     again = load_project(json.loads(json.dumps(data)))
     assert again.observations == pr.observations
+
+
+def test_a_selected_photo_beyond_a_full_known_list_still_saves_and_opens():
+    from app.models import MAX_PHOTOS
+
+    data = {"format": "dikarya-presentation", "schema_version": 5,
+            "observations": [{"id": 1, "known_photo_ids": list(range(1, MAX_PHOTOS + 1)), "selected_photo_ids": [9999]}]}
+    pr = load_project(data)
+    known = pr.observations[0].known_photo_ids
+    assert len(known) == MAX_PHOTOS and 9999 in known
+    again = load_project(json.loads(json.dumps(project_to_json(pr))))
+    assert again.observations[0].selected_photo_ids == [9999]

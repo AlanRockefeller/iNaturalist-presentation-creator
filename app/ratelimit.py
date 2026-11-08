@@ -194,14 +194,30 @@ class ByteBudget:
     def check(self, expected: int = 0) -> None:
         self._refuse_if(expected, *self.remaining())
 
+    def _unreserved(self) -> tuple[int, int]:
+        """Bytes left this hour and today that no deck has reserved, never
+        below zero (finished downloads can overshoot). The caller holds the lock."""
+        hour, day = self._totals()
+        return max(0, self.hourly - hour - self._reserved), max(0, self.daily - day - self._reserved)
+
     def reserve(self, expected: int) -> "Reservation":
         """Set aside ``expected`` bytes, or raise BudgetExceeded if other
-        downloads and reservations leave too little."""
+        downloads and reservations leave too little. Reserving nothing (a deck
+        whose photos are all cached) always works."""
         with self._lock:
-            hour, day = self._totals()
-            self._refuse_if(expected, self.hourly - hour - self._reserved, self.daily - day - self._reserved)
+            self._refuse_if(expected, *self._unreserved())
             self._reserved += expected
         return Reservation(self, expected)
+
+    def allow_download(self, reservation: "Reservation | None" = None) -> None:
+        """Raise BudgetExceeded unless one more download may start: inside the
+        deck's own reservation, or else only from allowance no other deck has
+        reserved, so a deck that downloads more than it estimated cannot use
+        up another deck's share."""
+        with self._lock:
+            if reservation is not None and reservation.left > 0:
+                return
+            self._refuse_if(1, *self._unreserved())
 
     def _use(self, reservation: "Reservation", nbytes: int) -> None:
         with self._lock:  # downloads run in several threads

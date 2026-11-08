@@ -62,7 +62,7 @@ def test_submitted_text_cannot_forge_log_lines():
     assert fmt_value("two words") == '"two words"'
     forged = fmt_value("x\nevent=request.failed status=500")
     assert "\n" not in forged and forged.startswith('"')
-    assert fmt_value("a" * 400).endswith('..."') or fmt_value("a" * 400).endswith("...")
+    assert fmt_value("a" * 400) == "a" * 300 + "..."
 
 
 def test_body_limit_rejections_are_logged_for_declared_and_streamed_bodies(app_client, settings, caplog):
@@ -181,3 +181,86 @@ def test_ipv6_clients_are_limited_per_64():
     assert client_bucket("2001:db8:1:2:aaaa::1") == client_bucket("2001:db8:1:2:bbbb::9") == "2001:db8:1:2::/64"
     assert client_bucket("::ffff:203.0.113.5") == "203.0.113.5"
     assert client_bucket("unknown") == "unknown"
+
+
+# ---------------------------------------------------------------- review fixes (PR 3)
+
+def test_no_unprintable_character_can_start_a_new_log_line():
+    for char in (" ", " ", "\x85", "‮", "\x9b"):
+        out = fmt_value(f"a{char}b")
+        assert char not in out and len(out.splitlines()) == 1 and out.startswith('"')
+
+
+def test_percent_signs_in_context_values_are_logged_as_they_are(caplog):
+    from app.diagnostics import bind_context, get_logger
+
+    caplog.set_level(logging.INFO)
+    with bind_context({"request_id": "r1", "client_ip": "fe80::1%eth0"}):
+        get_logger("tests").info("event=x a=%s", 5)
+    assert caplog.records[-1].message == "event=x a=5 request_id=r1 client_ip=fe80::1%eth0"
+
+
+def _asgi(app, scope_path="/api/x", messages=({"type": "http.request", "body": b"", "more_body": False},),
+          headers=()):
+    import asyncio
+
+    sent, queue = [], list(messages)
+
+    async def receive():
+        return queue.pop(0) if queue else {"type": "http.disconnect"}
+
+    async def send(message):
+        sent.append(message)
+
+    scope = {"type": "http", "method": "POST", "path": scope_path, "query_string": b"",
+             "headers": list(headers), "client": ("203.0.113.1", 1)}
+    try:
+        asyncio.run(app(scope, receive, send))
+    except BaseException as exc:  # noqa: BLE001 - the tests look at what was raised
+        return sent, exc
+    return sent, None
+
+
+def test_body_limit_adds_up_separate_streamed_messages():
+    from app.main import BodyLimitMiddleware
+
+    reached = []
+
+    async def inner(scope, receive, send):
+        reached.append(True)
+
+    chunks = [{"type": "http.request", "body": b"x" * 60, "more_body": more} for more in (True, True, False)]
+    sent, _ = _asgi(BodyLimitMiddleware(inner, limit=100), messages=chunks, headers=[(b"transfer-encoding", b"chunked")])
+    assert sent[0]["status"] == 413 and not reached  # 60 + 60 > 100, though each message is under it
+    small = chunks[:1] + [{"type": "http.request", "body": b"x" * 30, "more_body": False}]
+    sent, _ = _asgi(BodyLimitMiddleware(inner, limit=100), messages=small, headers=[(b"transfer-encoding", b"chunked")])
+    assert reached and not sent  # 90 bytes went through to the app
+
+
+def test_cancelled_requests_are_logged_even_on_quiet_routes(caplog):
+    import asyncio
+
+    from app.diagnostics import RequestDiagnosticsMiddleware
+
+    async def cut_off(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        raise asyncio.CancelledError()
+
+    caplog.set_level(logging.INFO)
+    _, exc = _asgi(RequestDiagnosticsMiddleware(cut_off), scope_path="/healthz")
+    assert isinstance(exc, asyncio.CancelledError)
+    line = _lines(caplog, "request")[-1]
+    assert "route=/healthz" in line.message and "cancelled=true" in line.message and line.levelno == logging.INFO
+
+
+def test_an_error_body_cut_at_the_capture_limit_still_logs_its_text(caplog):
+    from app.diagnostics import RequestDiagnosticsMiddleware
+
+    async def big_error(scope, receive, send):
+        await send({"type": "http.response.start", "status": 422,
+                    "headers": [(b"content-type", b"application/json")]})
+        await send({"type": "http.response.body", "body": ('{"detail": "' + "x" * 3000 + '"}').encode()})
+
+    _asgi(RequestDiagnosticsMiddleware(big_error))
+    line = _lines(caplog, "request.failed")[-1].message
+    assert 'detail="{\\"detail\\": \\"xxx' in line

@@ -581,19 +581,33 @@ class TaxaCache:
 
 ProgressFn = Callable[[int, int], None]
 
-# Set by count_requests() so a job can tell how many API requests it made.
-_request_counter: ContextVar[list[int] | None] = ContextVar("inat_request_counter", default=None)
+class RequestMeter:
+    """Counts a job's API requests, charging each to its client first."""
+
+    def __init__(self, charge: Callable[[], None] | None = None):
+        self.count = 0
+        self._charge = charge
+
+    def add(self) -> None:
+        if self._charge is not None:
+            self._charge()  # raises BudgetExceeded once the client's share is used up
+        self.count += 1
+
+
+# Set by count_requests() for the API requests made inside a job.
+_request_meter: ContextVar[RequestMeter | None] = ContextVar("inat_request_meter", default=None)
 
 
 @contextmanager
-def count_requests():
-    """Count the API requests (including retries) made inside the block."""
-    counter = [0]
-    token = _request_counter.set(counter)
+def count_requests(charge: Callable[[], None] | None = None):
+    """Count the API requests (including retries) made inside the block, and
+    call ``charge`` before each one so it can refuse it."""
+    meter = RequestMeter(charge)
+    token = _request_meter.set(meter)
     try:
-        yield counter
+        yield meter
     finally:
-        _request_counter.reset(token)
+        _request_meter.reset(token)
 
 
 class INatClient:
@@ -624,10 +638,10 @@ class INatClient:
         attempt = 0
         while True:
             attempt += 1
+            meter = _request_meter.get()
+            if meter is not None:
+                meter.add()  # the client's share first, then the site's daily budget
             self.budget.consume(1)
-            counter = _request_counter.get()
-            if counter is not None:
-                counter[0] += 1
             self.limiter.wait()
             try:
                 resp = self.http.get(url, params=params, headers={

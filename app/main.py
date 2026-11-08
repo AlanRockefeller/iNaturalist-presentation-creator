@@ -160,8 +160,8 @@ class Services:
 
     def stop(self) -> None:
         self._stop.set()
-        # Cancelled jobs stop at their next progress check, so the process can
-        # exit at once instead of waiting for them.
+        # Cancelled jobs stop at their next progress check; shutdown() waits a
+        # few seconds for that, so the budgets saved below include their bytes.
         cancelled = self.jobs.shutdown()
         self.api_budget.flush()
         self.media_budget.flush()
@@ -328,10 +328,9 @@ def create_app(settings: Settings | None = None, services: Services | None = Non
         job = svc.jobs.get(job_id)
         if not job:
             raise HTTPException(404, "That job is not known (it may have expired).")
-        if job.result_dropped:
+        data = svc.jobs.status(job)
+        if data is None:
             raise HTTPException(410, "These results have expired. Load the sources again.")
-        data = job.public()
-        svc.jobs.mark_delivered(job)
         return data
 
     @app.delete("/api/jobs/{job_id}")

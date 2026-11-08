@@ -12,7 +12,9 @@ Each line should serve one of those, and nothing more:
   its results (see jobs.py);
 * a crash is logged once, with its traceback.
 
-Values are quoted when they contain spaces, quotes or control characters, so
+Values are quoted when they contain spaces, quotes or anything unprintable,
+and every unprintable character (newlines, U+2028 and U+2029, C1 controls,
+bidirectional overrides) is escaped, so a value is always one line and
 submitted text cannot fake extra log lines or fields.
 """
 
@@ -76,8 +78,15 @@ def fmt_value(value: Any) -> str:
     if len(text) > MAX_VALUE:
         text = text[:MAX_VALUE] + "..."
     if not text or not text.isprintable() or any(c in text for c in ' "=\\'):
-        text = json.dumps(text, ensure_ascii=False)  # quoted; control characters escaped
+        # json.dumps quotes it and escapes C0 controls; escape the other
+        # unprintable characters too, which it leaves as they are.
+        text = "".join(c if c.isprintable() else _escape(c) for c in json.dumps(text, ensure_ascii=False))
     return text
+
+
+def _escape(char: str) -> str:
+    code = ord(char)
+    return f"\\u{code:04x}" if code <= 0xFFFF else f"\\U{code:08x}"
 
 
 def fields_text(fields: dict[str, Any]) -> str:
@@ -137,6 +146,19 @@ def client_bucket(ip: str) -> str:
 
 class ContextLogger(logging.LoggerAdapter):
     """Appends the request, client and job ids that apply to each line."""
+
+    def log(self, level, msg, *args, **kwargs):
+        if not self.isEnabledFor(level):
+            return
+        # Format now, so the ids appended below (an address may hold "%") are
+        # never read as format codes.
+        if args:
+            try:
+                msg = str(msg) % args
+            except (TypeError, ValueError):
+                msg = f"{msg} {args!r}"
+        msg, kwargs = self.process(msg, kwargs)
+        self.logger.log(level, "%s", msg, **kwargs)
 
     def process(self, msg, kwargs):
         context = _context.get()
@@ -211,11 +233,12 @@ class RequestDiagnosticsMiddleware:
         path = scope.get("path", "/")
         route = getattr(scope.get("route"), "path", None) or path
         crash = error if isinstance(error, Exception) else None
+        cancelled = error is not None and crash is None  # the client went away
         if crash is not None:
             status = 500
         elif status is None:
-            status = 499 if error is not None else 500  # 499: the client went away first
-        if status < 400 and _quiet(method, path, route):
+            status = 499 if cancelled else 500
+        if status < 400 and not cancelled and _quiet(method, path, route):
             return
         fields: dict[str, Any] = {"method": method, "route": route}
         if route != path:
@@ -223,14 +246,19 @@ class RequestDiagnosticsMiddleware:
         fields["status"] = status
         fields["duration_ms"] = (time.monotonic() - started) * 1000
         fields.update(context["fields"])
+        if cancelled:
+            fields["cancelled"] = True
         if status >= 400 and status != 499:
             query = scope.get("query_string", b"")
             if query:
                 fields["query"] = query.decode("latin-1")
-            try:
-                detail = json.loads(bytes(error_body)).get("detail") if error_body else None
-            except (ValueError, AttributeError):
-                detail = None
+            detail = None
+            if error_body:
+                try:
+                    detail = json.loads(bytes(error_body)).get("detail")
+                except (ValueError, AttributeError):
+                    # Not JSON as captured (cut at 2,000 bytes, say): keep its text.
+                    detail = bytes(error_body).decode("utf-8", "replace")
             if detail:
                 fields["detail"] = detail
             if crash is not None:

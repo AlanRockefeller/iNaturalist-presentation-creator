@@ -98,15 +98,23 @@ class MediaFetcher:
             raise ImageFetchError(f"Photo {photo_id} has an untrusted URL and was skipped.")
         if f"/photos/{int(photo_id)}/" not in url:
             raise ImageFetchError(f"Photo {photo_id} URL does not match its id.")
-        with self._lock_for(photo_id):
+        lock = self._lock_for(photo_id)
+        # Another download may hold this lock (the same photo, or one sharing
+        # its stripe); keep checking for a cancel while waiting.
+        while not lock.acquire(timeout=0.25):
+            stop_if_cancelled()
+        try:
             cached = self.cached_path(photo_id)
             if cached:
-                os.utime(cached)  # refresh TTL
-                return cached
+                try:
+                    os.utime(cached)  # refresh TTL
+                    return cached
+                except FileNotFoundError:
+                    pass  # cleanup trimmed it just now: download it again
             stop_if_cancelled()
-            # Refuse once the allowance is spent. check(0) can never fail because
-            # remaining() clamps at zero, so ask for at least one byte.
-            self.budget.check(1)
+            # Refuse once the allowance is spent; past its own reservation a deck
+            # may only use what no other deck has reserved.
+            self.budget.allow_download(reservation)
             ext = url.rsplit(".", 1)[-1].lower()
             final = self.cache_dir / f"{int(photo_id)}.{ext}"
             fd, tmp = tempfile.mkstemp(dir=self.cache_dir, prefix=f"{int(photo_id)}.", suffix=".part")
@@ -122,7 +130,10 @@ class MediaFetcher:
                                     raise httpx.HTTPStatusError("retryable", request=resp.request, response=resp)
                                 if resp.status_code != 200:
                                     raise ImageFetchError(f"Photo {photo_id} could not be downloaded (HTTP {resp.status_code}).")
-                                declared = int(resp.headers.get("Content-Length") or 0)
+                                try:
+                                    declared = int(resp.headers.get("Content-Length") or 0)
+                                except ValueError:
+                                    declared = 0  # malformed: the streamed size is checked below
                                 if declared > self.settings.max_image_bytes:
                                     raise ImageFetchError(f"Photo {photo_id} is too large.")
                                 fh.seek(0)
@@ -155,6 +166,8 @@ class MediaFetcher:
                 except OSError:
                     pass
                 raise
+        finally:
+            lock.release()
 
     def fetch_into(self, photo_id: int, api_url: str, dest_dir: Path, cancelled=None,
                    reservation: Reservation | None = None) -> Path:

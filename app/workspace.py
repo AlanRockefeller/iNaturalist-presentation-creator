@@ -97,11 +97,18 @@ class WorkspaceStore:
             self._remember(wid, ws)
         if now - ws["used"] > self.ttl:
             raise WorkspaceExpired()
-        ws["used"] = now
         try:
-            os.utime(path)  # also keeps cleanup() from deleting it
+            # The file's time is the last use, for restarts and for cleanup().
+            os.utime(path)
+        except FileNotFoundError:
+            # Its file is gone, so it could not outlive this process: treat it
+            # as expired rather than alive in memory only.
+            with self._lock:
+                self._mem.pop(wid, None)
+            raise WorkspaceExpired() from None
         except OSError:
-            pass
+            return ws  # the use could not be recorded; leave both times as they were
+        ws["used"] = now
         return ws
 
     def cleanup(self) -> None:

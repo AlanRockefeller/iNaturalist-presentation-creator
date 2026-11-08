@@ -125,6 +125,7 @@ def normalize_project(project: Project) -> Project:
         for pid in selected:
             if pid not in known:
                 known.append(pid)
+        known = _cap_known(known, selected)  # still loadable when saved
         states.append(st.model_copy(update={
             "known_photo_ids": known,
             "selected_photo_ids": selected,

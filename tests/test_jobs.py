@@ -169,3 +169,83 @@ def test_a_second_deck_cannot_take_the_first_ones_allowance(services):
         budget.reserve(30)
     first.release()
     budget.reserve(30).release()
+
+
+# ---------------------------------------------------------------- review fixes (PR 3)
+
+def test_cancelled_waiting_jobs_leave_the_queue(one_worker):
+    jobs = one_worker
+    running, release = _blocker(jobs, client="other")
+    for _ in range(50):  # start and cancel, again and again
+        job = jobs._submit("load", "c1", lambda job: {}, 60)
+        assert jobs.cancel(job.id)
+        assert job.work is None
+    assert len(jobs._workers["load"]._queue) == 0
+    release.set()
+    _wait_state(running, ("done",))
+
+
+def test_a_long_load_stops_at_the_clients_share(app_client, fake, settings, services):
+    fake.add(*(make_obs(i, 47692, user="alice") for i in range(1, 251)))  # two pages
+    settings.api_client_daily_share = 2 / 10_000  # search page 1 and 2, then the taxa lookup is refused
+    body = {"project": project(source("a", "alice")).model_dump(mode="json")}
+    final = wait_job(app_client, app_client.post("/api/load", json=body).json()["id"])
+    assert final["state"] == "error" and "share of today's iNaturalist requests" in final["error"]
+    assert len(fake.api_calls()) == 2
+
+
+def test_overlapping_loads_from_one_client_share_one_allowance(one_worker, client, fake, settings):
+    jobs = one_worker
+    settings.max_concurrent_loads = 2
+    fake.add(*(make_obs(i, 47692, user="alice") for i in range(1, 251)))
+    settings.api_client_daily_share = 4 / 10_000
+    from app.jobs import JobManager
+
+    jobs = JobManager(settings, client, jobs.media, jobs.workspaces)
+    body = project(source("a", "alice"))
+    a = jobs.start_load("c1", body, None, None)
+    b = jobs.start_load("c1", body, None, None)
+    for job in (a, b):
+        _wait_state(job, ("done", "error"))
+    assert len(fake.api_calls()) <= 4
+    assert "error" in (a.state, b.state)
+    jobs.shutdown()
+
+
+def test_disabled_sources_do_not_count_toward_the_observation_limit(app_client, fake, settings):
+    fake.add(make_obs(1, 47692, user="alice"), make_obs(2, 47602, user="bob"), make_obs(3, 47702, user="bob"),
+             make_obs(4, 47693, user="carol"))
+    pr = project(source("a", "alice"), source("b", "bob"))
+    first = wait_job(app_client, app_client.post("/api/load", json={"project": pr.model_dump(mode="json")}).json()["id"])
+    assert first["state"] == "done"
+    pr = first["result"]["project"]
+    pr["sources"][1]["enabled"] = False                       # bob's 2 stay in the workspace
+    pr["sources"].append(source("c", "carol").model_dump())
+    settings.max_observations_per_project = 2                 # alice 1 + carol 1
+    body = {"project": pr, "workspace_id": first["result"]["workspace_id"], "refresh_source_ids": ["c"]}
+    second = wait_job(app_client, app_client.post("/api/load", json=body).json()["id"])
+    assert second["state"] == "done", second["error"]
+    assert second["result"]["source_results"] == {"a": 1, "b": 2, "c": 1}
+
+
+def test_an_oversized_download_cannot_use_another_decks_reservation():
+    from app.ratelimit import BudgetExceeded, ByteBudget
+
+    budget = ByteBudget(hourly=100, daily=10_000)
+    a, b = budget.reserve(30), budget.reserve(60)
+    budget.allow_download(a)
+    budget.add(50)          # deck A's photo was bigger than it estimated
+    a.consume(50)
+    with pytest.raises(BudgetExceeded):
+        budget.allow_download(a)  # only 10 unreserved were left, and A used them
+    budget.allow_download(b)      # B still has its 60
+    budget.add(60)
+    b.consume(60)
+    assert budget.remaining()[0] == 0
+
+
+def test_shutdown_waits_for_running_jobs_to_stop(one_worker):
+    jobs = one_worker
+    running, _ = _blocker(jobs, client="other")
+    jobs.shutdown()
+    assert running.state == "cancelled"  # stopped before shutdown() returned

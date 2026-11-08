@@ -265,4 +265,37 @@ def test_requests_are_counted_per_job(client, fake):
     fake.fail_429_times = 1
     with count_requests() as used:
         client.search({"user_id": "alice"}, 10_000)
-    assert used[0] == 2  # the retry counts too
+    assert used.count == 2  # the retry counts too
+
+
+def test_a_deck_with_every_photo_cached_needs_no_allowance():
+    bb = ByteBudget(hourly=100, daily=1000)
+    bb.add(150)  # downloads overshot the hour
+    bb.reserve(0).release()
+    with pytest.raises(BudgetExceeded):
+        bb.reserve(1)
+
+
+def test_a_cached_photo_trimmed_just_after_lookup_is_downloaded_again(settings, fake, media, tmp_path):
+    fake.add(make_obs(1, 47692, photos=((11, 64, 48),)))
+    gone = settings.media_cache_dir / "11.jpg"   # found, then deleted by cleanup
+    media.cached_path = lambda photo_id: gone
+    path = media.fetch_original(11, f"https://{PHOTO_HOST}/photos/11/square.jpg")
+    assert path == gone and path.read_bytes()[:2] == b"\xff\xd8" and len(fake.photo_requests) == 1
+
+
+def test_waiting_for_a_busy_photo_lock_notices_a_cancel(media):
+    import time
+
+    from app.images import LOCK_STRIPES, DownloadCancelled
+
+    lock = media._lock_for(11)
+    lock.acquire()  # another download holds the stripe that photo 11 + LOCK_STRIPES shares
+    try:
+        started = time.monotonic()
+        with pytest.raises(DownloadCancelled):
+            media.fetch_original(11 + LOCK_STRIPES, f"https://{PHOTO_HOST}/photos/{11 + LOCK_STRIPES}/square.jpg",
+                                 cancelled=lambda: True)
+        assert time.monotonic() - started < 2
+    finally:
+        lock.release()

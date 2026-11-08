@@ -14,6 +14,7 @@ import secrets
 import shutil
 import threading
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextvars import copy_context
 from dataclasses import dataclass, field
@@ -40,6 +41,8 @@ MIB = 1024 ** 2
 # period in case that response was lost, or after LOAD_RESULT_TTL regardless.
 RESULT_GRACE_SECONDS = 120
 LOAD_RESULT_TTL = 15 * 60
+SHARE_USED_UP = ("You have used this site's share of today's iNaturalist requests. "
+                 "Please try again tomorrow (UTC).")
 
 
 class JobRejected(Exception):
@@ -58,7 +61,7 @@ def _utc_day() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
-@dataclass
+@dataclass(eq=False)  # a job is equal only to itself
 class Job:
     id: str
     kind: str
@@ -83,6 +86,9 @@ class Job:
     result_dropped: bool = False
     log_context: dict[str, str] = field(default_factory=dict, repr=False)
     log_fields: dict[str, Any] = field(default_factory=dict, repr=False)
+    # What the job does. It holds the whole project, so it is dropped as soon
+    # as the job ends or is cancelled.
+    work: Callable[["Job"], Any] | None = field(default=None, repr=False)
 
     def progress(self, phase: str, done: int, total: int, message: str = "") -> None:
         self.phase, self.done, self.total = phase, done, total
@@ -110,6 +116,57 @@ class Job:
         return data
 
 
+class _Workers:
+    """A fixed number of threads running jobs from a queue. Unlike a thread
+    pool's queue, a cancelled job can be taken out of this one, so waiting work
+    stays within the job limits however often jobs are started and cancelled."""
+
+    def __init__(self, size: int, name: str, run: Callable[[Job], None]):
+        self._size, self._name, self._run = size, name, run
+        self._queue: deque[Job] = deque()
+        self._cond = threading.Condition()
+        self._threads: list[threading.Thread] = []
+        self._stopped = False
+
+    def submit(self, job: Job) -> None:
+        with self._cond:
+            if self._stopped:
+                raise RuntimeError("workers stopped")
+            self._queue.append(job)
+            if len(self._threads) < self._size:  # threads start on first use
+                thread = threading.Thread(target=self._loop, name=f"{self._name}-{len(self._threads)}", daemon=True)
+                self._threads.append(thread)
+                thread.start()
+            self._cond.notify()
+
+    def remove(self, job: Job) -> bool:
+        with self._cond:
+            try:
+                self._queue.remove(job)
+                return True
+            except ValueError:  # a worker has already taken it
+                return False
+
+    def stop(self) -> None:
+        with self._cond:
+            self._stopped = True
+            self._queue.clear()
+            self._cond.notify_all()
+
+    def _loop(self) -> None:
+        while True:
+            with self._cond:
+                while not self._queue and not self._stopped:
+                    self._cond.wait()
+                if not self._queue:
+                    return
+                job = self._queue.popleft()
+            try:
+                self._run(job)
+            except Exception:  # _run records job errors itself; keep the worker alive
+                log.exception("event=worker.crashed")
+
+
 class JobManager:
     def __init__(self, settings: Settings, client: INatClient, media: MediaFetcher, workspaces: WorkspaceStore):
         self.settings = settings
@@ -118,8 +175,10 @@ class JobManager:
         self.workspaces = workspaces
         self.jobs: dict[str, Job] = {}
         self._lock = threading.Lock()
-        self._load_pool = ThreadPoolExecutor(settings.max_concurrent_loads, thread_name_prefix="load")
-        self._gen_pool = ThreadPoolExecutor(settings.max_concurrent_generations, thread_name_prefix="gen")
+        self._workers = {
+            "load": _Workers(settings.max_concurrent_loads, "load", self._run),
+            "generate": _Workers(settings.max_concurrent_generations, "gen", self._run),
+        }
         # iNaturalist requests made by each client today (in memory only).
         self._usage_day = ""
         self._usage: dict[str, int] = {}
@@ -160,10 +219,15 @@ class JobManager:
             self._usage_day, self._usage = day, {}
         return self._usage.get(client, 0)
 
-    def _record_usage(self, client: str, requests: int) -> None:
-        if requests:
-            with self._lock:
-                self._usage[client] = self._client_usage(client) + requests
+    def _charge(self, client: str) -> None:
+        """Count one iNaturalist request against ``client``'s daily share, or
+        refuse it once the share is used up. Called before every request, so
+        neither one long load nor two at once can go past the share."""
+        with self._lock:
+            used = self._client_usage(client)
+            if used >= self.api_share():
+                raise BudgetExceeded(SHARE_USED_UP)
+            self._usage[client] = used + 1
 
     def _submit(self, kind: str, client: str, fn: Callable[[Job], Any], timeout: int) -> Job:
         with self._lock:
@@ -176,11 +240,8 @@ class JobManager:
                 if len(self._active("load")) >= self.settings.max_queued_loads:
                     raise JobRejected("The server is busy loading other projects. Please try again in a few minutes.")
                 if self._client_usage(client) >= self.api_share():
-                    raise JobRejected(
-                        "You have used this site's share of today's iNaturalist requests. "
-                        "Please try again tomorrow (UTC)."
-                    )
-            job = Job(id=secrets.token_urlsafe(16), kind=kind, client=client, timeout=timeout)
+                    raise JobRejected(SHARE_USED_UP)
+            job = Job(id=secrets.token_urlsafe(16), kind=kind, client=client, timeout=timeout, work=fn)
             request = snapshot()
             job.log_context = {
                 "request_id": request.get("request_id", "-"),
@@ -188,22 +249,22 @@ class JobManager:
                 "job_id": job.id,
             }
             self.jobs[job.id] = job
-        pool = self._gen_pool if kind == "generate" else self._load_pool
         try:
-            pool.submit(self._run, job, fn)
-        except RuntimeError:  # the pools are shut down: the server is stopping
-            job.state, job.error, job.finished = "error", "The server is restarting.", time.time()
+            self._workers[kind].submit(job)
+        except RuntimeError:  # the workers are stopped: the server is stopping
+            job.state, job.error, job.finished, job.work = "error", "The server is restarting.", time.time(), None
             raise JobRejected("The server is restarting. Please try again in a minute.") from None
         return job
 
-    def _run(self, job: Job, fn: Callable[[Job], Any]) -> None:
+    def _run(self, job: Job) -> None:
         with bind_context(job.log_context):
-            self._run_with_context(job, fn)
+            self._run_with_context(job)
 
-    def _run_with_context(self, job: Job, fn: Callable[[Job], Any]) -> None:
+    def _run_with_context(self, job: Job) -> None:
         with self._lock:
-            if job.state != "queued":  # cancelled while it waited
+            if job.state != "queued" or job.work is None:  # cancelled while it waited
                 return
+            fn = job.work
             job.state = "running"
             job.started = time.time()
             # The time limit counts from now, not from when it was queued.
@@ -211,7 +272,7 @@ class JobManager:
         log_event(log, logging.INFO, "job.started", kind=job.kind, wait_ms=(job.started - job.created) * 1000)
         error_type = None
         crash = None
-        with count_requests() as requests:
+        with count_requests(charge=lambda: self._charge(job.client)) as meter:
             try:
                 job.check()
                 job.result = fn(job)
@@ -229,11 +290,11 @@ class JobManager:
                 job.state, job.error = "error", "Something went wrong on the server. Please try again."
             finally:
                 job.finished = time.time()
+                job.work = None
                 if job.state != "done" and job.output:
                     shutil.rmtree(job.output.parent, ignore_errors=True)
                     job.output = None
-        self._record_usage(job.client, requests[0])
-        self._log_finished(job, error_type, crash, api_requests=requests[0])
+        self._log_finished(job, error_type, crash, api_requests=meter.count)
 
     def _log_finished(self, job: Job, error_type: str | None = None, crash: Exception | None = None, **extra) -> None:
         """One line per job with what it did: for usage figures and for debugging."""
@@ -263,9 +324,11 @@ class JobManager:
         with self._lock:
             job.cancel_event.set()
             if job.state == "queued":
-                # It has not started, so it ends now: it frees the client's
-                # slot at once and the browser's poll sees "cancelled".
-                job.state, job.error, job.finished = "cancelled", "Cancelled.", time.time()
+                # It has not started, so it ends now: it leaves the queue, frees
+                # the client's slot and the project it held, and the browser's
+                # poll sees "cancelled".
+                self._workers[job.kind].remove(job)
+                job.state, job.error, job.finished, job.work = "cancelled", "Cancelled.", time.time(), None
                 was_queued = True
         if was_queued:
             with bind_context(job.log_context):
@@ -275,23 +338,34 @@ class JobManager:
             job.output = None
         return True
 
-    def shutdown(self) -> int:
-        """Cancel every job so the worker threads stop at their next check. The
-        process waits for them before it exits, and systemd stops waiting after
-        30 seconds. Returns how many jobs were cancelled."""
+    def shutdown(self, wait: float = 5.0) -> int:
+        """Cancel every job. Running ones stop at their next check (within a
+        download chunk or a slide); this waits up to ``wait`` seconds for that,
+        so the bytes they downloaded are counted before the budgets are saved.
+        Returns how many jobs were cancelled."""
         with self._lock:
             active = self._active()
             for job in active:
                 job.cancel_event.set()
                 if job.state == "queued":
-                    job.state, job.error, job.finished = "cancelled", "The server restarted.", time.time()
-        for pool in (self._load_pool, self._gen_pool):
-            pool.shutdown(wait=False, cancel_futures=True)
+                    job.state, job.error, job.finished, job.work = "cancelled", "The server restarted.", time.time(), None
+        for workers in self._workers.values():
+            workers.stop()
+        until = time.monotonic() + wait
+        while time.monotonic() < until and any(job.state == "running" for job in active):
+            time.sleep(0.05)
         return len(active)
 
-    def mark_delivered(self, job: Job) -> None:
-        if job.kind == "load" and job.state == "done" and job.delivered is None:
-            job.delivered = time.time()
+    def status(self, job: Job) -> dict | None:
+        """The job's public state, or None once its load result was dropped.
+        Read under the lock, so cleanup cannot drop the result meanwhile."""
+        with self._lock:
+            if job.result_dropped:
+                return None
+            data = job.public()
+            if job.kind == "load" and job.state == "done" and job.delivered is None:
+                job.delivered = time.time()
+        return data
 
     def _trim_results(self) -> None:
         """Drop finished loads' results once delivered. The caller holds the lock."""
@@ -363,7 +437,10 @@ class JobManager:
             raw_all.extend(raws)
             log_event(log, logging.INFO, "load.source", source=src.url, results=len(source_results[src.id]),
                       total=total, duration_ms=(time.monotonic() - started) * 1000)
-            unique = set().union(*source_results.values())
+            # Only enabled sources count: a disabled one keeps its results in the
+            # workspace (re-enabling it is instant) but is not in the project.
+            enabled_ids = {e.id for e in enabled}
+            unique = set().union(*(ids for sid, ids in source_results.items() if sid in enabled_ids))
             if len(unique) > s.max_observations_per_project:
                 raise JobFailed(
                     f"Together these sources match {len(unique):,} observations; the limit is "

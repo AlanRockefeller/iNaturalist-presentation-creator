@@ -665,6 +665,20 @@
     }, min);
     lastHidden = { hiddenFaves, hiddenSources };
     updateStats(hiddenFaves, hiddenSources);
+    return items.filter((it) => it.type === 'obs').length;
+  }
+
+  // Screen readers hear what a sort, grouping or Find change did, rather than
+  // the whole list being read out again (#org-announce is a status region).
+  function announce(text) {
+    const box = $('#org-announce');
+    box.textContent = '';
+    setTimeout(() => { box.textContent = text; }, 50); // a change is what gets read
+  }
+  const shownText = (count) => `${plural(count, 'observation')} shown.`;
+  function groupingText() {
+    const g = S.project.settings.grouping;
+    return g === 'none' ? 'Not grouped.' : `Grouped by ${GROUP_NAMES[g].toLowerCase()}.`;
   }
 
   // The filter counts change only when the list is rebuilt, so a photo
@@ -1201,7 +1215,10 @@
       sort.direction = direction;
       if (key !== 'random') { sort.base_key = key; sort.base_direction = direction; }
       markDirty();
-      renderOrganize();
+      const shown = renderOrganize();
+      const option = $(`#sort-key option[value="${key}"]`);
+      const how = key === 'random' ? '' : `, ${direction === 'desc' ? 'descending' : 'ascending'}`;
+      announce(`Sorted by ${option ? option.textContent : key}${how}. ${groupingText()} ${shownText(shown)}`);
     } catch (err) { if (gen === projectGen && seq === sortSeq) handleApiError(err); }
   }
 
@@ -1227,7 +1244,7 @@
     S.project.settings.grouping = e.target.value;
     markDirty();
     const s = S.project.settings.sort;
-    if (s.key === 'custom') renderOrganize();
+    if (s.key === 'custom') announce(`${groupingText()} ${shownText(renderOrganize())}`);
     else applySort(s.key, s.direction);
   });
   $('#min-faves').addEventListener('input', debounce((e) => {
@@ -1236,7 +1253,11 @@
     markDirty();
     renderOrganize();
   }, 150));
-  $('#find').addEventListener('input', debounce(() => renderOrganize(), 200));
+  $('#find').addEventListener('input', debounce(() => {
+    const shown = renderOrganize();
+    const needle = $('#find').value.trim();
+    announce(needle ? `${plural(shown, 'observation')} match "${needle}".` : shownText(shown));
+  }, 200));
 
   function bulkSelect(on) {
     const { items } = organizeItems();

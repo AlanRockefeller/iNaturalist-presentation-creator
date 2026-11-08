@@ -31,3 +31,13 @@ def test_last_use_survives_a_restart(tmp_path):
     os.utime(path, (old, old))
     with pytest.raises(WorkspaceExpired):
         WorkspaceStore(tmp_path, ttl_seconds=100).get(wid)
+
+
+def test_a_workspace_whose_file_is_gone_has_expired(tmp_path):
+    store = WorkspaceStore(tmp_path, ttl_seconds=100)
+    wid = store.create({1: {"id": 1}}, {})
+    (tmp_path / f"{wid}.json.gz").unlink()
+    with pytest.raises(WorkspaceExpired):
+        store.get(wid)  # it was still in memory
+    with pytest.raises(WorkspaceExpired):
+        store.get(wid)

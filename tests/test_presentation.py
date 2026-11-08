@@ -412,3 +412,12 @@ def test_groups_sharing_a_label_get_their_own_divider():
     pr = add_observations(pr, [1, 2], obs, {1: ["a"], 2: ["b"]}, placement="append")
     kinds = [s["kind"] for s in build_slide_plan(pr, obs)["slides"]]
     assert kinds == ["title", "divider", "image", "divider", "image"]
+
+
+def test_adjacent_groups_with_the_same_key_but_another_label_get_a_divider():
+    obs = norm(make_obs(1, 47692, photos=((11, 800, 600),)), make_obs(2, 47693, photos=((21, 800, 600),)))
+    obs[2]["ranks"] = {**obs[2]["ranks"], "genus": "hygrocybe"}  # same genus key, differently written
+    pr = project(source("a", "alice"), grouping="genus", dividers=True)
+    pr = add_observations(pr, [1, 2], obs, {1: ["a"], 2: ["a"]}, placement="append")
+    dividers = [s["text"] for s in build_slide_plan(pr, obs)["slides"] if s["kind"] == "divider"]
+    assert dividers == ["Hygrocybe", "hygrocybe"]
