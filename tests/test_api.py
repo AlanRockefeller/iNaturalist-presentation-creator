@@ -92,13 +92,15 @@ def test_saved_project_refresh_finds_new_and_unavailable(app_client, fake):
     project = _new_project(tc, _source(tc, "https://www.inaturalist.org/observations?taxon_id=47170", "a", username="alice"), _source(tc, URL_B, "b"))
     first = _load(tc, project)
     saved = tc.post("/api/project/export", json={"project": first["project"]}).json()
-    assert saved["format"] == "dikarya-presentation" and saved["schema_version"] == 4
+    assert saved["format"] == "dikarya-presentation" and saved["schema_version"] == 5
     text = json.dumps(saved)
     assert "square.jpg" not in text and "faves_count" not in text
 
     # time passes on iNaturalist
     obs1 = next(o for o in saved["observations"] if o["id"] == 1)
-    obs1["overrides"]["scientific"] = "Hygrocybe custom"
+    # Default observation fields are left out of the file to keep it small.
+    assert "overrides" not in obs1 and "rotations" not in obs1 and "status" not in obs1
+    obs1["overrides"] = {"scientific": "Hygrocybe custom"}
     fake.remove(4)
     fake.add(make_obs(5, 47693, user="alice", place_id=2), make_obs(6, 47602, user="dave", place_id=2),
              make_obs(7, 47602, user="alice", place_id=1))

@@ -220,3 +220,49 @@ def test_cancelled_download_stops_before_and_during_streaming(settings, fake):
     with pytest.raises(DownloadCancelled):  # cancelled after the request started
         media.fetch_original(12, base.format(12), cancelled=lambda: calls.append(1) or len(calls) > 1)
     assert media.cached_path(12) is None and not list(settings.media_cache_dir.glob("*.part"))
+
+
+def test_byte_reservations_are_used_up_by_downloads():
+    bb = ByteBudget(hourly=100, daily=1000)
+    first = bb.reserve(60)
+    with pytest.raises(BudgetExceeded):
+        bb.reserve(50)  # 100 - 60 reserved
+    bb.add(30)
+    first.consume(30)  # 30 downloaded, 30 still reserved
+    bb.reserve(40).release()
+    first.release()
+    assert bb.remaining() == (70, 970)
+
+
+def test_fetch_into_keeps_the_photo_when_the_cache_is_trimmed(settings, fake, media, tmp_path):
+    fake.add(make_obs(1, 47692, photos=((11, 64, 48),)))
+    url = f"https://{PHOTO_HOST}/photos/11/square.jpg"
+    linked = media.fetch_into(11, url, tmp_path / "job")
+    settings.media_cache_max_bytes = 0
+    media.cleanup()
+    assert media.cached_path(11) is None
+    assert linked.read_bytes()[:2] == b"\xff\xd8"
+    again = media.fetch_into(11, url, tmp_path / "job2")  # downloads it once more
+    assert again.read_bytes()[:2] == b"\xff\xd8" and len(fake.photo_requests) == 2
+
+
+def test_images_over_120_megapixels_are_never_decoded(tmp_path):
+    from PIL import Image
+
+    from app.images import MAX_DECODE_PIXELS, open_image
+
+    assert Image.MAX_IMAGE_PIXELS * 2 == MAX_DECODE_PIXELS == 120_000_000
+    path = tmp_path / "big.png"
+    Image.new("1", (11_000, 11_000)).save(path)  # 121 MP, tiny on disk
+    with pytest.raises(Image.DecompressionBombError):
+        open_image(path)
+
+
+def test_requests_are_counted_per_job(client, fake):
+    from app.inaturalist import count_requests
+
+    fake.add(make_obs(1, 47692))
+    fake.fail_429_times = 1
+    with count_requests() as used:
+        client.search({"user_id": "alice"}, 10_000)
+    assert used[0] == 2  # the retry counts too

@@ -162,7 +162,7 @@ def test_save_load_roundtrip_has_everything_and_no_photos():
     pr = ignore_observations(pr, [99])
     data = project_to_json(pr)
     text = json.dumps(data)
-    assert data["format"] == "dikarya-presentation" and data["schema_version"] == 4
+    assert data["format"] == "dikarya-presentation" and data["schema_version"] == 5
     assert "base64" not in text and "square.jpg" not in text and "faves_count" not in text
     loaded = load_project(json.loads(text))
     assert loaded.order == [3, 1, 2]
@@ -245,7 +245,7 @@ def test_v1_file_migrates_and_single_user_url_source_becomes_username():
                      "url": "https://www.inaturalist.org/observations?taxon_id=47170&user_id=alan_rockefeller"}],
         "observations": [{"id": 1, "selected_photo_ids": [5]}],
     })
-    assert pr.schema_version == 4
+    assert pr.schema_version == 5
     assert pr.sources[0].type == "username" and pr.sources[0].username == "alan_rockefeller"
     assert pr.observations[0].rotations == {} and pr.observations[0].show_lines == {}
 
@@ -279,3 +279,69 @@ def test_add_observations_refuses_to_pass_the_project_limit():
         add_observations(pr, [1, 2, 3], obs, {2: ["a"], 3: ["a"]}, placement="append", max_observations=2)
     assert "1 more can be added, not 2" in str(exc.value)
     assert len(add_observations(pr, [2], obs, {2: ["a"]}, placement="append", max_observations=2).observations) == 2
+
+
+# ---------------------------------------------------------------- schema 5 and limits
+
+USER_URL = "https://www.inaturalist.org/observations?taxon_id=47170&user_id=alan_rockefeller"
+
+
+def test_v4_file_keeps_its_single_user_url_source_as_the_users_own():
+    pr = load_project({"format": "dikarya-presentation", "schema_version": 4,
+                       "sources": [{"id": "a", "type": "url", "url": USER_URL}]})
+    assert pr.schema_version == 5
+    assert pr.sources[0].type == "username" and pr.sources[0].username == "alan_rockefeller"
+
+
+def test_v5_source_type_is_the_users_choice():
+    """A search limited to one user can be marked as not the presenter's photos."""
+    pr = load_project({"format": "dikarya-presentation", "schema_version": 5,
+                       "sources": [{"id": "a", "type": "url", "url": USER_URL}]})
+    assert pr.sources[0].type == "url" and pr.sources[0].username is None
+    assert observer_default(pr) is True
+    again = load_project(json.loads(json.dumps(project_to_json(pr))))
+    assert again.sources[0].type == "url"
+    mine = load_project({"format": "dikarya-presentation", "schema_version": 5,
+                         "sources": [{"id": "a", "type": "username", "username": "alan_rockefeller", "url": USER_URL}]})
+    assert mine.sources[0].type == "username" and observer_default(mine) is False
+
+
+def test_ignored_ids_are_capped_so_the_file_still_opens():
+    from app.models import MAX_IGNORED, Project
+
+    pr = ignore_observations(Project(ignored_observation_ids=list(range(1, MAX_IGNORED - 100))), list(range(10**6, 10**6 + 500)))
+    assert len(pr.ignored_observation_ids) == MAX_IGNORED
+    assert pr.ignored_observation_ids[-1] == 10**6 + 499  # the newest are kept
+    load_project(project_to_json(pr))
+
+
+def test_observation_with_more_photos_than_a_file_holds():
+    from app.models import MAX_PHOTOS
+
+    many = tuple((900_000 + k, 100, 100) for k in range(MAX_PHOTOS + 20))
+    obs = norm(make_obs(5, 47692, photos=many))
+    assert len(obs[5]["photos"]) == MAX_PHOTOS
+    pr = add_observations(base_project(), [5], obs, {5: ["a"]}, placement="append")
+    # A refresh where a selected photo was deleted and the photo list is full.
+    st = pr.observations[0].model_copy(update={"selected_photo_ids": [123], "known_photo_ids": [123]})
+    pr = pr.model_copy(update={"observations": [st]})
+    refreshed, summary = refresh_project(pr, obs, {"a": [5]})
+    known = refreshed.observations[0].known_photo_ids
+    assert len(known) == MAX_PHOTOS and 123 in known and summary["missing_photos"] == {"5": [123]}
+    load_project(project_to_json(refreshed))
+
+
+def test_saved_file_leaves_out_default_observation_fields():
+    pr = base_project()
+    obs = norm(make_obs(1, 47692), make_obs(2, 47602))
+    pr = add_observations(pr, [1, 2], obs, {1: ["a"], 2: ["a"]}, placement="append")
+    st = pr.observations[1].model_copy(update={
+        "overrides": AnnotationOverrides(location=""), "rotations": {obs[2]["photos"][0]["id"]: 90}})
+    pr = pr.model_copy(update={"observations": [pr.observations[0], st]})
+    data = project_to_json(pr)
+    first, second = data["observations"]
+    assert set(first) == {"id", "selected_photo_ids", "known_photo_ids", "source_ids", "last_inat_name", "added_at"}
+    assert second["overrides"] == {"location": ""} and "status" not in second
+    assert data["settings"]["annotations"]["observer"] is None  # settings stay complete
+    again = load_project(json.loads(json.dumps(data)))
+    assert again.observations == pr.observations

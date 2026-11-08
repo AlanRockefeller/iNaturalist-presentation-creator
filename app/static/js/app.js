@@ -81,7 +81,7 @@
   function newProject() {
     return {
       format: 'dikarya-presentation',
-      schema_version: 4,
+      schema_version: 5,
       sources: [],
       settings: {
         title: '', presenter: '', background: 'black', title_photo: null,
@@ -129,15 +129,43 @@
   // so iNaturalist is not searched again) and whether it was saved to a file.
   const DRAFT_KEY = 'dp-draft';
   let restoring = true; // until startup has restored (or found no) draft; never overwrite it before then
+  // Observation fields at their defaults are left out of the draft (the server
+  // fills them back in), as project_to_json() does for saved files, so a large
+  // project still fits in the browser's storage.
+  function leanState(st) {
+    const out = {};
+    for (const [k, v] of Object.entries(st)) {
+      if (v === null || v === undefined || (k === 'status' && v === 'active')) continue;
+      if (Array.isArray(v)) { if (v.length) out[k] = v; continue; }
+      if (k === 'overrides') {
+        const kept = Object.entries(v).filter(([, x]) => x !== null && x !== undefined);
+        if (kept.length) out[k] = Object.fromEntries(kept);
+        continue;
+      }
+      if (typeof v === 'object' && !Object.keys(v).length) continue;
+      out[k] = v;
+    }
+    return out;
+  }
+  let draftWarned = false;
   function saveDraft() {
     if (restoring) return;
     try {
       if (!S.project.sources.length) { localStorage.removeItem(DRAFT_KEY); return; }
+      const project = { ...S.project, observations: S.project.observations.map(leanState) };
       localStorage.setItem(DRAFT_KEY, JSON.stringify({
-        project: S.project, step: S.step, workspaceId: S.workspaceId, dirty: S.dirty, savedAt: Date.now(),
+        project, step: S.step, workspaceId: S.workspaceId, dirty: S.dirty, savedAt: Date.now(),
       }));
       localStorage.removeItem('dp-project'); // the older draft format
-    } catch (e) { /* storage full or unavailable: project files still work */ }
+    } catch (e) {
+      // Storage is full or turned off. The draft already stored is older than
+      // this project, so it must not be restored later as if it were current.
+      try { localStorage.removeItem(DRAFT_KEY); } catch (err) { /* ignore */ }
+      if (!draftWarned && S.project.observations.length) {
+        draftWarned = true;
+        toast('This browser cannot keep this project automatically (it may be too large). Use Save project to keep your work.', true, 9000);
+      }
+    }
   }
   const autosave = debounce(saveDraft, 800);
 
@@ -159,22 +187,39 @@
   function enabledSourceIds() {
     return new Set(S.project.sources.filter((s) => s.enabled).map((s) => s.id));
   }
-  function hiddenBySources(st) {
+  function hiddenBySources(st, en = enabledSourceIds()) {
     if (!st.source_ids || !st.source_ids.length) return false;
-    const en = enabledSourceIds();
     return !st.source_ids.some((sid) => en.has(sid));
+  }
+  // Mirror of single_user_login() in inaturalist.py: the login when a source's
+  // search is limited to exactly one user, else null. Only such a source can be
+  // switched between Mine and Search.
+  const LOGIN_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,39}$/;
+  function singleUserLogin(src) {
+    let params;
+    try { params = new URL(src.url).searchParams; } catch (e) { return null; }
+    const logins = new Map();
+    for (const key of ['user_id', 'user_login']) {
+      for (const part of (params.get(key) || '').split(',')) {
+        const v = part.trim();
+        if (v) logins.set(v.toLowerCase(), v);
+      }
+    }
+    if (logins.size !== 1) return null;
+    const login = [...logins.values()][0];
+    return LOGIN_RE.test(login) && !/^\d+$/.test(login) ? login : null;
   }
   const GROUP_RANKS = ['kingdom', 'phylum', 'class', 'order', 'family', 'genus'];
   // The group an observation is listed under, like group_of() in sorting.py:
   // the label is shown, the key tells apart groups that share a label (two
   // sources with the same label, or one genus name under two families).
-  function groupOf(id) {
+  function groupOf(id, enabled = null) {
     const g = S.project.settings.grouping;
     const o = S.obs.get(id);
     if (g === 'none' || !o) return { key: '', label: '' };
     if (g === 'source') {
       const st = S.states.get(id);
-      const en = enabledSourceIds();
+      const en = enabled || enabledSourceIds();
       const ids = (st && st.source_ids) || [];
       const src = S.project.sources.find((s) => ids.includes(s.id) && en.has(s.id)) || S.project.sources.find((s) => ids.includes(s.id));
       return src ? { key: `source:${src.id}`, label: src.label || src.url } : { key: 'other', label: 'Other observations' };
@@ -192,11 +237,11 @@
     const ids = new Set(o.photos.map((p) => p.id));
     return st.selected_photo_ids.filter((p) => ids.has(p)).length;
   }
-  function slideEligible(st) {
+  function slideEligible(st, en = enabledSourceIds()) {
     const o = S.obs.get(st.id);
     if (!o || st.status !== 'active') return false;
     if ((o.faves_count || 0) < (S.project.settings.min_faves || 0)) return false;
-    return !hiddenBySources(st);
+    return !hiddenBySources(st, en);
   }
 
   // ---------------------------------------------------------------- steps
@@ -277,6 +322,9 @@
       try { localStorage.setItem('dp-username', username); } catch (err) { /* ignore */ }
       markDirty();
       renderSources();
+      if (parsed.type === 'username' && !username) {
+        toast(`This search is limited to ${parsed.username}, so it counts as your own photos and photo credits start off. If they are someone else's, click Mine on the source.`, false, 9000);
+      }
     } catch (err) {
       $('#source-error').textContent = err.message;
     } finally {
@@ -310,24 +358,48 @@
     return dropped.size;
   }
 
+  // Mine (the presenter's own photos: credits start off) or Search (may
+  // include other people's: credits start on). Only a search limited to one
+  // user can be switched; Mine then means that user is the presenter.
+  function setSourceOwner(src, login) {
+    src.type = login ? 'username' : 'url';
+    src.username = login || null;
+    markDirty();
+    renderSources();
+  }
+
   function renderSources() {
     const list = $('#source-list');
     list.replaceChildren();
     $('#sources-empty').hidden = S.project.sources.length > 0;
     S.project.sources.forEach((src) => {
       const count = S.sourceCounts[src.id];
+      const mine = src.type === 'username';
+      const login = singleUserLogin(src);
+      const whose = mine
+        ? `Your own photos (${src.username}): photo credits start off.`
+        : 'May include other people\'s photos: photo credits start on.';
+      const badge = login
+        ? el('button', {
+          type: 'button', class: `badge ${src.type} badge-toggle`, text: mine ? 'Mine' : 'Search',
+          'aria-pressed': mine ? 'true' : 'false', 'aria-label': `My own photos (${login})`,
+          title: mine ? `Click if these are not your photos, but ${login}'s.` : `Click if you are ${login} and these are your own photos.`,
+          onclick: () => setSourceOwner(src, mine ? null : login),
+        })
+        : el('span', { class: 'badge ' + src.type, text: mine ? 'Mine' : 'Search', title: whose });
       const item = el('li', { class: 'source-item' + (src.enabled ? '' : ' disabled') },
         el('input', {
           type: 'checkbox', checked: src.enabled, title: 'Include this source', 'aria-label': 'Include this source',
           onchange: (e) => { src.enabled = e.target.checked; markDirty(); renderSources(); },
         }),
-        el('span', { class: 'badge ' + src.type, text: src.type === 'username' ? 'Mine' : 'Search', title: src.type === 'username' ? `Your observations (${src.username}); photo credits start off` : 'May include other people\'s photos; photo credits start on' }),
+        badge,
         el('div', { class: 'source-meta' },
           el('input', {
             type: 'text', class: 'label-input', value: src.label, maxLength: 120, 'aria-label': 'Source label',
             onchange: (e) => { src.label = e.target.value.trim().slice(0, 120); markDirty(); },
           }),
           el('a', { class: 'url', href: src.url, target: '_blank', rel: 'noopener noreferrer', text: src.url }),
+          el('span', { class: 'who', text: whose + (login ? ` Click ${mine ? 'Mine' : 'Search'} to change.` : '') }),
         ),
         el('span', { class: 'count-pill', text: count === undefined ? '' : plural(count, 'observation') }),
         el('button', {
@@ -406,12 +478,32 @@
     bar.style.width = `${Math.min(100, Math.round((100 * done) / total))}%`;
   }
 
+  // Dialogs: focus moves into one when it opens and back where it was when it
+  // closes. Closing the review dialog refreshes its "Review new" button.
+  const modalReturn = new Map();
+  function openModal(m) {
+    if (!m.hidden) return;
+    modalReturn.set(m, document.activeElement);
+    m.hidden = false;
+    const box = $('.modal-box', m);
+    box.setAttribute('tabindex', '-1');
+    box.focus();
+  }
+  function closeModal(m) {
+    if (m.hidden) return;
+    m.hidden = true;
+    if (m.id === 'review-modal') updateStats();
+    const back = modalReturn.get(m);
+    modalReturn.delete(m);
+    if (back && back.isConnected && typeof back.focus === 'function') back.focus();
+  }
+
   async function startLoad(refreshSourceIds, resume = null) {
     const gen = projectGen;
     const modal = $('#load-modal');
     $('#load-message').textContent = 'Starting…';
     setBar($('#load-bar'), 0, 0);
-    modal.hidden = false;
+    openModal(modal);
     loadCancelled = false;
     try {
       const job = await api('/api/load', {
@@ -434,7 +526,7 @@
     } catch (err) {
       if (gen === projectGen) toast(err.message, true, 9000);
     } finally {
-      modal.hidden = true;
+      closeModal(modal);
       loadJobId = null;
     }
   }
@@ -509,6 +601,7 @@
   function organizeItems() {
     const needle = $('#find').value.trim().toLowerCase();
     const minF = S.project.settings.min_faves || 0;
+    const en = enabledSourceIds();
     const items = [];
     let hiddenFaves = 0;
     let hiddenSources = 0;
@@ -519,11 +612,11 @@
       if (!st) continue;
       const o = S.obs.get(id);
       if (st.status === 'active' && o) {
-        if (hiddenBySources(st)) { hiddenSources++; continue; }
+        if (hiddenBySources(st, en)) { hiddenSources++; continue; }
         if ((o.faves_count || 0) < minF) { hiddenFaves++; continue; }
       }
       if (!findMatches(id, needle)) continue;
-      const g = groupOf(id);
+      const g = groupOf(id, en);
       if (S.project.settings.grouping !== 'none' && g.label && g.key !== lastGroup) {
         items.push({ type: 'group', key: g.key, label: g.label });
         lastGroup = g.key;
@@ -536,7 +629,8 @@
   // Removes the observations listed under a group heading (those hidden by the
   // filters stay), like "Remove from project" on each card.
   function removeGroup(key, label) {
-    const ids = new Set(organizeItems().items.filter((it) => it.type === 'obs' && groupOf(it.id).key === key).map((it) => it.id));
+    const en = enabledSourceIds();
+    const ids = new Set(organizeItems().items.filter((it) => it.type === 'obs' && groupOf(it.id, en).key === key).map((it) => it.id));
     if (!ids.size) return;
     if (!confirm(`Remove ${plural(ids.size, 'observation')} in ${label} from the project?`)) return;
     const p = S.project;
@@ -569,17 +663,21 @@
       renderedCards.set(item.id, card);
       return card;
     }, min);
+    lastHidden = { hiddenFaves, hiddenSources };
     updateStats(hiddenFaves, hiddenSources);
   }
 
-  function updateStats(hiddenFaves, hiddenSources) {
-    if (hiddenFaves === undefined) ({ hiddenFaves, hiddenSources } = organizeItems());
+  // The filter counts change only when the list is rebuilt, so a photo
+  // checkbox (which refreshes one card) reuses them instead of rescanning.
+  let lastHidden = { hiddenFaves: 0, hiddenSources: 0 };
+  function updateStats(hiddenFaves = lastHidden.hiddenFaves, hiddenSources = lastHidden.hiddenSources) {
+    const en = enabledSourceIds();
     let obsCount = 0;
     let slides = 0;
     let unavailable = 0;
     for (const st of S.project.observations) {
       if (st.status !== 'active') { unavailable++; continue; }
-      if (!slideEligible(st)) continue;
+      if (!slideEligible(st, en)) continue;
       const c = selectedCount(st);
       if (c) { obsCount++; slides += c; }
     }
@@ -832,13 +930,20 @@
         type: 'button', class: 'edit', text: 'edit', title: 'Edit the name shown on the slides',
         onclick: () => {
           const input = el('input', { type: 'text', value: name, maxLength: 300, 'aria-label': 'Name on slides' });
+          // Escape removes the input; some browsers then fire blur, which must not save.
+          let finished = false;
           const save = () => {
+            if (finished) return;
+            finished = true;
             const v = input.value.trim();
             st.overrides.scientific = (v === '' || v === (o.inat_name || '')) ? null : v;
             markDirty();
             refreshCard(id);
           };
-          input.addEventListener('keydown', (e) => { if (e.key === 'Enter') save(); if (e.key === 'Escape') refreshCard(id); });
+          input.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') save();
+            if (e.key === 'Escape') { finished = true; refreshCard(id); }
+          });
           input.addEventListener('blur', save);
           nameRow.replaceChildren(input);
           input.focus();
@@ -1102,6 +1207,10 @@
 
   $('#sort-key').addEventListener('change', (e) => {
     const key = e.target.value;
+    if (S.project.settings.sort.key === 'custom' && !confirm('Re-sorting replaces your hand-arranged order. Continue?')) {
+      syncToolbar(); // back to "Custom (dragged)"
+      return;
+    }
     const dir = ['favorites', 'observed_on', 'created_at'].includes(key) ? 'desc' : 'asc';
     applySort(key, dir);
   });
@@ -1316,7 +1425,8 @@
       if (e.target.tagName === 'INPUT' && e.target.type === 'text') return;
       if (e.ctrlKey || e.metaKey || e.altKey) return; // leave browser shortcuts such as Ctrl+R alone
       const k = e.key;
-      if (k === 'Escape') close();
+      // Only the viewer: not the review dialog it may have been opened from.
+      if (k === 'Escape') { close(); e.stopImmediatePropagation(); }
       else if (k === 'ArrowLeft') step(-1);
       else if (k === 'ArrowRight') step(1);
       else if (k === ' ') { e.preventDefault(); toggle(); }
@@ -1407,13 +1517,13 @@
       onclick: () => {
         S.project.settings.title_photo = { observation_id: id, photo_id: p.id, position: $('#title-position').value || 'center' };
         markDirty();
-        $('#picker-modal').hidden = true;
+        closeModal($('#picker-modal'));
         renderTitlePhoto();
       },
     }, el('img', { class: rotClass(rotationOf(S.states.get(id), p.id)), src: photoSize(p.url, 'small'), loading: 'lazy', alt: effectiveName(id) })), 0, 120);
     if (!items.length) $('#picker-grid').append(el('p', { class: 'muted', text: 'No photos match.' }));
   }
-  $('#btn-pick-title').addEventListener('click', () => { $('#picker-modal').hidden = false; renderPicker(); });
+  $('#btn-pick-title').addEventListener('click', () => { openModal($('#picker-modal')); renderPicker(); });
   $('#picker-all').addEventListener('change', renderPicker);
   $('#picker-find').addEventListener('input', debounce(renderPicker, 200));
 
@@ -1432,7 +1542,7 @@
         slide.append(el('img', { class: `cover focus-${spec.photo.position || 'center'} ${rotClass(spec.photo.rotation)}`, src: photoSize(spec.photo.url, 'medium'), loading: 'lazy', alt: '' }));
       }
       slide.append(el('div', { class: 'center' },
-        el('div', { class: 't-title', text: spec.title }),
+        el('div', { class: 't-title' + (spec.title_size && spec.title_size !== 54 ? ` s${spec.title_size}` : ''), text: spec.title }),
         el('div', { class: 't-rule' }),
         spec.presenter ? el('div', { class: 't-presenter', text: spec.presenter }) : null));
     } else if (spec.kind === 'divider') {
@@ -1638,7 +1748,7 @@
       reviewRenderer = chunkRender($('#review-list'), $('#review-sentinel'), ids, (id) => obsCard(id, 0, reviewAdapter(id)), 0, 40);
       updateReviewButtons();
     }
-    $('#review-modal').hidden = false;
+    openModal($('#review-modal'));
     S.reviewIds = ids;
   }
 
@@ -1679,7 +1789,7 @@
       const remaining = (S.reviewIds || []).filter((id) => !S.states.has(id) && !S.project.ignored_observation_ids.includes(id));
       if (S.pendingNew) S.pendingNew.new_ids = remaining;
       if (!remaining.length) S.pendingNew = null;
-      $('#review-modal').hidden = true;
+      closeModal($('#review-modal'));
       if (ids.length) toast(`Added ${plural(ids.length, 'observation')}.`);
       else if (ignoreIds.length) toast(`Ignored ${plural(ignoreIds.length, 'observation')}; they won't be offered again.`);
       goto(S.step === 'sources' ? 'organize' : S.step);
@@ -1712,13 +1822,12 @@
     m.addEventListener('click', (e) => {
       if (e.target === m || e.target.closest('[data-close]')) {
         if (m.id === 'load-modal' || m.dataset.busy) return;
-        m.hidden = true;
-        if (m.id === 'review-modal') updateStats();
+        closeModal(m);
       }
     });
   });
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') $$('.modal').forEach((m) => { if (m.id !== 'load-modal' && !m.dataset.busy) m.hidden = true; });
+    if (e.key === 'Escape') $$('.modal').forEach((m) => { if (m.id !== 'load-modal' && !m.dataset.busy) closeModal(m); });
   });
 
   // ---------------------------------------------------------------- save / open

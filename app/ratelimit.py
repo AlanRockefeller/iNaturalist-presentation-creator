@@ -138,7 +138,11 @@ class DailyBudget:
 
 
 class ByteBudget:
-    """Rolling hour/day byte counters kept in one-minute buckets."""
+    """Rolling hour/day byte counters kept in one-minute buckets.
+
+    A generation reserves its estimated download up front, so two decks that
+    start together cannot both pass the check and then run out halfway.
+    """
 
     def __init__(self, hourly: int, daily: int, path: Path | None = None, clock=time.time):
         self.hourly = int(hourly)
@@ -147,6 +151,7 @@ class ByteBudget:
         self._clock = clock
         self._lock = threading.Lock()
         self._buckets: dict[int, int] = {}
+        self._reserved = 0
         self._last_flush = 0.0
         if path and path.exists():
             try:
@@ -168,12 +173,13 @@ class ByteBudget:
         return hour, day
 
     def remaining(self) -> tuple[int, int]:
+        """Bytes left this hour and today, not counting reservations."""
         with self._lock:
             hour, day = self._totals()
             return max(0, self.hourly - hour), max(0, self.daily - day)
 
-    def check(self, expected: int = 0) -> None:
-        hour_left, day_left = self.remaining()
+    @staticmethod
+    def _refuse_if(expected: int, hour_left: int, day_left: int) -> None:
         if expected > day_left:
             raise BudgetExceeded(
                 "This site has reached its daily photo-download allowance from iNaturalist. "
@@ -184,6 +190,24 @@ class ByteBudget:
                 "This site has downloaded a lot of photos from iNaturalist in the last hour. "
                 "Please try again in an hour, or make a smaller presentation."
             )
+
+    def check(self, expected: int = 0) -> None:
+        self._refuse_if(expected, *self.remaining())
+
+    def reserve(self, expected: int) -> "Reservation":
+        """Set aside ``expected`` bytes, or raise BudgetExceeded if other
+        downloads and reservations leave too little."""
+        with self._lock:
+            hour, day = self._totals()
+            self._refuse_if(expected, self.hourly - hour - self._reserved, self.daily - day - self._reserved)
+            self._reserved += expected
+        return Reservation(self, expected)
+
+    def _use(self, reservation: "Reservation", nbytes: int) -> None:
+        with self._lock:  # downloads run in several threads
+            take = min(reservation.left, max(0, int(nbytes)))
+            reservation.left -= take
+            self._reserved = max(0, self._reserved - take)
 
     def add(self, nbytes: int) -> None:
         with self._lock:
@@ -196,3 +220,27 @@ class ByteBudget:
                     _atomic_write_json(self.path, self._buckets)
                 except OSError:
                     pass
+
+    def flush(self) -> None:
+        if not self.path:
+            return
+        with self._lock:
+            try:
+                _atomic_write_json(self.path, self._buckets)
+            except OSError:
+                pass
+
+
+class Reservation:
+    """Bytes set aside for one generation. Downloads use it up as they are
+    counted; ``release()`` returns what is left."""
+
+    def __init__(self, budget: ByteBudget, nbytes: int):
+        self._budget = budget
+        self.left = int(nbytes)
+
+    def consume(self, nbytes: int) -> None:
+        self._budget._use(self, nbytes)
+
+    def release(self) -> None:
+        self._budget._use(self, self.left)

@@ -20,6 +20,7 @@ Generation rules:
 from __future__ import annotations
 
 import hashlib
+import re
 import zipfile
 from datetime import date
 from pathlib import Path
@@ -51,6 +52,24 @@ MARGIN_Y = Emu(int(0.22 * EMU_PER_INCH))
 TITLE_FONT = "Georgia"
 BODY_FONT = "Calibri"
 GOLD = RGBColor(0xC9, 0xA9, 0x62)
+
+# Text that XML (so a .pptx) cannot hold, and control characters, which
+# python-pptx would otherwise write as visible "_x000B_" escapes.
+_XML_UNSAFE = re.compile("[\ud800-\udfff\ufffe\uffff]")
+_CONTROL = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
+
+
+def xml_text(text: str) -> str:
+    """One line of slide text, safe to write into the deck."""
+    return _CONTROL.sub(" ", _XML_UNSAFE.sub("", text or ""))
+
+
+def title_size(title: str) -> int:
+    """Title point size: 54 pt, smaller for long titles so they stay on the
+    slide (the title box holds about three lines at 54 pt)."""
+    n = len(title)
+    return 54 if n <= 70 else 44 if n <= 120 else 36
+
 
 MONTHS = ["January", "February", "March", "April", "May", "June", "July",
           "August", "September", "October", "November", "December"]
@@ -131,9 +150,11 @@ def build_slide_plan(project: Project, workspace_obs: dict[int, dict], max_image
                            "rotation": tp_state.rotations.get(tp.photo_id, 0) if tp_state else 0}
         else:
             warnings.append("The title background photo is no longer available on iNaturalist.")
+    title = settings.title.strip() or "Untitled presentation"
     slides.append({
         "kind": "title",
-        "title": settings.title.strip() or "Untitled presentation",
+        "title": title,
+        "title_size": title_size(title),
         "presenter": settings.presenter.strip(),
         "photo": title_photo,
     })
@@ -170,9 +191,11 @@ def build_slide_plan(project: Project, workspace_obs: dict[int, dict], max_image
         photos.sort(key=lambda p: position[p["id"]])
 
         if grouping != "none" and settings.dividers:
-            _, label = group_of(obs, st, grouping, project)
-            if label != current_group:
-                current_group = label
+            # By group key, like the Select & Organize headings: two groups can
+            # share a label (one genus name in two families, two sources).
+            group_key, label = group_of(obs, st, grouping, project)
+            if group_key != current_group:
+                current_group = group_key
                 slides.append({
                     "kind": "divider",
                     "text": label,
@@ -224,7 +247,7 @@ def _speaker_notes(obs: dict, st: ObservationState, photo: dict) -> str:
     bits.append(obs.get("uri") or "")
     if photo.get("attribution"):
         bits.append(photo["attribution"])
-    return "\n".join(b for b in bits if b)
+    return "\n".join(xml_text(b) for b in bits if b)  # one paragraph per line
 
 
 # ---------------------------------------------------------------------------
@@ -326,7 +349,7 @@ def _add_para(tf, first: bool, text: str, size: int, italic=False, bold=False, c
     para = tf.paragraphs[0] if first else tf.add_paragraph()
     para.alignment = align
     run = para.add_run()
-    run.text = text
+    run.text = xml_text(text)
     f = run.font
     f.size = Pt(size)
     f.italic = italic
@@ -382,7 +405,7 @@ class DeckWriter:
         if self._on_media_write:
             self._on_media_write(self.media_written)
 
-    def add_title(self, title: str, presenter: str, bg_image=None):
+    def add_title(self, title: str, presenter: str, bg_image=None, size: int | None = None):
         slide = self._new_slide()
         light_text = self.background == "black" or bg_image is not None
         if bg_image is not None:
@@ -392,7 +415,8 @@ class DeckWriter:
         w = int(SLIDE_W * 0.84)
         left = (int(SLIDE_W) - w) // 2
         box, tf = _textbox(slide, left, int(SLIDE_H * 0.16), w, int(SLIDE_H * 0.42), MSO_ANCHOR.BOTTOM)
-        _add_para(tf, True, title, 54, bold=True, color=color, font=TITLE_FONT, align=PP_ALIGN.CENTER, shadow=shadow)
+        _add_para(tf, True, title, size or title_size(title), bold=True, color=color, font=TITLE_FONT,
+                  align=PP_ALIGN.CENTER, shadow=shadow)
         rule_w = int(SLIDE_W * 0.12)
         rule = slide.shapes.add_shape(1, (int(SLIDE_W) - rule_w) // 2, int(SLIDE_H * 0.625), rule_w, Emu(28575))
         rule.fill.solid()
@@ -444,8 +468,8 @@ class DeckWriter:
 
     def save(self, out_path: Path, title: str = "", author: str = "") -> None:
         props = self.prs.core_properties
-        props.title = title[:200]
-        props.author = author[:200] or "Dikarya Presentations"
+        props.title = xml_text(title)[:200]
+        props.author = xml_text(author)[:200] or "Dikarya Presentations"
         props.comments = "Created with presentations.dikarya.us from iNaturalist observations."
         self.prs.save(str(out_path))
 
@@ -474,7 +498,7 @@ def write_pptx(
         kind = spec["kind"]
         if kind == "title":
             title_text = spec["title"]
-            writer.add_title(spec["title"], spec.get("presenter", ""), title_image)
+            writer.add_title(spec["title"], spec.get("presenter", ""), title_image, spec.get("title_size"))
         elif kind == "divider":
             writer.add_divider(spec["text"], spec.get("rank_label", ""), spec.get("italic", False))
         elif kind == "image":

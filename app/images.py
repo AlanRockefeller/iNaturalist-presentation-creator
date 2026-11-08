@@ -12,7 +12,6 @@ orientation tag), CMYK, or formats PowerPoint cannot show (WebP).
 
 from __future__ import annotations
 
-import logging
 import os
 import shutil
 import tempfile
@@ -26,11 +25,13 @@ from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
 from .config import Settings
 from .inaturalist import photo_url
-from .ratelimit import ByteBudget
+from .ratelimit import ByteBudget, Reservation
 
-log = logging.getLogger(__name__)
-
-Image.MAX_IMAGE_PIXELS = 120_000_000  # bound decompression bombs
+# Bound decompression bombs. Pillow refuses images over twice MAX_IMAGE_PIXELS
+# (and only warns between one and two times it), so this refuses over 120 MP.
+MAX_DECODE_PIXELS = 120_000_000
+Image.MAX_IMAGE_PIXELS = MAX_DECODE_PIXELS // 2
+LOCK_STRIPES = 256
 # The formats iNaturalist serves. Pillow picks a parser from a file's contents,
 # not its name, so only these parsers are ever tried on downloaded bytes: a
 # file named .jpg that holds anything else (EPS, which runs Ghostscript, TIFF,
@@ -67,12 +68,12 @@ class MediaFetcher:
             headers={"User-Agent": settings.user_agent},
             follow_redirects=False,
         )
-        self._locks: dict[int, threading.Lock] = {}
-        self._locks_guard = threading.Lock()
+        # One download per photo at a time. A fixed set of locks, shared by
+        # photo id, so the table does not grow with every photo ever fetched.
+        self._locks = [threading.Lock() for _ in range(LOCK_STRIPES)]
 
     def _lock_for(self, photo_id: int) -> threading.Lock:
-        with self._locks_guard:
-            return self._locks.setdefault(photo_id, threading.Lock())
+        return self._locks[int(photo_id) % LOCK_STRIPES]
 
     def cached_path(self, photo_id: int) -> Path | None:
         for p in self.cache_dir.glob(f"{int(photo_id)}.*"):
@@ -80,11 +81,13 @@ class MediaFetcher:
                 return p
         return None
 
-    def fetch_original(self, photo_id: int, api_url: str, cancelled=None) -> Path:
+    def fetch_original(self, photo_id: int, api_url: str, cancelled=None,
+                       reservation: Reservation | None = None) -> Path:
         """Download (or reuse the cached) original of a photo; returns its path.
 
         ``cancelled`` (optional, returns bool) is checked before the download and
         between chunks and retries; DownloadCancelled is raised when it is true.
+        Downloaded bytes are taken from ``reservation`` when one is given.
         """
         def stop_if_cancelled():
             if cancelled and cancelled():
@@ -135,6 +138,8 @@ class MediaFetcher:
                                 finally:
                                     # Count every byte received, even from an aborted attempt.
                                     self.budget.add(total)
+                                    if reservation is not None:
+                                        reservation.consume(total)
                             break
                         except (httpx.HTTPError,) as exc:
                             if attempt == 2:
@@ -150,6 +155,32 @@ class MediaFetcher:
                 except OSError:
                     pass
                 raise
+
+    def fetch_into(self, photo_id: int, api_url: str, dest_dir: Path, cancelled=None,
+                   reservation: Reservation | None = None) -> Path:
+        """Like fetch_original, but returns a hard link to the photo in
+        ``dest_dir`` (a job's own folder). Cleanup may trim the cache while a
+        deck is being built; the link keeps the file until the job is done."""
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        for attempt in range(2):
+            src = self.fetch_original(photo_id, api_url, cancelled, reservation)
+            dest = dest_dir / src.name
+            try:
+                os.link(src, dest)
+                return dest
+            except FileExistsError:
+                return dest
+            except FileNotFoundError:
+                if attempt:  # trimmed twice in a row; give up on this photo
+                    raise ImageFetchError(f"Photo {photo_id} could not be kept for the presentation.") from None
+            except OSError:
+                try:  # a filesystem without hard links
+                    shutil.copyfile(src, dest)
+                    return dest
+                except FileNotFoundError:
+                    if attempt:
+                        raise ImageFetchError(f"Photo {photo_id} could not be kept for the presentation.") from None
+        raise ImageFetchError(f"Photo {photo_id} could not be kept for the presentation.")
 
     def cleanup(self) -> None:
         """Expire cached originals by age, then trim to the size cap (oldest first)."""
@@ -245,7 +276,3 @@ def title_background(src: Path, out: Path, position: str = "center", max_width: 
         out.parent.mkdir(parents=True, exist_ok=True)
         im.save(out, "JPEG", quality=90, subsampling=0, optimize=True)
         return PreparedImage(out, width, height, "image/jpeg", "jpg")
-
-
-def remove_tree(path: Path) -> None:
-    shutil.rmtree(path, ignore_errors=True)

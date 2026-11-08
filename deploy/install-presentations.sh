@@ -19,7 +19,8 @@
 #      it in place when run from there. A .git directory is never touched.
 #      (owner $CODE_OWNER, group presentations, read-only for the service).
 #   5. Creates/updates the virtualenv /var/www/presentations/.venv and installs
-#      requirements.txt; byte-compiles; runs an import check as the service user.
+#      requirements.txt; byte-compiles; as the service user, imports the app
+#      and builds it with create_app() (the start-up check).
 #   6. Installs /etc/systemd/system/presentations.service (hardened, 127.0.0.1:8031,
 #      one Uvicorn worker, Restart=on-failure), enables and restarts it, waits for
 #      /healthz.
@@ -204,11 +205,12 @@ fi
 "$APP_DIR/.venv/bin/python" -m compileall -q "$APP_DIR/app" >/dev/null
 chown -R "$CODE_OWNER:$SERVICE_USER" "$APP_DIR"
 find "$APP_DIR" -path "$APP_DIR/.git" -prune -o -exec chmod go-w {} +
-# Import check as the service user, before anything is restarted.
+# Start-up check as the service user, before anything is restarted: import the
+# app and build it, so an error in create_app() is caught too, not only at import.
 runuser -u "$SERVICE_USER" -- env PRESENTATIONS_WORK_DIR="$STATE_DIR" \
-  "$APP_DIR/.venv/bin/python" -c "import sys; sys.path.insert(0, '$APP_DIR'); import app.main; app.main.create_app" \
-  || die "the application failed to import; service not restarted"
-info "dependencies installed, import check passed"
+  "$APP_DIR/.venv/bin/python" -c "import sys; sys.path.insert(0, '$APP_DIR'); import app.main; app.main.create_app()" \
+  || die "the application failed to start (import or create_app); service not restarted"
+info "dependencies installed, start-up check passed"
 
 # ---------------------------------------------------------------------------
 log "6. systemd unit"
@@ -544,7 +546,7 @@ cat >"$tmp" <<'WRAPPER'
 #   70  systemctl restart failed (status printed)
 #   75  refused: a presentation is being generated; wait, or use --force
 #   77  not run as root (use sudo)
-#   78  import check failed: NOT restarted, the running site is unaffected
+#   78  start-up check failed: NOT restarted, the running site is unaffected
 set -uo pipefail
 APP_DIR=@APP_DIR@
 SERVICE=@SERVICE@
@@ -560,17 +562,25 @@ case "$#:${1:-}" in
 esac
 [[ $EUID -eq 0 ]] || { echo "run it with sudo" >&2; exit 77; }
 
-# 1. Import check as the unprivileged service user.
+# 1. Start-up check as the unprivileged service user: import the app and build
+#    it with create_app(), as Uvicorn will.
 if ! out=$(cd / && runuser -u "$SERVICE_USER" -- env PYTHONDONTWRITEBYTECODE=1 \
       PRESENTATIONS_WORK_DIR="$STATE_DIR" "$APP_DIR/.venv/bin/python" \
-      -c "import sys; sys.path.insert(0, '$APP_DIR'); import app.main" 2>&1); then
-  echo "Import check FAILED, so the service was NOT restarted (the site is still up on the old code):" >&2
+      -c "import sys; sys.path.insert(0, '$APP_DIR'); import app.main; app.main.create_app()" 2>&1); then
+  echo "Start-up check FAILED, so the service was NOT restarted (the site is still up on the old code):" >&2
   printf '%s\n' "$out" | tail -n 25 >&2
   exit 78
 fi
 
-# 2. Do not cancel a deck that is being built.
-health=$(curl -fsS --max-time 3 "http://127.0.0.1:${PORT}/healthz" 2>/dev/null || true)
+# 2. Do not cancel a deck that is being built. /healthz is asked up to three
+#    times, so one slow answer cannot make it look as if nothing is running.
+health=""
+for _ in 1 2 3; do
+  health=$(curl -fsS --max-time 3 "http://127.0.0.1:${PORT}/healthz" 2>/dev/null) && break
+  health=""
+  sleep 1
+done
+[[ -n $health ]] || echo "note: /healthz did not answer, so running jobs could not be checked; the site looks down, restarting." >&2
 read -r loading generating < <(python3 -c '
 import json, sys
 try:

@@ -12,9 +12,9 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from .inaturalist import SourceError, build_source
+from .inaturalist import SourceError, build_source, parse_source_input, single_user_login
 from .models import (
-    PROJECT_FORMAT, SCHEMA_VERSION, ObservationState, Project, Source,
+    MAX_IGNORED, MAX_PHOTOS, PROJECT_FORMAT, SCHEMA_VERSION, ObservationState, Project, Source,
 )
 
 
@@ -43,9 +43,25 @@ def _migrate(data: dict) -> dict:
     if version == 3:
         # v4 added per-observation photo_order; a v3 file simply has none.
         data["schema_version"] = version = 4
+    if version == 4:
+        # Since v5 a source's type is the user's choice (shown and changeable
+        # as Mine / Search). Before, every load re-derived it: a search limited
+        # to one user's login counted as that user's own photos. Keep that.
+        data["sources"] = [_typed_source(src) for src in data.get("sources") or []]
+        data["schema_version"] = version = 5
     if version == SCHEMA_VERSION:
         return data
     raise ProjectError(f"Unsupported project schema version {version!r}.")
+
+
+def _typed_source(src):
+    if not (isinstance(src, dict) and src.get("type") == "url" and isinstance(src.get("url"), str)):
+        return src
+    try:
+        login = single_user_login(parse_source_input(src["url"])["params"])
+    except SourceError:
+        return src  # validation reports it
+    return {**src, "type": "username", "username": login} if login else src
 
 
 def load_project(data: Any) -> Project:
@@ -85,8 +101,9 @@ def normalize_project(project: Project) -> Project:
         try:
             if src.type == "username" and not src.username:
                 raise SourceError("a username source needs a username")
-            # build_source also recognises a URL that filters to a single user.
-            parsed = build_source(src.url, src.username if src.type == "username" else None)
+            # The saved type stands: a "url" source limited to one user stays
+            # "url" when the user said those are not their own photos.
+            parsed = build_source(src.url, src.username if src.type == "username" else None, infer_username=False)
         except SourceError as exc:
             raise ProjectError(f"Source {src.label or src.id!r} is not valid: {exc}") from None
         sources.append(src.model_copy(update={
@@ -134,6 +151,10 @@ def project_to_json(project: Project) -> dict:
     from . import __version__
 
     data = project.model_dump(mode="json")
+    # Observation fields at their defaults (no overrides, no rotations, active,
+    # ...) are most of a large file and loading fills them back in, so they are
+    # left out. Settings and sources are written in full.
+    data["observations"] = [st.model_dump(mode="json", exclude_defaults=True) for st in project.observations]
     data["format"] = PROJECT_FORMAT
     data["schema_version"] = SCHEMA_VERSION
     data["saved_at"] = now_iso()
@@ -242,7 +263,7 @@ def refresh_project(
             summary["new_photos"][str(st.id)] = new_photos
         # Keep missing selected photos in the selection so the editor can flag
         # them; never substitute another photo silently.
-        known_ids = current + [pid for pid in missing if pid not in current_set]
+        known_ids = _cap_known(current + [pid for pid in missing if pid not in current_set], st.selected_photo_ids)
         if st.last_inat_name is not None and st.last_inat_name != obs.get("inat_name"):
             summary["name_changed"] += 1
         # Membership in sources that were not queried this time (disabled
@@ -275,6 +296,22 @@ def refresh_project(
     summary["new_by_source"] = new_by_source
     summary["membership"] = {str(oid): membership[oid] for oid in new_ids}
     return project.model_copy(update={"observations": states}), summary
+
+
+def _cap_known(ids: list[int], selected: list[int]) -> list[int]:
+    """At most MAX_PHOTOS ids, the most a file may hold; selected photos first."""
+    if len(ids) <= MAX_PHOTOS:
+        return ids
+    chosen = set(selected)
+    room = MAX_PHOTOS - sum(1 for pid in ids if pid in chosen)
+    out = []
+    for pid in ids:
+        if pid in chosen:
+            out.append(pid)
+        elif room > 0:
+            out.append(pid)
+            room -= 1
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -340,8 +377,10 @@ def add_observations(
 
 
 def ignore_observations(project: Project, ids: list[int]) -> Project:
+    """Remember ids not to offer again, keeping the newest MAX_IGNORED so the
+    project file stays loadable."""
     ignored = list(dict.fromkeys(project.ignored_observation_ids + [int(i) for i in ids]))
-    return project.model_copy(update={"ignored_observation_ids": ignored})
+    return project.model_copy(update={"ignored_observation_ids": ignored[-MAX_IGNORED:]})
 
 
 def remove_source(project: Project, source_id: str) -> Project:

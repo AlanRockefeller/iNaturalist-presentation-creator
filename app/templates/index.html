@@ -84,7 +84,8 @@
       <h3>Tips</h3>
       <ul class="tips">
         <li>Any filter the iNaturalist observations page supports works here, for example <code>taxon_id</code>, <code>place_id</code>, <code>project_id</code>, <code>d1</code>/<code>d2</code> dates and <code>quality_grade</code>.</li>
-        <li>Each source can match at most {{ "{:,}".format(limits.max_observations) }} observations, the most iNaturalist allows in one search. Add filters to narrow a larger one.</li>
+        <li>Each source can match at most {{ "{:,}".format(limits.max_observations_per_source) }} observations, the most iNaturalist allows in one search. Add filters to narrow a larger one.</li>
+        <li>A source with your username, or a link limited to one iNaturalist user, counts as your own photos (<strong>Mine</strong>), so photo credits start off. Other sources (<strong>Search</strong>) may include other people's photos, so credits start on. Click Mine or Search on a source limited to one user to change it.</li>
         <li>Thumbnails load directly from iNaturalist. Full-resolution photos are downloaded only when you generate the PowerPoint.</li>
       </ul>
     </div>
@@ -125,7 +126,7 @@
       </div>
       <div class="tool">
         <label for="min-faves">Minimum favorites</label>
-        <input type="number" id="min-faves" min="0" max="100000" step="1" value="0">
+        <input type="number" id="min-faves" min="0" max="1000000" step="1" value="0">
       </div>
       <div class="tool grow">
         <label for="find">Find</label>
@@ -143,7 +144,7 @@
       <span id="org-stats"></span>
       <span class="muted small">Drag ⠿ to reorder. Click a photo to inspect it. Drag a photo to change its slide order. Keys: <kbd>↑</kbd> <kbd>↓</kbd> observations, <kbd>←</kbd> <kbd>→</kbd> photos, <kbd>Shift</kbd>+<kbd>←</kbd> <kbd>→</kbd> move a photo, <kbd>Space</kbd> include, <kbd>Enter</kbd> enlarge.</span>
     </div>
-    <div id="obs-list" class="obs-list" aria-live="polite"></div>
+    <div id="obs-list" class="obs-list"></div>
     <div id="obs-sentinel" class="sentinel"></div>
     <div class="row-end sticky-actions">
       <button type="button" class="btn btn-primary btn-lg" data-goto="settings">Next: Presentation settings</button>

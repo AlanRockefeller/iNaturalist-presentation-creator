@@ -153,6 +153,9 @@ html.dark .check input { accent-color: var(--journal-gold); }
 .badge { display: inline-block; font-size: .7rem; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; padding: 2px 8px; border-radius: 999px; background: var(--journal-gold-light); color: var(--journal-dark); }
 .badge.url { background: #d6e6dc; }
 html.dark .badge.url { background: #355245; color: var(--text); }
+/* A source limited to one user: the badge switches between Mine and Search. */
+.badge-toggle { border: 1px dashed currentColor; font-family: inherit; line-height: inherit; cursor: pointer; }
+.badge-toggle:hover { border-style: solid; }
 .count-pill { font-size: .8rem; color: var(--text-dim); }
 .empty-note { color: var(--text-mute); font-style: italic; }
 
@@ -260,6 +263,8 @@ html.dark .chip.warn { background: #4a241c; color: #ffb4a4; border-color: #7a3a2
 .slide .ann .l18 { font-size: calc(18 / 540 * 100cqh); }
 .slide .center { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; padding: 0 8cqw; font-family: Georgia, serif; }
 .slide .t-title { font-size: calc(54 / 540 * 100cqh); font-weight: 700; line-height: 1.1; }
+.slide .t-title.s44 { font-size: calc(44 / 540 * 100cqh); }
+.slide .t-title.s36 { font-size: calc(36 / 540 * 100cqh); }
 .slide .t-rule { width: 12cqw; height: 0.4cqh; background: var(--journal-gold); margin: 3cqh 0; }
 .slide .t-presenter { font-size: calc(28 / 540 * 100cqh); }
 .slide.bg-white:not(.has-photo) .t-title, .slide.bg-white:not(.has-photo) .t-presenter, .slide.bg-white .d-name { color: #1a2f23; }
@@ -293,6 +298,7 @@ html.dark .result-err { background: #4a241c; border-color: #7a3a2c; color: #ffb4
 .modal { position: fixed; inset: 0; background: rgba(10, 20, 14, .6); z-index: 100; display: flex; align-items: center; justify-content: center; padding: 20px; }
 .modal-box { background: var(--panel); color: var(--text); border-radius: 12px; box-shadow: 0 20px 60px rgba(0, 0, 0, .4); padding: 20px 22px; width: 100%; max-height: 92vh; display: flex; flex-direction: column; border: 1px solid var(--line); }
 .modal-box.narrow { max-width: 520px; }
+.modal-box:focus { outline: none; }
 .modal-box.wide { max-width: 1100px; }
 .modal-head { display: flex; justify-content: space-between; align-items: center; }
 .modal-head .close { background: none; color: var(--text-mute); font-size: 1.6rem; }

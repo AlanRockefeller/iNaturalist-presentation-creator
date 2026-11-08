@@ -369,3 +369,46 @@ def test_only_expected_image_formats_are_parsed(tmp_path):
             _verify_image(bad, 7)
         with pytest.raises(Exception):
             prepare_for_slide(bad, tmp_path / "work")
+
+
+# ---------------------------------------------------------------- text safety, title size, groups
+
+def test_pasted_control_characters_and_unencodable_text_cannot_break_the_deck(tmp_path):
+    from app.models import PresentationSettings
+
+    settings = PresentationSettings(title="Fungi\x0bof Oregon", presenter="Alan\ud800 R")
+    assert settings.title == "Fungi of Oregon" and settings.presenter == "Alan R"
+    pr, obs = _deck()
+    # iNaturalist text and older files go through the writer's own check too.
+    obs[3]["place_guess"] = "Marin\x0b County￾"
+    pr = pr.model_copy(update={"settings": pr.settings.model_copy(update={
+        "annotations": AnnotationSettings(location=True)})})
+    plan = build_slide_plan(pr, obs)
+    plan["slides"][0]["title"] = "Bad\x0bTitle\ud800"
+    out = tmp_path / "deck.pptx"
+    write_pptx(plan, _images(tmp_path, obs), None, out, author="Pre\x01senter")
+    prs = Presentation(str(out))
+    texts = [sh.text_frame.text for s in prs.slides for sh in s.shapes if sh.has_text_frame]
+    assert "Bad Title" in texts and any("Marin  County" in t for t in texts)
+    assert not any("_x000B_" in t for t in texts)
+    assert prs.core_properties.title == "Bad Title" and prs.core_properties.author == "Pre senter"
+
+
+@pytest.mark.parametrize("length,size", [(20, 54), (70, 54), (71, 44), (120, 44), (121, 36), (200, 36)])
+def test_long_titles_get_a_smaller_font(tmp_path, length, size):
+    pr, obs = _deck({"title": "T" * length})
+    plan = build_slide_plan(pr, obs)
+    assert plan["slides"][0]["title_size"] == size
+    out = tmp_path / "deck.pptx"
+    write_pptx(plan, _images(tmp_path, obs), None, out)
+    run = Presentation(str(out)).slides[0].shapes[0].text_frame.paragraphs[0].runs[0]
+    assert run.font.size.pt == size
+
+
+def test_groups_sharing_a_label_get_their_own_divider():
+    a, b = source("a", URL, label="Same label"), source("b", URL.replace("place_id=1", "place_id=2"), label="Same label")
+    obs = norm(make_obs(1, 47692, photos=((11, 800, 600),)), make_obs(2, 47602, photos=((21, 800, 600),)))
+    pr = project(a, b, grouping="source", dividers=True)
+    pr = add_observations(pr, [1, 2], obs, {1: ["a"], 2: ["b"]}, placement="append")
+    kinds = [s["kind"] for s in build_slide_plan(pr, obs)["slides"]]
+    assert kinds == ["title", "divider", "image", "divider", "image"]

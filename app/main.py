@@ -21,6 +21,9 @@ from starlette.concurrency import run_in_threadpool
 
 from . import __version__
 from .config import Settings, get_settings
+from .diagnostics import (
+    AlreadyLoggedFilter, RequestDiagnosticsMiddleware, annotate, client_bucket, client_ip, get_logger, log_event,
+)
 from .images import MediaFetcher
 from .inaturalist import INatClient, SourceError, TaxaCache, build_source
 from .jobs import JobManager, JobRejected
@@ -36,7 +39,7 @@ from .ratelimit import ByteBudget, DailyBudget, RateLimiter
 from .sorting import sort_ids
 from .workspace import WorkspaceExpired, WorkspaceStore
 
-log = logging.getLogger("presentations")
+log = get_logger("presentations")
 BASE = Path(__file__).resolve().parent
 
 CSP = (
@@ -56,13 +59,40 @@ class BodyLimitMiddleware:
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
+        declared = chunked = False
         for name, value in scope.get("headers", []):
             if name == b"content-length":
+                declared = True
                 try:
                     if int(value) > self.limit:
                         return await _too_large(send)
                 except ValueError:
                     return await _too_large(send)
+            elif name == b"transfer-encoding":
+                chunked = True
+        if chunked and not declared:
+            # A streamed body is read here first. Raising from receive() inside
+            # the app would not work: FastAPI turns that into a 400.
+            body = bytearray()
+            while True:
+                message = await receive()
+                if message["type"] == "http.disconnect":
+                    return
+                body.extend(message.get("body", b""))
+                if len(body) > self.limit:
+                    return await _too_large(send)
+                if not message.get("more_body"):
+                    break
+            replayed = False
+
+            async def replay():
+                nonlocal replayed
+                if replayed:
+                    return await receive()
+                replayed = True
+                return {"type": "http.request", "body": bytes(body), "more_body": False}
+
+            return await self.app(scope, replay, send)
         received = 0
 
         async def limited_receive():
@@ -92,13 +122,8 @@ async def _too_large(send):
 
 
 def client_key(request: Request) -> str:
-    """Real client address: trust X-Real-IP only from the local nginx proxy."""
-    peer = request.client.host if request.client else "unknown"
-    if peer in ("127.0.0.1", "::1"):
-        real = request.headers.get("x-real-ip", "").strip()
-        if real and len(real) <= 64:
-            return real
-    return peer
+    """Who per-client limits count: the address, or its /64 for IPv6."""
+    return client_bucket(client_ip(request.scope))
 
 
 class Services:
@@ -135,7 +160,12 @@ class Services:
 
     def stop(self) -> None:
         self._stop.set()
+        # Cancelled jobs stop at their next progress check, so the process can
+        # exit at once instead of waiting for them.
+        cancelled = self.jobs.shutdown()
         self.api_budget.flush()
+        self.media_budget.flush()
+        log_event(log, logging.INFO, "app.stopping", jobs_cancelled=cancelled)
 
 
 def create_app(settings: Settings | None = None, services: Services | None = None) -> FastAPI:
@@ -146,6 +176,8 @@ def create_app(settings: Settings | None = None, services: Services | None = Non
     async def lifespan(app: FastAPI):
         svc.cleanup()
         svc.start_cleanup_thread()
+        log_event(log, logging.INFO, "app.started", version=__version__,
+                  api_left=svc.api_budget.remaining(), workspaces=len(list(settings.workspace_dir.glob("*.json.gz"))))
         yield
         svc.stop()
 
@@ -179,8 +211,12 @@ def create_app(settings: Settings | None = None, services: Services | None = Non
 
     @app.exception_handler(Exception)
     async def unhandled(request: Request, exc: Exception):
-        log.exception("event=request.unhandled path=%s", request.url.path)
-        return JSONResponse({"detail": "Something went wrong on the server."}, status_code=500)
+        # ServerErrorMiddleware runs this after the request middleware, which
+        # has already logged the exception; give the 500 the same request ID.
+        return JSONResponse(
+            {"detail": "Something went wrong on the server."}, status_code=500,
+            headers={"X-Request-ID": getattr(request.state, "request_id", "-")},
+        )
 
     def workspace(wid: str) -> dict:
         try:
@@ -203,6 +239,7 @@ def create_app(settings: Settings | None = None, services: Services | None = Non
             "limits": {
                 "max_sources": settings.max_sources,
                 "max_observations": settings.max_observations_per_project,
+                "max_observations_per_source": settings.max_observations_per_source,
                 "max_image_slides": settings.max_image_slides,
             },
         })
@@ -211,15 +248,7 @@ def create_app(settings: Settings | None = None, services: Services | None = Non
     async def healthz():
         # Counts only (no ids): the restart wrapper uses them to avoid killing
         # a deck that is being generated.
-        active = [j for j in svc.jobs.jobs.values() if j.state in ("queued", "running")]
-        return {
-            "ok": True,
-            "version": __version__,
-            "jobs": {
-                "loading": sum(1 for j in active if j.kind == "load"),
-                "generating": sum(1 for j in active if j.kind == "generate"),
-            },
-        }
+        return {"ok": True, "version": __version__, "jobs": svc.jobs.counts()}
 
     @app.get("/robots.txt", response_class=HTMLResponse)
     async def robots():
@@ -229,34 +258,42 @@ def create_app(settings: Settings | None = None, services: Services | None = Non
 
     @app.post("/api/sources/parse")
     async def parse_source(body: ParseSourceRequest):
+        annotate(input=body.url, username=body.username or None)
         try:
             parsed = build_source(body.url, body.username)
         except SourceError as exc:
             raise HTTPException(422, str(exc)) from None
         parsed.pop("params", None)
+        annotate(type=parsed["type"], source=parsed["url"])
         return parsed
 
     @app.post("/api/project/validate")
     async def validate_project(request: Request):
+        raw = await request.body()
+        annotate(bytes=len(raw))
         try:
-            data = json.loads(await request.body())
+            data = await run_in_threadpool(json.loads, raw)
         except (ValueError, UnicodeDecodeError):
             raise HTTPException(422, "That file is not valid JSON.") from None
+        if isinstance(data, dict):
+            annotate(schema=data.get("schema_version"), app_version=data.get("app_version"))
         try:
             project = await run_in_threadpool(load_project, data)
         except ProjectError as exc:
             raise HTTPException(422, str(exc)) from None
+        annotate(sources=len(project.sources), observations=len(project.observations))
         return {"project": project.model_dump(mode="json"), "observer_default": observer_default(project)}
 
     @app.post("/api/project/export")
     async def export_project(request: Request):
         try:
-            data = json.loads(await request.body())
+            data = await run_in_threadpool(json.loads, await request.body())
             project = await run_in_threadpool(load_project, data.get("project") if isinstance(data, dict) else None)
         except ProjectError as exc:
             raise HTTPException(422, str(exc)) from None
         except (ValueError, UnicodeDecodeError):
             raise HTTPException(422, "Invalid project.") from None
+        annotate(sources=len(project.sources), observations=len(project.observations))
         return project_to_json(project)
 
     # -- jobs ----------------------------------------------------------------
@@ -264,21 +301,26 @@ def create_app(settings: Settings | None = None, services: Services | None = Non
     @app.post("/api/load")
     def start_load(body: LoadRequest, request: Request):
         project = checked(body.project)
+        annotate(sources=sum(1 for s in project.sources if s.enabled), observations=len(project.observations),
+                 refresh=body.refresh_source_ids if body.workspace_id else None)
         try:
             job = svc.jobs.start_load(client_key(request), project, body.workspace_id, body.refresh_source_ids)
         except JobRejected as exc:
             raise HTTPException(429, str(exc)) from None
+        annotate(job_id=job.id)
         return job.public()
 
     @app.post("/api/generate")
     def start_generate(body: ProjectRequest, request: Request):
         project = checked(body.project)
+        annotate(observations=len(project.observations), title=project.settings.title or None)
         try:
             job = svc.jobs.start_generate(client_key(request), project, body.workspace_id)
         except WorkspaceExpired:
             raise HTTPException(410, "Your session data expired. Reload the sources to continue.") from None
         except JobRejected as exc:
             raise HTTPException(429, str(exc)) from None
+        annotate(job_id=job.id)
         return job.public()
 
     @app.get("/api/jobs/{job_id}")
@@ -286,10 +328,16 @@ def create_app(settings: Settings | None = None, services: Services | None = Non
         job = svc.jobs.get(job_id)
         if not job:
             raise HTTPException(404, "That job is not known (it may have expired).")
-        return job.public()
+        if job.result_dropped:
+            raise HTTPException(410, "These results have expired. Load the sources again.")
+        data = job.public()
+        svc.jobs.mark_delivered(job)
+        return data
 
     @app.delete("/api/jobs/{job_id}")
     async def job_cancel(job_id: str):
+        job = svc.jobs.get(job_id)
+        annotate(job_id=job_id, kind=job.kind if job else None, state=job.state if job else None)
         if not svc.jobs.cancel(job_id):
             raise HTTPException(404, "That job is not known.")
         return {"ok": True}
@@ -299,6 +347,7 @@ def create_app(settings: Settings | None = None, services: Services | None = Non
         job = svc.jobs.get(job_id)
         if not job or job.kind != "generate" or job.state != "done" or not job.output or not job.output.is_file():
             raise HTTPException(404, "That file is no longer available. Generate the presentation again.")
+        annotate(bytes=job.output.stat().st_size)
         return FileResponse(
             job.output,
             media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
@@ -311,6 +360,8 @@ def create_app(settings: Settings | None = None, services: Services | None = Non
     def sort(body: SortRequest):
         project = checked(body.project)
         ws = workspace(body.workspace_id)
+        annotate(key=body.key, direction=body.direction, grouping=project.settings.grouping,
+                 observations=len(project.order))
         order = sort_ids(project.order, ws["observations"], project, body.key, body.direction, ws, body.seed)
         return {"order": order}
 
@@ -342,14 +393,20 @@ def create_app(settings: Settings | None = None, services: Services | None = Non
             raise HTTPException(422, str(exc)) from None
         if body.ignore_ids:
             project = ignore_observations(project, body.ignore_ids)
+        annotate(added=len(observation_ids), ignored=len(body.ignore_ids), placement=body.placement,
+                 observations=len(project.observations))
         return {"project": project.model_dump(mode="json")}
 
     @app.post("/api/plan")
     def plan(body: ProjectRequest):
         project = checked(body.project)
         ws = workspace(body.workspace_id)
-        return build_slide_plan(project, ws["observations"], settings.max_image_slides)
+        plan = build_slide_plan(project, ws["observations"], settings.max_image_slides)
+        annotate(slides=plan["counts"]["total"], images=plan["counts"]["images"])
+        return plan
 
+    # Last added user middleware is outermost, covering body-limit rejects too.
+    app.add_middleware(RequestDiagnosticsMiddleware)
     return app
 
 
@@ -358,6 +415,14 @@ def _configure_logging() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    # Lines that do not help debug, measure use or spot attacks:
+    # httpx logs every iNaturalist request and photo download at INFO,
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+    # Uvicorn's access log repeats the request middleware's line with less in it,
+    logging.getLogger("uvicorn.access").addFilter(lambda record: False)
+    # and Uvicorn logs a second traceback for crashes the middleware has logged.
+    logging.getLogger("uvicorn.error").addFilter(AlreadyLoggedFilter())
 
 
 _configure_logging()

@@ -3,8 +3,9 @@
 A workspace holds what the last load fetched (observations + per-source result
 lists) so sorting, preview and generation work from trusted, server-derived data
 without the browser re-uploading megabytes of metadata. Workspaces are gzipped
-JSON files that expire after ``workspace_ttl_seconds``; they hold no user edits
-and no photographs.
+JSON files that expire ``workspace_ttl_seconds`` after they were last used (the
+file's modification time records the last use); they hold no user edits and
+no photographs.
 """
 
 from __future__ import annotations
@@ -57,7 +58,9 @@ class WorkspaceStore:
         except BaseException:
             Path(tmp).unlink(missing_ok=True)
             raise
-        self._remember(wid, self._inflate(data))
+        ws = self._inflate(data)
+        ws["used"] = data["created"]
+        self._remember(wid, ws)
         return wid
 
     @staticmethod
@@ -76,22 +79,27 @@ class WorkspaceStore:
                 self._mem.popitem(last=False)
 
     def get(self, wid: str) -> dict:
+        """The workspace, if it was used within the TTL. Each use extends it."""
         path = self._path(wid)
+        now = time.time()
         with self._lock:
             ws = self._mem.get(wid)
             if ws is not None:
                 self._mem.move_to_end(wid)
         if ws is None:
             try:
+                used = path.stat().st_mtime
                 with gzip.open(path, "rb") as fh:
                     ws = self._inflate(json.loads(fh.read()))
             except (OSError, ValueError, EOFError):
                 raise WorkspaceExpired() from None
+            ws["used"] = used
             self._remember(wid, ws)
-        if time.time() - ws["created"] > self.ttl:
+        if now - ws["used"] > self.ttl:
             raise WorkspaceExpired()
+        ws["used"] = now
         try:
-            os.utime(path)
+            os.utime(path)  # also keeps cleanup() from deleting it
         except OSError:
             pass
         return ws
@@ -105,5 +113,5 @@ class WorkspaceStore:
             except OSError:
                 continue
         with self._lock:
-            for wid in [w for w, ws in self._mem.items() if now - ws["created"] > self.ttl]:
+            for wid in [w for w, ws in self._mem.items() if now - ws["used"] > self.ttl]:
                 self._mem.pop(wid, None)

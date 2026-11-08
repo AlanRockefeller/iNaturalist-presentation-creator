@@ -174,3 +174,12 @@ def test_url_filtered_to_one_user_is_a_username_source(url, login):
 def test_url_without_exactly_one_login_stays_a_url_source(url):
     src = build_source(url)
     assert src["type"] == "url" and src["username"] is None
+
+
+def test_saved_source_type_is_not_inferred_again():
+    url = "https://www.inaturalist.org/observations?user_id=alan_rockefeller&taxon_id=47170"
+    assert build_source(url)["type"] == "username"  # a new source: treated as the user's own
+    kept = build_source(url, infer_username=False)
+    assert kept["type"] == "url" and kept["username"] is None and "user_id=alan_rockefeller" in kept["url"]
+    people = build_source("https://www.inaturalist.org/people/alan_rockefeller?taxon_id=1", infer_username=False)
+    assert people["type"] == "url" and "user_id=alan_rockefeller" in people["url"]

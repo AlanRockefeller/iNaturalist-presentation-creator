@@ -34,7 +34,9 @@ small JSON project file; the server holds only short-lived temporary data.
 1. **Sources**: paste the URL of an iNaturalist observations search (filter on
    iNaturalist first by taxon, place, project, dates, quality grade and so on),
    optionally with your iNaturalist username. Several sources can be combined,
-   labeled and disabled.
+   labeled and disabled. Each is marked **Mine** (your own photos) or **Search**
+   (may include other people's); a search limited to one user can be switched
+   between the two.
 2. **Select & Organize**: one card per observation with its name, common name,
    date, place, observer, a visible favorite count (♥ 17) and a checkbox for every
    photo. Only the first photo of each observation starts checked; tick others to
@@ -65,7 +67,8 @@ browser (vanilla JS, no framework)          FastAPI (single Uvicorn worker)
                                                      ├─ images.py       trusted downloads, cache, Pillow prep
                                                      ├─ workspace.py    temp store of fetched metadata
                                                      ├─ jobs.py         background load/generate jobs
-                                                     └─ ratelimit.py    1 req/s limiter, daily/hourly budgets
+                                                     ├─ ratelimit.py    1 req/s limiter, daily/hourly budgets
+                                                     └─ diagnostics.py  request and job logging
 ```
 
 | Module | Responsibility |
@@ -79,11 +82,13 @@ browser (vanilla JS, no framework)          FastAPI (single Uvicorn worker)
 | `app/images.py` | Downloads originals from allowlisted hosts with size caps and a byte budget, a 2-hour cache, EXIF/format fixes, title-photo treatment. |
 | `app/workspace.py` | Gzipped JSON of the metadata the last load fetched, keyed by an unguessable id, expiring after 24 h. |
 | `app/jobs.py` | Thread-pool jobs with progress, cancellation, timeouts, per-client and global limits, cleanup. |
+| `app/diagnostics.py` | Request IDs, one log line per request and per job, client addresses (IPv6 grouped by /64). |
 
 **Workspaces.** Sorting, previewing and generating need metadata for up to
 10,000 observations. To avoid the browser uploading megabytes on every click,
-the server keeps what it fetched (trusted, server-derived data) for 24
-hours. If a workspace expires, the client reloads from iNaturalist automatically.
+the server keeps what it fetched (trusted, server-derived data) until 24 hours
+after it was last used. If a workspace expires, the client reloads from
+iNaturalist automatically.
 
 **One worker.** The iNaturalist rate limiter, daily request budget, media
 byte budget and job registry are in-process. Running more than one Uvicorn
@@ -97,7 +102,8 @@ Implemented as recommended in iNaturalist's
 
 - **~1 request/second** process-wide (`RateLimiter`), shared by every user and job.
 - **Daily request budget** (default 8,500/day, persisted across restarts). When
-  it is exhausted, users get a friendly "try again tomorrow".
+  it is exhausted, users get a friendly "try again tomorrow". One client (an
+  IPv4 address or an IPv6 /64) may use at most a quarter of it per day.
 - **`per_page=200`** for every search, and the v2 `fields=` parameter so responses
   contain only what the app uses.
 - **Batched id lookups**: refreshing saved observations and resolving ancestor
@@ -112,7 +118,7 @@ Implemented as recommended in iNaturalist's
   under a rolling budget of 4 GB/hour and 20 GB/day (iNaturalist may block above
   5 GB/hour or 24 GB/day). Originals are cached for 2 hours, so regenerating after
   a typo fix re-downloads nothing.
-- **User-Agent**: `DikaryaPresentations/1.0 (+https://presentations.dikarya.us)`.
+- **User-Agent**: `DikaryaPresentations/<version> (+https://presentations.dikarya.us; contact via dikarya.us)`.
 
 All limits are environment variables (see `app/config.py`).
 
@@ -133,9 +139,13 @@ The add-source form has two fields: an **observations URL** (required) and an
   meaning "the presenter's own photos". A URL that already filters by a
   different user is refused. A URL that already filters to exactly one user by
   login (`user_id=<login>`, `user_login=<login>` or `/observations/<login>`) is
-  treated the same as entering that username; a numeric user id or several
-  users leave it a `url` source. A bare username typed into the URL box is refused
-  too, because on its own it would load a whole account.
+  treated the same as entering that username, since it is most likely the
+  presenter's own search; a numeric user id or several users leave it a `url`
+  source. A bare username typed into the URL box is refused too, because on its
+  own it would load a whole account.
+- The source list shows each source as **Mine** (`username`) or **Search**
+  (`url`). For a search limited to one user, clicking the badge switches it, for
+  a talk about someone else's photos. The choice is saved in the project file.
 - Each source records `type` (`username` | `url`), the original `input`, the
   canonical `url` (always `https://www.inaturalist.org/observations?...`, including
   the user filter), the `username` when given, an editable `label`, and `enabled`.
@@ -157,7 +167,7 @@ kB. Photos and full iNaturalist metadata are **not** embedded.
 ```json
 {
   "format": "dikarya-presentation",
-  "schema_version": 4,
+  "schema_version": 5,
   "saved_at": "2026-10-06T03:40:00Z",
   "app_version": "1.0.0",
   "sources": [
@@ -184,9 +194,8 @@ kB. Photos and full iNaturalist metadata are **not** embedded.
   "observations": [
     {"id": 123, "selected_photo_ids": [456, 457], "known_photo_ids": [456, 457, 458],
      "rotations": {"457": 90}, "show_lines": {"common_name": true}, "photo_order": [457, 456],
-     "overrides": {"scientific": "Psilocybe alimapensis nom. prov.", "common_name": null,
-                   "date": null, "location": null, "observer": null},
-     "source_ids": ["s1a2b3c4d5e6", "s0f9e8d7c6b5"], "status": "active",
+     "overrides": {"scientific": "Psilocybe alimapensis nom. prov."},
+     "source_ids": ["s1a2b3c4d5e6", "s0f9e8d7c6b5"],
      "last_inat_name": "Psilocybe sp.", "added_at": "2026-10-06T03:30:00Z"}
   ],
   "order": [123],
@@ -194,8 +203,14 @@ kB. Photos and full iNaturalist metadata are **not** embedded.
 }
 ```
 
-- `overrides`: `null` means "use the live iNaturalist value"; a string replaces
-  it on the slide; `""` hides that line for this observation.
+- Observation fields at their defaults are left out of the file (an override
+  that is not set, no rotations, `"status": "active"`, empty lists); loading
+  fills them back in. Settings and sources are always written in full.
+- `type` of a source: `username` (Mine: the presenter's own photos) or `url`
+  (Search). Since schema 5 it is kept as saved; before, every load re-derived
+  it from the URL, and loading an older file still does that once.
+- `overrides`: `null` (or left out) means "use the live iNaturalist value"; a
+  string replaces it on the slide; `""` hides that line for this observation.
 - `annotations.observer: null` means automatic (see below); `true`/`false` is the
   user's explicit choice.
 - `sort.key = "custom"` marks a hand-arranged order. `base_key` records the
@@ -216,9 +231,12 @@ kB. Photos and full iNaturalist metadata are **not** embedded.
   oversized lists, duplicate source ids, and source URLs that fail the same
   parser as new input are all rejected with a readable message. Unknown keys are
   ignored. Inconsistent `order`/duplicate observations are normalized.
-- **Schema versions**: `_migrate()` in `app/project.py` is where `v1` to `v2`
-  upgrades go. Bump `SCHEMA_VERSION` in `app/models.py` when the format changes
-  incompatibly.
+- **Schema versions**: `_migrate()` in `app/project.py` upgrades older files one
+  version at a time (currently 1 to 5). Bump `SCHEMA_VERSION` in `app/models.py`
+  and add a step there when the format or its meaning changes.
+- **Limits that keep a file loadable**: at most 200 photos are remembered per
+  observation (iNaturalist photos past that are not offered) and the newest
+  50,000 ignored observation ids are kept.
 
 ## How refresh works
 
@@ -277,12 +295,19 @@ first photo of each selected, in default taxonomic order.
   defaults **on**, since that search may include other people's photos. An
   explicit choice is saved and always wins.
 - **Favorite counts never appear in the deck**, including the notes.
-- **Title slide**: title (54 pt bold) and presenter (28 pt) centred with a gold
+- **Title slide**: title (54 pt bold; 44 pt over 70 characters, 36 pt over 120,
+  so long titles stay on the slide) and presenter (28 pt) centred with a gold
   rule. The optional background photo is the only cropped image: a full-bleed
   16:9 cover crop (focus centre/top/bottom), desaturated, darkened and slightly
-  softened in Pillow, never upscaled past the source.
+  softened in Pillow, never upscaled past the source. If it cannot be read the
+  deck is still made, without it, and the user is told.
+- **Text**: control characters (a line break pasted from PowerPoint or Word,
+  say) become spaces and characters a .pptx cannot hold are dropped, both on
+  input and when the deck is written.
 - **Divider slides** (optional, when grouping): rank label in small gold caps
-  above the group name, which is italic for genera.
+  above the group name, which is italic for genera. A new divider starts with
+  each new group, even when two groups share a name (a genus name in two
+  families, two sources with the same label), as in Select & Organize.
 - **Speaker notes** (optional): name, common name, iNaturalist link and the
   photo's license attribution.
 - Text stays editable; photos stay picture objects; nothing is rasterized.
@@ -303,16 +328,41 @@ first photo of each selected, in default taxonomic order.
 - **Input validation**: Pydantic models with bounds on every list and string; the
   source parser rejects other hosts, credentials, ports, control characters,
   unknown parameter shapes and filterless searches.
-- **Size limits**: 8 MB request bodies (nginx and app), 20 sources, 10,000
-  observations, 200 photos per observation, 2,000 photo slides, 40 MB per image,
-  120 MP decode limit.
-- **Runaway jobs**: at most 3 concurrent loads and 2 concurrent generations, 6
-  queued generations, 2 active jobs per client, 20/60-minute timeouts, user
-  cancellation, and a free-disk check before generation.
+- **Size limits**: 8 MB request bodies (nginx and app, declared or streamed),
+  20 sources, 10,000 observations, 200 photos per observation, 2,000 photo
+  slides, 40 MB per image, 120 MP decode limit.
+- **Runaway jobs**: at most 3 concurrent loads (12 running or waiting) and 2
+  concurrent generations (6 running or waiting), 2 active jobs per client, a
+  quarter of the daily iNaturalist budget per client, 20/60-minute timeouts
+  counted from when a job starts, user cancellation (a waiting job ends at
+  once), and a free-disk check before generation. Each generation reserves its
+  expected download against the hourly and daily media budgets, so two decks
+  started together cannot both run out halfway. A "client" is an IPv4 address
+  or an IPv6 /64.
+- **Restarts**: stopping the service cancels running jobs, so it exits at once.
+- **Memory**: a finished load's result (every observation's metadata) is
+  dropped two minutes after the browser fetched it, or after 15 minutes.
 - **Paths**: workspace and job ids are random tokens validated by regex before
   touching the filesystem; download filenames are sanitized.
 - **Errors**: no stack traces or filesystem paths are returned; `/docs` and
   `/openapi.json` are disabled.
+- **Logs** (`journalctl -u presentations`), for fixing bugs, tracking use and
+  spotting attacks, and no more:
+  - one `event=request` line per request: method, route, status, time and what
+    it did (the source URL tried, project size, slide counts, job id, ...);
+  - failures are `event=request.failed`, adding the query string, the error the
+    user saw and the User-Agent;
+  - successful static files, `/healthz` and job-status polls are not logged,
+    and neither are httpx's per-request lines or Uvicorn's access log, which
+    would repeat the request line;
+  - one `job.started` and one `job.finished` line per job, with its results
+    (observations loaded, slides, bytes, iNaturalist requests used and left),
+    plus `load.source` per source searched;
+  - a crash is logged once, with its traceback.
+
+  Every line carries `request_id` (also sent as the `X-Request-ID` response
+  header), `client_ip` and, for jobs, `job_id`. Submitted values are quoted, so
+  they cannot fake extra lines.
 - **Headers**: strict CSP (`script-src 'self'`; images only from self and the two
   iNaturalist photo hosts), `X-Frame-Options: DENY`, `nosniff`, HSTS via nginx.
 - **nginx**: per-IP rate limit on `/api/` (10 r/s, burst 60) and the shared
@@ -330,9 +380,10 @@ python3 -m venv .venv
 # tests (iNaturalist is mocked; no network needed)
 .venv/bin/python -m pytest
 
-# run locally (temporary data goes to ./var)
-.venv/bin/uvicorn --factory app.main:create_app --reload --port 8031
-# -> http://127.0.0.1:8031/
+# run locally (temporary data goes to ./var). On the production server use
+# another port: the live service listens on 8031 and another service on 8040.
+.venv/bin/uvicorn --factory app.main:create_app --reload --port 8041
+# -> http://127.0.0.1:8041/
 ```
 
 Tests cover source parsing and malicious-input rejection, pagination and batching
@@ -362,10 +413,11 @@ no favorite counts), plus end-to-end API flows.
 The service listens only on `127.0.0.1:8031` (Dikarya uses 5000/8000, the image
 service 8017, others 9000).
 
-Logs: `journalctl -u presentations`. Restart after a code change:
-`sudo /usr/local/sbin/restart-presentations`, which import-checks the code as the
-service user first and refuses while a presentation is being generated (see
-CLAUDE.md for its exit codes).
+Logs: `journalctl -u presentations` (see [Security and limits](#security-and-limits)
+for what is logged). Restart after a code change:
+`sudo /usr/local/sbin/restart-presentations`, which first imports the code and
+builds the app as the service user, and refuses while a presentation is being
+generated (see CLAUDE.md for its exit codes).
 
 ## Deployment
 
@@ -399,7 +451,7 @@ The script's header lists every step. It:
 - installs `python3-venv`/`rsync`/`certbot` only if missing;
 - creates the `presentations` system user;
 - syncs code to `/var/www/presentations` and builds `.venv`;
-- runs an import check;
+- imports the code and builds the app (`create_app()`) as the service user;
 - installs and restarts the hardened systemd unit and waits for `/healthz`;
 - writes the dedicated nginx vhost, running `nginx -t` before every reload and
   restoring the previous file if the test fails;

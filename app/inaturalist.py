@@ -18,11 +18,12 @@ API limits (https://www.inaturalist.org/pages/api+recommended+practices):
 from __future__ import annotations
 
 import json
-import logging
 import math
 import re
 import threading
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Callable, Iterable
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit
@@ -30,9 +31,10 @@ from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 import httpx
 
 from .config import Settings
+from .diagnostics import get_logger
 from .ratelimit import BudgetExceeded, DailyBudget, RateLimiter
 
-log = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 LIFE_TAXON_ID = 48460
 PER_PAGE = 200
@@ -46,7 +48,7 @@ INAT_NETWORK_HOSTS = {
     "inaturalist.org", "inaturalist.ca", "inaturalist.nz", "naturalista.mx",
     "biodiversity4all.org", "argentinat.org", "inaturalist.ala.org.au",
     "inaturalist.lu", "israelinat.org", "inaturalist.laji.fi", "inaturalist.se",
-    "naturalista.uy", "inaturalist.mma.gob.cl", "inaturalist.ge", "inaturalist.lu",
+    "naturalista.uy", "inaturalist.mma.gob.cl", "inaturalist.ge",
     "naturalista.co", "inaturalist.ie", "inaturalist.co.uk",
 }
 
@@ -299,14 +301,15 @@ def single_user_login(params: dict[str, str]) -> str | None:
     return login
 
 
-def build_source(url: str, username: str | None = None) -> dict:
+def build_source(url: str, username: str | None = None, infer_username: bool = True) -> dict:
     """A source from an observations URL plus an optional iNaturalist username.
 
     The URL is required. A username restricts the search to that person's
     observations and marks the source as the presenter's own photos (type
-    "username"), which turns the observer credit off by default. A URL that
-    already filters to one user by login counts as if that username were
-    given. Returns the same shape as ``parse_source_input``.
+    "username"), which turns the observer credit off by default. With
+    ``infer_username``, a URL that already filters to one user by login counts
+    as if that username were given (used for new sources; a saved source keeps
+    the type the user chose). Returns the same shape as ``parse_source_input``.
     """
     username = (username or "").strip().lstrip("@")
     if username and (not USERNAME_RE.match(username) or username.isdigit()):
@@ -322,10 +325,15 @@ def build_source(url: str, username: str | None = None) -> dict:
             "That looks like a username, not a URL. Put it in the username box, and paste "
             "the link to a filtered iNaturalist observations search in the URL box."
         )
-    if not username:
+    if not username and infer_username:
         username = single_user_login(parsed["params"])
-        if not username:
+    if not username:
+        if parsed["type"] == "url":
             return parsed
+        # /people/<login> without inference: the same search, as a "url" source.
+        params = parsed["params"]
+        return {"type": "url", "input": parsed["input"], "username": None,
+                "url": canonical_url(params), "params": params, "label": default_label(params)}
     params = dict(parsed["params"])
     existing = params.get("user_id") or params.get("user_login")
     if existing and existing.lower() != username.lower():
@@ -429,8 +437,12 @@ def _provisional_name(ofvs) -> str | None:
     return None
 
 
-def normalize_observation(raw: dict, taxa: dict[int, dict]) -> dict | None:
-    """Reduce an API observation to what the app uses. ``taxa`` maps id -> {name, rank}."""
+def normalize_observation(raw: dict, taxa: dict[int, dict], max_photos: int = 200) -> dict | None:
+    """Reduce an API observation to what the app uses. ``taxa`` maps id -> {name, rank}.
+
+    Only the first ``max_photos`` photos are kept, the most a project file
+    remembers per observation.
+    """
     try:
         obs_id = int(raw["id"])
     except (KeyError, TypeError, ValueError):
@@ -454,6 +466,8 @@ def normalize_observation(raw: dict, taxa: dict[int, dict]) -> dict | None:
         }
     photos = []
     for p in raw.get("photos") or []:
+        if len(photos) >= max_photos:
+            break
         if not isinstance(p, dict) or p.get("hidden"):
             continue
         url = photo_url(p.get("url") or "", "square")
@@ -567,6 +581,20 @@ class TaxaCache:
 
 ProgressFn = Callable[[int, int], None]
 
+# Set by count_requests() so a job can tell how many API requests it made.
+_request_counter: ContextVar[list[int] | None] = ContextVar("inat_request_counter", default=None)
+
+
+@contextmanager
+def count_requests():
+    """Count the API requests (including retries) made inside the block."""
+    counter = [0]
+    token = _request_counter.set(counter)
+    try:
+        yield counter
+    finally:
+        _request_counter.reset(token)
+
 
 class INatClient:
     def __init__(
@@ -597,6 +625,9 @@ class INatClient:
         while True:
             attempt += 1
             self.budget.consume(1)
+            counter = _request_counter.get()
+            if counter is not None:
+                counter[0] += 1
             self.limiter.wait()
             try:
                 resp = self.http.get(url, params=params, headers={
@@ -720,13 +751,14 @@ class INatClient:
         taxa = self.fetch_taxa(anc) if anc else {}
         out: dict[int, dict] = {}
         for r in raws:
-            n = normalize_observation(r, taxa)
+            n = normalize_observation(r, taxa, self.settings.max_photos_per_observation)
             if n:
                 out[n["id"]] = n
         return out
 
 
 __all__ = [
-    "build_source", "source_params", "BudgetExceeded", "INatClient", "INatError", "SourceError", "TaxaCache", "TooManyResults",
+    "build_source", "count_requests", "source_params", "BudgetExceeded", "INatClient", "INatError", "SourceError", "TaxaCache",
+    "TooManyResults",
     "format_taxon_name", "normalize_observation", "parse_source_input", "photo_url", "username_url",
 ]

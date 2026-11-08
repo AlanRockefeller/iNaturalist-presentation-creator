@@ -10,6 +10,8 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import __version__
+
 GIB = 1024 ** 3
 MIB = 1024 ** 2
 
@@ -40,11 +42,14 @@ class Settings:
     work_dir: Path = field(default_factory=lambda: Path(os.environ.get("PRESENTATIONS_WORK_DIR", "var")).resolve())
 
     api_base: str = "https://api.inaturalist.org"
-    user_agent: str = "DikaryaPresentations/1.0 (+https://presentations.dikarya.us; contact via dikarya.us)"
+    user_agent: str = f"DikaryaPresentations/{__version__} (+https://presentations.dikarya.us; contact via dikarya.us)"
 
     # iNaturalist API limits: ~1 request/second process-wide, ~10k/day.
     api_min_interval: float = field(default_factory=lambda: _env_float("PRESENTATIONS_API_MIN_INTERVAL", 1.0))
     api_daily_budget: int = field(default_factory=lambda: _env_int("PRESENTATIONS_API_DAILY_BUDGET", 8500))
+    # The most of that budget one client (an IPv4 address or an IPv6 /64) may
+    # use per UTC day, so a single visitor cannot use up the day for everyone.
+    api_client_daily_share: float = field(default_factory=lambda: _env_float("PRESENTATIONS_API_CLIENT_SHARE", 0.25))
     api_timeout: float = 30.0
     api_max_retries: int = 4
 
@@ -63,12 +68,13 @@ class Settings:
     max_sources: int = 20
     max_observations_per_source: int = 10_000  # iNat's page/per_page ceiling
     max_observations_per_project: int = field(default_factory=lambda: _env_int("PRESENTATIONS_MAX_OBSERVATIONS", 10_000))
-    max_photos_per_observation: int = 200
+    max_photos_per_observation: int = 200  # at most models.MAX_PHOTOS
     max_image_slides: int = field(default_factory=lambda: _env_int("PRESENTATIONS_MAX_IMAGE_SLIDES", 2000))
     max_body_bytes: int = 8 * MIB
 
     # Jobs.
     max_concurrent_loads: int = 3
+    max_queued_loads: int = 12  # running plus waiting, from all clients
     max_concurrent_generations: int = field(default_factory=lambda: _env_int("PRESENTATIONS_MAX_GENERATIONS", 2))
     max_queued_generations: int = 6
     max_active_jobs_per_client: int = 2
