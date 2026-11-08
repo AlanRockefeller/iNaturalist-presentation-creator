@@ -4,7 +4,9 @@ import pytest
 
 from app.inaturalist import INatError, SourceError
 from app.models import RelatedOthers, RelatedSettings, RelatedMine
-from app.related import api_filters, estimate_requests, is_species, run_related_search
+from app.related import (
+    SearchCancelled, api_filters, estimate_requests, is_species, pages_per_species, run_related_search,
+)
 from tests.conftest import make_obs
 from tests.helpers import norm
 
@@ -37,6 +39,33 @@ def test_filters_for_my_photos_and_other_peoples():
 
 def test_estimate_is_a_ceiling():
     assert [estimate_requests(n) for n in (0, 1, 2, 100, 101, 250)] == [0, 1, 3, 101, 102, 253]
+    assert [estimate_requests(n, 3) for n in (1, 2, 101)] == [3, 7, 304]  # licenses checked here
+    assert pages_per_species("others", rs(licenses=["cc-by", "arr"])) == 3
+    assert pages_per_species("others", rs()) == pages_per_species("mine", rs(licenses=["arr"])) == 1
+
+
+def test_all_of_the_presenters_logins_are_left_out(client, fake):
+    fake.add(make_obs(1, CONICA, user="alice_old", faves=9), make_obs(2, CONICA, user="bob", faves=1))
+    raws = run_related_search(client, "others", [CONICA], rs(), exclude={"Alice_Old"})
+    assert [r["id"] for r in raws] == [2]
+
+
+def test_only_photos_a_project_keeps_count_for_licenses(client, fake):
+    fake.add(make_obs(1, CONICA, user="bob", faves=3, licenses=["cc-by-nc", "cc-by"], photos=((11, 9, 9), (12, 9, 9))))
+    assert run_related_search(client, "others", [CONICA], rs(), max_photos=1) == []
+    assert [r["id"] for r in run_related_search(client, "others", [CONICA], rs(), max_photos=2)] == [1]
+
+
+def test_licenses_checked_here_page_on_until_enough_are_found(client, fake):
+    # "All rights reserved" only: iNaturalist cannot filter for it, so the
+    # first 200 (all CC BY-NC) are passed over and page 2 has the one wanted.
+    fake.add(*[make_obs(i, CONICA, user="bob", faves=5, license="cc-by-nc") for i in range(1, 251)])
+    fake.add(make_obs(999, CONICA, user="carol", faves=1, license=None))
+    raws = run_related_search(client, "others", [CONICA], rs(licenses=["arr"], per_taxon=1))
+    assert [r["id"] for r in raws] == [999]
+    calls = searches(fake)
+    assert [c.url.params["page"] for c in calls] == ["1", "2"] and calls[0].url.params["per_page"] == "200"
+    assert len(calls) <= estimate_requests(1, 3)
 
 
 def test_one_species_is_one_request_with_the_most_favorited_first(client, fake):
@@ -119,7 +148,7 @@ def test_never_pages_past_ten_thousand(client, fake):
 
 def test_cancel_stops_between_requests(client, fake):
     fake.add(make_obs(1, CONICA, user="bob", faves=5))
-    with pytest.raises(INatError, match="Cancelled"):
+    with pytest.raises(SearchCancelled):  # the load job reports it as "cancelled", not an error
         run_related_search(client, "others", [CONICA], rs(), cancelled=lambda: True)
     assert not fake.api_calls()
 

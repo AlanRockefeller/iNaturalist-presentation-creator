@@ -28,8 +28,10 @@ from .images import DownloadCancelled, ImageFetchError, MediaFetcher, prepare_fo
 from .inaturalist import INatClient, INatError, SourceError, count_requests, source_params
 from .models import Project
 from .presentation import build_slide_plan, write_pptx
-from .project import ProjectError, add_observations, refresh_project, safe_filename
-from .related import LABELS as RELATED_LABELS, estimate_requests, run_related_search
+from .project import ProjectError, add_observations, own_logins, refresh_project, safe_filename
+from .related import (
+    LABELS as RELATED_LABELS, SearchCancelled, estimate_requests, pages_per_species, run_related_search,
+)
 from .ratelimit import BudgetExceeded
 from .workspace import WorkspaceExpired, WorkspaceStore
 
@@ -401,12 +403,14 @@ class JobManager:
     def _load(self, job: Job, project: Project, workspace_id: str | None, refresh_ids: list[str] | None,
               related_taxa: list[int] | None = None) -> dict:
         s = self.settings
-        prev = None
-        if workspace_id and refresh_ids is not None:
+        earlier_ws = None
+        if workspace_id:
             try:
-                prev = self.workspaces.get(workspace_id)
+                earlier_ws = self.workspaces.get(workspace_id)
             except WorkspaceExpired:
-                prev = None
+                earlier_ws = None
+        # An incremental load reuses the workspace; a full refresh searches again.
+        prev = earlier_ws if refresh_ids is not None else None
         enabled = [src for src in project.sources if src.enabled]
         if not project.sources:
             raise JobFailed("Add at least one source first.")
@@ -427,9 +431,24 @@ class JobManager:
                 if src.id not in queried and src.id in prev["source_results"]:
                     source_results[src.id] = prev["source_results"][src.id]
             observations.update(prev["observations"])
+        elif earlier_ws is not None:
+            # A full refresh does not search "more photos" sources again. Keep
+            # what they found: their membership, and the metadata of what still
+            # waits for review (the project's own are refreshed by id below).
+            in_project = {st.id for st in project.observations}
+            searched = {src.id for src in to_query}
+            for src in project.sources:
+                if src.type != "related" or src.id in searched or src.id not in earlier_ws["source_results"]:
+                    continue
+                ids = earlier_ws["source_results"][src.id]
+                source_results[src.id] = ids
+                for oid in ids:
+                    if oid not in in_project and oid in earlier_ws["observations"]:
+                        observations[oid] = earlier_ws["observations"][oid]
 
         raw_all: list[dict] = []
         related_found: list[int] = []
+        recheck: set[int] = set()
         for n, src in enumerate(to_query, 1):
             if src.type == "related":
                 raws = self._search_related(job, src, project, related_taxa, n, len(to_query))
@@ -440,6 +459,10 @@ class JobManager:
                 earlier = prev["source_results"].get(src.id, []) if prev else []
                 listed = [st.id for st in project.observations if src.id in st.source_ids]
                 source_results[src.id] = list(dict.fromkeys(found + earlier + listed))
+                if related_taxa is None:
+                    # A full search again: what it kept but did not find now
+                    # is looked up by id, so it is current (or unavailable).
+                    recheck.update(set(listed) - set(found))
                 raw_all.extend(raws)
                 self._check_unique(source_results, enabled)
                 continue
@@ -461,6 +484,9 @@ class JobManager:
         if raw_all:
             job.progress("taxa", 0, 0, "Looking up taxonomy")
             observations.update(self.client.normalize_all(raw_all))
+        returned = {int(r["id"]) for r in raw_all if r.get("id")}
+        for oid in recheck - returned:
+            observations.pop(oid, None)  # cached metadata: refreshed by id below
 
         # Keep what this project can use: what its sources returned, and its own
         # observations. An incremental load would otherwise carry along results
@@ -482,7 +508,9 @@ class JobManager:
         # What this load's "more photos" search found, so the browser can show
         # just those (other new observations may still be waiting for review).
         summary["related_found"] = list(dict.fromkeys(related_found))
-        first_load = not project.observations
+        # A first load adds everything at once, but what a "more photos" search
+        # finds is always offered for review, even in an empty project.
+        first_load = not project.observations and not any(src.type == "related" for src in to_query)
         workspace = {"observations": observations, "source_results": source_results}
         new_count = summary["new"]
         if first_load and summary["new_ids"]:
@@ -543,7 +571,10 @@ class JobManager:
         if len(taxa) > limit:
             raise JobFailed(f"One search can cover at most {limit:,} species, not {len(taxa):,}. "
                             "Use Find on Select & Organize to list fewer.")
-        need = estimate_requests(len(taxa))
+        whose = src.related.whose
+        # The search itself, plus a little for the taxonomy and saved-observation
+        # lookups after it, so it does not run out with the results in hand.
+        need = estimate_requests(len(taxa), pages_per_species(whose, project.settings.related)) + 2
         with self._lock:
             share_left = self.api_share() - self._client_usage(job.client)
         left = min(self.client.budget.remaining(), share_left)
@@ -552,17 +583,21 @@ class JobManager:
                 f"Searching {len(taxa):,} species can take up to {need:,} iNaturalist requests, and only "
                 f"{max(0, left):,} are left for you today. Search fewer species, or try again tomorrow (UTC)."
             )
-        whose = src.related.whose
         what = "your photos" if whose == "mine" else "other people's photos"
         species = f"{len(taxa):,} species" if len(taxa) != 1 else "1 species"
         prefix = f"Searching {what} of {species}" + (f" ({n} of {of})" if of > 1 else "")
         job.progress("search", 0, need, prefix)
         started = time.monotonic()
-        raws = run_related_search(
-            self.client, whose, taxa, project.settings.related,
-            lambda done, total: job.progress("search", done, total, f"{prefix}: {done:,} of up to {total:,} requests"),
-            job.cancel_event.is_set,
-        )
+        try:
+            raws = run_related_search(
+                self.client, whose, taxa, project.settings.related,
+                lambda done, total: job.progress("search", done, total, f"{prefix}: {done:,} of up to {total:,} requests"),
+                job.cancel_event.is_set,
+                exclude=own_logins(project),
+                max_photos=self.settings.max_photos_per_observation,
+            )
+        except SearchCancelled:
+            raise JobCancelled() from None
         log_event(log, logging.INFO, "load.related", whose=whose, label=src.label or RELATED_LABELS[whose],
                   species=len(taxa), results=len(raws), duration_ms=(time.monotonic() - started) * 1000)
         return raws
