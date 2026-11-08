@@ -41,3 +41,31 @@ def test_a_workspace_whose_file_is_gone_has_expired(tmp_path):
         store.get(wid)  # it was still in memory
     with pytest.raises(WorkspaceExpired):
         store.get(wid)
+
+
+def test_a_use_whose_file_time_cannot_be_set_still_counts(tmp_path, monkeypatch, caplog):
+    import logging
+
+    store = WorkspaceStore(tmp_path, ttl_seconds=100)
+    wid = store.create({1: {"id": 1}}, {})
+    path = tmp_path / f"{wid}.json.gz"
+    old = time.time() - 150
+    os.utime(path, (old, old))  # its file looks unused for longer than the TTL
+
+    def refuse(*args, **kwargs):
+        raise PermissionError()
+
+    monkeypatch.setattr("app.workspace.os.utime", refuse)
+    caplog.set_level(logging.WARNING)
+    assert store.get(wid)["observations"]
+    assert any("event=workspace.touch_failed" in r.message for r in caplog.records)
+    store.cleanup()
+    assert path.exists()  # in use, so cleanup keeps it
+
+
+def test_two_uses_at_once_never_put_the_time_back(tmp_path):
+    store = WorkspaceStore(tmp_path, ttl_seconds=100)
+    wid = store.create({}, {})
+    later = time.time() + 50
+    store._mem[wid]["used"] = later  # a use that finished after this one began
+    assert store.get(wid)["used"] == later

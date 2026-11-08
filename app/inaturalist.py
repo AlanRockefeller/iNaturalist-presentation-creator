@@ -441,7 +441,8 @@ def _provisional_name(ofvs) -> str | None:
     return None
 
 
-def normalize_observation(raw: dict, taxa: dict[int, dict], max_photos: int = 200) -> dict | None:
+def normalize_observation(raw: dict, taxa: dict[int, dict], max_photos: int = 200,
+                          keep: set[int] | frozenset[int] = frozenset()) -> dict | None:
     """Reduce an API observation to what the app uses. ``taxa`` maps id -> {name, rank}.
 
     Only the first ``max_photos`` photos are kept, the most a project file
@@ -470,12 +471,14 @@ def normalize_observation(raw: dict, taxa: dict[int, dict], max_photos: int = 20
         }
     photos = []
     for p in raw.get("photos") or []:
-        if len(photos) >= max_photos:
-            break
         if not isinstance(p, dict) or p.get("hidden"):
             continue
         url = photo_url(p.get("url") or "", "square")
         if not url or not p.get("id"):
+            continue
+        # Past the limit only photos in ``keep`` (selected in the project) are
+        # kept, so a selected photo that moved down the list is not "deleted".
+        if len(photos) >= max_photos and int(p["id"]) not in keep:
             continue
         dims = p.get("original_dimensions") or {}
         photos.append({
@@ -791,8 +794,9 @@ class INatClient:
         found.update(fetched)
         return found
 
-    def normalize_all(self, raws: list[dict]) -> dict[int, dict]:
-        """Normalize raw observations, resolving ancestor names in batched lookups."""
+    def normalize_all(self, raws: list[dict], keep: set[int] | frozenset[int] = frozenset()) -> dict[int, dict]:
+        """Normalize raw observations, resolving ancestor names in batched lookups.
+        ``keep``: photo ids kept even past the per-observation limit (selected ones)."""
         anc: set[int] = set()
         for r in raws:
             t = r.get("taxon") or {}
@@ -802,7 +806,7 @@ class INatClient:
         taxa = self.fetch_taxa(anc) if anc else {}
         out: dict[int, dict] = {}
         for r in raws:
-            n = normalize_observation(r, taxa, self.settings.max_photos_per_observation)
+            n = normalize_observation(r, taxa, self.settings.max_photos_per_observation, keep)
             if n:
                 out[n["id"]] = n
         return out

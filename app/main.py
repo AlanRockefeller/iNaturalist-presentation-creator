@@ -32,6 +32,7 @@ from .models import (
 )
 from .notes import NOTES_BUDGET_MESSAGE, AccessGuard, ClaudeCliWriter
 from .presentation import build_slide_plan
+from .models import SCHEMA_VERSION
 from .project import (
     ProjectError, add_observations, ignore_observations, load_project, normalize_project,
     observer_default, project_to_json,
@@ -238,6 +239,10 @@ def create_app(settings: Settings | None = None, services: Services | None = Non
 
     def checked(project) -> object:
         try:
+            if project.schema_version < SCHEMA_VERSION:
+                # Sent straight to the API without /api/project/validate: upgrade
+                # it the way a project file is (load_project runs _migrate).
+                return load_project(project.model_dump(mode="json"))
             return normalize_project(project)
         except ProjectError as exc:
             raise HTTPException(422, str(exc)) from None

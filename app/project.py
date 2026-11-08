@@ -48,7 +48,8 @@ def _migrate(data: dict) -> dict:
         # Since v5 a source's type is the user's choice (shown and changeable
         # as Mine / Search). Before, every load re-derived it: a search limited
         # to one user's login counted as that user's own photos. Keep that.
-        data["sources"] = [_typed_source(src) for src in data.get("sources") or []]
+        if isinstance(data.get("sources"), list):  # anything else fails validation below
+            data["sources"] = [_typed_source(src) for src in data["sources"]]
         data["schema_version"] = version = 5
     if version == 5:
         # v6 added "more photos" (related) sources and settings.related; a v5
@@ -478,7 +479,10 @@ def add_observations(
 def ignore_observations(project: Project, ids: list[int]) -> Project:
     """Remember ids not to offer again, keeping the newest MAX_IGNORED so the
     project file stays loadable."""
-    ignored = list(dict.fromkeys(project.ignored_observation_ids + [int(i) for i in ids]))
+    new = list(dict.fromkeys(int(i) for i in ids))
+    again = set(new)
+    # An id ignored again becomes the newest, so the cap cannot drop it at once.
+    ignored = [i for i in dict.fromkeys(project.ignored_observation_ids) if i not in again] + new
     return project.model_copy(update={"ignored_observation_ids": ignored[-MAX_IGNORED:]})
 
 
