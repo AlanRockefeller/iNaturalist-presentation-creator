@@ -54,8 +54,8 @@
     toastTimer = setTimeout(() => { t.hidden = true; }, ms);
   }
 
-  async function api(path, { method = 'GET', body, raw } = {}) {
-    const opts = { method, headers: {} };
+  async function api(path, { method = 'GET', body, raw, headers } = {}) {
+    const opts = { method, headers: { ...(headers || {}) } };
     if (raw !== undefined) { opts.body = raw; opts.headers['Content-Type'] = 'application/json'; }
     else if (body !== undefined) { opts.body = JSON.stringify(body); opts.headers['Content-Type'] = 'application/json'; }
     let res;
@@ -111,7 +111,7 @@
   function newProject() {
     return {
       format: 'dikarya-presentation',
-      schema_version: 6,
+      schema_version: 7,
       sources: [],
       settings: {
         title: '', presenter: '', background: 'black', title_photo: null,
@@ -120,6 +120,7 @@
         annotations: { scientific: true, common_name: false, date: false, location: false, observer: null },
         speaker_notes: true,
         related: defaultRelated(),
+        presenter_notes: true,
       },
       observations: [],
       order: [],
@@ -596,6 +597,7 @@
   // Dialogs: focus moves into one when it opens and back where it was when it
   // closes. Closing the review dialog refreshes its "Review new" button.
   const modalReturn = new Map();
+  const modalOnClose = new Map(); // dialog -> function called once when it closes
   function openModal(m) {
     if (!m.hidden) return;
     modalReturn.set(m, document.activeElement);
@@ -608,6 +610,9 @@
     if (m.hidden) return;
     m.hidden = true;
     if (m.id === 'review-modal') updateStats();
+    const onClose = modalOnClose.get(m);
+    modalOnClose.delete(m);
+    if (onClose) onClose();
     const back = modalReturn.get(m);
     modalReturn.delete(m);
     if (back && back.isConnected && typeof back.focus === 'function') back.focus();
@@ -1279,12 +1284,14 @@
       });
     }
     if (missing.length) chips.append(el('span', { class: 'chip warn', text: `${plural(missing.length, 'selected photo')} deleted on iNaturalist` }));
+    if (!review && notesStale(id)) chips.append(el('span', { class: 'chip warn', text: `Notes are about ${st.notes_name}` }));
     if (chips.childNodes.length) info.append(chips);
 
     if (!review) {
       const actions = el('div', { class: 'obs-actions' },
         el('a', { href: o.uri, target: '_blank', rel: 'noopener noreferrer', text: 'iNaturalist ↗' }),
         el('button', { type: 'button', text: 'Slide text', onclick: () => toggleAnnEdit(card, id) }),
+        el('button', { type: 'button', text: st.notes ? 'Notes ✓' : 'Notes', title: 'Presenter notes for this observation\'s slides', onclick: () => Notes.open(id) }),
         el('button', { type: 'button', text: 'Move to…', onclick: () => {
           const v = prompt(`Move to position (1 to ${S.project.order.length}):`, String(pos || 1));
           const k = parseInt(v, 10);
@@ -1779,6 +1786,7 @@
     $('#set-dividers').checked = s.dividers;
     $('#divider-note').textContent = s.grouping === 'none' ? '(choose “Group by” on the Select & Organize step first)' : `(grouped by ${GROUP_NAMES[s.grouping].toLowerCase()})`;
     $('#set-notes').checked = s.speaker_notes;
+    $('#set-presenter-notes').checked = s.presenter_notes !== false;
     $('#title-position').value = (s.title_photo && s.title_photo.position) || 'center';
     renderTitlePhoto();
   }
@@ -1803,6 +1811,7 @@
   $('#ann-observer').addEventListener('change', (e) => { S.project.settings.annotations.observer = e.target.checked; markDirty(); renderSettings(); });
   $('#set-dividers').addEventListener('change', (e) => { S.project.settings.dividers = e.target.checked; markDirty(); });
   $('#set-notes').addEventListener('change', (e) => { S.project.settings.speaker_notes = e.target.checked; markDirty(); });
+  $('#set-presenter-notes').addEventListener('change', (e) => { S.project.settings.presenter_notes = e.target.checked; markDirty(); });
   $('#title-position').addEventListener('change', (e) => {
     if (S.project.settings.title_photo) { S.project.settings.title_photo.position = e.target.value; markDirty(); }
   });
@@ -1881,10 +1890,14 @@
     $('#preview-stats').textContent = `${plural(c.total, 'slide')}: 1 title, ${plural(c.dividers, 'divider')}, ${plural(c.images, 'photo slide')} from ${plural(c.observations, 'observation')}`;
     $('#preview-warnings').replaceChildren(...plan.warnings.map((w) => el('div', { class: 'warning', text: w })));
     if (previewRenderer) previewRenderer.disconnect();
+    $('#btn-notes-all').hidden = !Notes.claudeOn || c.images === 0;
     previewRenderer = chunkRender(grid, $('#preview-sentinel'), plan.slides, (spec, i) => {
       const wrap = el('div', { class: 'pslide' + (spec.kind === 'image' ? ' draggable' : ''), dataset: spec.kind === 'image' ? { obs: String(spec.observation_id) } : {} },
         el('span', { class: 'num', text: String(i + 1) }), slideNode(spec, plan.background));
-      if (spec.kind === 'image') wrap.draggable = true;
+      if (spec.kind === 'image') {
+        wrap.draggable = true;
+        wrap.append(Notes.button(spec.observation_id));
+      }
       return wrap;
     }, min, 60);
   }
@@ -2171,6 +2184,285 @@
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') $$('.modal').forEach((m) => { if (m.id !== 'load-modal' && !m.dataset.busy) closeModal(m); });
   });
+
+  // ---------------------------------------------------------------- presenter notes
+  // An observation's notes (st.notes) go into the speaker notes of each of its
+  // slides. They can be typed here, or written by Claude on the server
+  // (/api/notes, app/notes.py) when the site has that set up. Mirrors of
+  // server rules: counts() follows JobManager.start_notes (one note per name;
+  // observations with notes are skipped unless replacing).
+  const Notes = (() => {
+    const claudeOn = document.body.dataset.notesEnabled === '1';
+    $$('[data-notes-claude]').forEach((x) => { x.hidden = !claudeOn; });
+    const CODE_KEY = 'dp-notes-code';
+    const modal = $('#notes-modal');
+    const allModal = $('#notes-all-modal');
+    const text = $('#notes-text');
+    const writeBtn = $('#btn-notes-claude');
+    let currentId = null;
+    let jobId = null;
+
+    const storedCode = () => { try { return localStorage.getItem(CODE_KEY) || ''; } catch (e) { return ''; } };
+    const storeCode = (v) => {
+      try { if (v) localStorage.setItem(CODE_KEY, v); else localStorage.removeItem(CODE_KEY); } catch (e) { /* storage blocked: ask each time */ }
+    };
+
+    function askCode(message) {
+      const m = $('#notes-code-modal');
+      const form = $('#notes-code-form');
+      const input = $('#notes-code-input');
+      $('#notes-code-message').textContent = message || 'Writing notes with Claude needs the access code for this site.';
+      input.value = '';
+      return new Promise((resolve) => {
+        let answer = null;
+        const submit = (e) => { e.preventDefault(); answer = input.value.trim(); closeModal(m); };
+        form.addEventListener('submit', submit);
+        modalOnClose.set(m, () => { form.removeEventListener('submit', submit); resolve(answer || null); });
+        openModal(m);
+        input.focus();
+      });
+    }
+
+    // Start a notes job, asking for the access code when needed. null: no code given.
+    async function start(ids, replace) {
+      let code = storedCode() || await askCode();
+      while (code) {
+        try {
+          const job = await api('/api/notes', {
+            method: 'POST', headers: { 'X-Notes-Code': code },
+            body: { project: S.project, workspace_id: S.workspaceId, observation_ids: ids, replace },
+          });
+          storeCode(code);
+          return job;
+        } catch (err) {
+          if (err.status !== 403) throw err;
+          storeCode('');
+          code = await askCode(err.message);
+        }
+      }
+      return null;
+    }
+
+    // Write notes with Claude and put them in the project. Returns the
+    // finished job (with .applied), or null if it never started or another
+    // project was opened meanwhile.
+    async function run(ids, replace, onProgress) {
+      const gen = projectGen;
+      const job = await start(ids, replace);
+      if (!job) return null;
+      jobId = job.id;
+      try {
+        const final = await pollJob(job.id, onProgress);
+        if (gen !== projectGen) return null;
+        return { ...final, applied: apply(final.result, replace) };
+      } finally {
+        jobId = null;
+      }
+    }
+
+    // Without "replace", an observation that got notes while Claude was
+    // writing (typed meanwhile) keeps them.
+    function apply(result, replace) {
+      let applied = 0;
+      for (const [key, v] of Object.entries((result && result.notes) || {})) {
+        const st = S.states.get(Number(key));
+        if (!st || (!replace && st.notes)) continue;
+        st.notes = v.text;
+        st.notes_name = v.name;
+        applied += 1;
+        updateViews(st.id);
+      }
+      if (applied) markDirty();
+      return applied;
+    }
+
+    async function stop() {
+      if (!jobId) return;
+      try { await api(`/api/jobs/${encodeURIComponent(jobId)}`, { method: 'DELETE' }); } catch (e) { /* ignore */ }
+    }
+
+    // The notes were written for another name than the observation has now.
+    function stale(id) {
+      const st = S.states.get(id);
+      return !!(st && st.notes && st.notes_name && st.notes_name !== effectiveName(id));
+    }
+
+    function button(id) {
+      const st = S.states.get(id);
+      const has = !!(st && st.notes);
+      return el('button', {
+        type: 'button', class: 'notes-btn' + (has ? ' has' : '') + (stale(id) ? ' stale' : ''),
+        text: has ? 'Notes ✓' : 'Notes',
+        title: has ? 'Presenter notes: view or edit' : 'Add presenter notes for this observation',
+        onclick: (e) => { e.stopPropagation(); open(id); },
+      });
+    }
+
+    function updateViews(id) {
+      $$(`.pslide[data-obs="${id}"] .notes-btn`).forEach((b) => b.replaceWith(button(id)));
+      if (S.step === 'organize') refreshCard(id); // the other steps redraw when shown
+    }
+
+    // ---- one observation
+    function setStatus(message, isError = false) {
+      const p = $('#notes-status');
+      p.textContent = message;
+      p.hidden = !message;
+      p.classList.toggle('error', isError);
+    }
+    function showState() {
+      const st = S.states.get(currentId) || {};
+      const warn = $('#notes-stale');
+      warn.hidden = !stale(currentId);
+      if (!warn.hidden) warn.textContent = `These notes were written for ${st.notes_name}. The name on the slides is now ${effectiveName(currentId) || 'empty'}.`;
+      writeBtn.textContent = st.notes ? 'Rewrite with Claude' : 'Write with Claude';
+    }
+
+    function open(id) {
+      const st = S.states.get(id);
+      if (!st) return;
+      currentId = id;
+      const o = S.obs.get(id);
+      $('#notes-for').textContent = effectiveName(id) || (o && o.common_name) || `Observation ${id}`;
+      text.value = st.notes || '';
+      setStatus('');
+      showState();
+      modalOnClose.set(modal, () => updateViews(id));
+      openModal(modal);
+      text.focus();
+    }
+
+    text.addEventListener('input', () => {
+      const st = S.states.get(currentId);
+      if (!st) return;
+      const v = text.value.slice(0, 4000);
+      if (v.trim()) {
+        if (!st.notes) st.notes_name = effectiveName(currentId) || null;
+        st.notes = v;
+      } else {
+        st.notes = null;
+        st.notes_name = null;
+      }
+      markDirty();
+    });
+
+    $('#btn-notes-remove').addEventListener('click', () => {
+      const st = S.states.get(currentId);
+      if (st && st.notes) {
+        if (!confirm('Remove the presenter notes for this observation?')) return;
+        st.notes = null;
+        st.notes_name = null;
+        markDirty();
+      }
+      closeModal(modal);
+    });
+
+    writeBtn.addEventListener('click', async () => {
+      if (modal.dataset.busy) { stop(); return; } // the button says "Stop" while Claude writes
+      const id = currentId;
+      const st = S.states.get(id);
+      if (!st) return;
+      if (st.notes && !confirm('Replace these notes with new ones from Claude?')) return;
+      modal.dataset.busy = '1';
+      text.disabled = true;
+      $('#btn-notes-remove').disabled = true;
+      writeBtn.textContent = 'Stop';
+      setStatus('Claude is writing notes. This takes 10 to 30 seconds…');
+      try {
+        const final = await run([id], true, (j) => {
+          if (j.state === 'queued') setStatus('Waiting for other notes to finish…');
+        });
+        if (!final) setStatus('');
+        else if (final.state === 'done' && final.applied) setStatus('');
+        else if (final.state === 'cancelled') setStatus('Stopped.');
+        else setStatus(final.error || final.warnings[0] || 'Claude did not write notes for this name.', true);
+      } catch (err) {
+        setStatus(err.message, true);
+        if (err.status === 410) handleApiError(err);
+      } finally {
+        delete modal.dataset.busy;
+        text.disabled = false;
+        $('#btn-notes-remove').disabled = false;
+        if (currentId === id) {
+          text.value = (S.states.get(id) || {}).notes || '';
+          showState();
+        }
+      }
+    });
+
+    // ---- every slide
+    function counts() {
+      const slides = (S.plan && S.plan.slides) || [];
+      const ids = [...new Set(slides.filter((sp) => sp.kind === 'image').map((sp) => sp.observation_id))]
+        .filter((id) => S.states.has(id) && effectiveName(id).trim());
+      const without = ids.filter((id) => !S.states.get(id).notes);
+      const names = (list) => new Set(list.map((id) => effectiveName(id).trim().toLowerCase())).size;
+      return { all: ids, without, withNotes: ids.length - without.length, names };
+    }
+
+    function updateStart() {
+      const c = counts();
+      const list = $('#notes-all-replace').checked ? c.all : c.without;
+      const btn = $('#btn-notes-all-start');
+      btn.disabled = !list.length || !!allModal.dataset.busy;
+      btn.textContent = list.length ? `Write notes for ${plural(c.names(list), 'name')}` : 'Write notes';
+    }
+
+    function openAll() {
+      const c = counts();
+      $('#notes-all-summary').textContent = c.without.length
+        ? `${plural(c.without.length, 'observation')} in this presentation (${plural(c.names(c.without), 'name')}) ${c.without.length === 1 ? 'has' : 'have'} no notes yet.`
+        : 'Every observation in this presentation has notes.';
+      $('#notes-all-replace').checked = false;
+      $('#notes-all-replace-row').hidden = c.withNotes === 0;
+      $('#notes-all-replace-label').textContent = `Also rewrite the ${plural(c.withNotes, 'observation')} that already ${c.withNotes === 1 ? 'has' : 'have'} notes`;
+      $('#notes-all-progress').hidden = true;
+      $('#btn-notes-all-cancel').textContent = 'Cancel';
+      updateStart();
+      openModal(allModal);
+    }
+
+    $('#btn-notes-all').addEventListener('click', openAll);
+    $('#notes-all-replace').addEventListener('change', updateStart);
+    $('#btn-notes-all-cancel').addEventListener('click', () => { if (allModal.dataset.busy) stop(); else closeModal(allModal); });
+    $('#btn-notes-all-start').addEventListener('click', async () => {
+      const replace = $('#notes-all-replace').checked;
+      if (replace && !confirm('Replace the notes that are already there, including any you typed?')) return;
+      allModal.dataset.busy = '1';
+      $('#btn-notes-all-start').disabled = true;
+      $('#notes-all-replace').disabled = true;
+      $('#btn-notes-all-cancel').textContent = 'Stop';
+      $('#notes-all-progress').hidden = false;
+      $('#notes-all-message').textContent = 'Starting…';
+      setBar($('#notes-all-bar'), 0, 0);
+      try {
+        const final = await run(null, replace, (j) => {
+          $('#notes-all-message').textContent = j.message || (j.state === 'queued' ? 'Waiting for other notes to finish…' : 'Working…');
+          setBar($('#notes-all-bar'), j.done, j.total);
+        });
+        if (!final) { $('#notes-all-progress').hidden = true; return; }
+        const done = `Notes written for ${plural(final.applied, 'observation')}.`;
+        const failed = (final.result && final.result.failed) || [];
+        let message = final.state === 'done' ? done
+          : final.state === 'cancelled' ? `Stopped. ${done}` : `${final.error} ${done}`;
+        if (failed.length) message += ` Claude could not write notes for ${plural(failed.length, 'name')}: ${failed.slice(0, 5).join(', ')}${failed.length > 5 ? ', …' : ''}.`;
+        delete allModal.dataset.busy;
+        closeModal(allModal);
+        toast(message, final.state === 'error' || failed.length > 0, 10000);
+      } catch (err) {
+        $('#notes-all-message').textContent = err.message;
+        if (err.status === 410) handleApiError(err);
+      } finally {
+        delete allModal.dataset.busy;
+        $('#notes-all-replace').disabled = false;
+        $('#btn-notes-all-cancel').textContent = 'Cancel';
+        updateStart();
+      }
+    });
+
+    return { claudeOn, button, open, stale };
+  })();
+  const notesStale = (id) => Notes.stale(id);
 
   // ---------------------------------------------------------------- save / open
   $('#btn-save-project').addEventListener('click', saveProjectFile);

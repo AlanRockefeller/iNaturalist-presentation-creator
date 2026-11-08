@@ -224,7 +224,7 @@ def build_slide_plan(project: Project, workspace_obs: dict[int, dict], max_image
                 "width": width,
                 "height": height,
                 "lines": lines,
-                "notes": _speaker_notes(obs, st, p) if settings.speaker_notes else "",
+                "notes": _speaker_notes(obs, st, p, settings),
             })
             image_count += 1
 
@@ -245,14 +245,22 @@ def build_slide_plan(project: Project, workspace_obs: dict[int, dict], max_image
     }
 
 
-def _speaker_notes(obs: dict, st: ObservationState, photo: dict) -> str:
-    bits = [effective_name(st, obs) or "Unidentified"]
-    if obs.get("common_name"):
-        bits.append(obs["common_name"])
-    bits.append(obs.get("uri") or "")
-    if photo.get("attribution"):
-        bits.append(photo["attribution"])
-    return "\n".join(xml_text(b) for b in bits if b)  # one paragraph per line
+def _speaker_notes(obs: dict, st: ObservationState, photo: dict, settings) -> str:
+    """The slide's notes: the name and common name, then the presenter notes,
+    then the iNaturalist link and photo credit. ``speaker_notes`` controls the
+    name, link and credit; ``presenter_notes`` the observation's own notes.
+    A blank line separates the presenter notes from the rest."""
+    head, tail = [], []
+    if settings.speaker_notes:
+        head = [effective_name(st, obs) or "Unidentified", obs.get("common_name") or ""]
+        tail = [obs.get("uri") or "", photo.get("attribution") or ""]
+    head, tail = [b for b in head if b], [b for b in tail if b]
+    own = [line for line in (st.notes or "").split("\n") if line.strip()] if settings.presenter_notes else []
+    lines = head
+    if own:
+        lines = head + ([""] if head else []) + own + ([""] if tail else [])
+    lines += tail
+    return "\n".join(xml_text(line) for line in lines)  # one paragraph per line
 
 
 # ---------------------------------------------------------------------------

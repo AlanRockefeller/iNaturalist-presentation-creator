@@ -9,7 +9,7 @@
   <link rel="stylesheet" href="/static/css/app.css?v={{ version }}">
   <script src="/static/js/theme.js?v={{ version }}"></script>
 </head>
-<body data-max-sources="{{ limits.max_sources }}" data-max-observations="{{ limits.max_observations }}" data-max-image-slides="{{ limits.max_image_slides }}" data-max-related-taxa="{{ limits.max_related_taxa }}">
+<body data-max-sources="{{ limits.max_sources }}" data-max-observations="{{ limits.max_observations }}" data-max-image-slides="{{ limits.max_image_slides }}" data-max-related-taxa="{{ limits.max_related_taxa }}" data-notes-enabled="{{ '1' if notes_enabled else '0' }}">
 
 <nav class="topnav">
   <div class="topnav-inner">
@@ -207,7 +207,9 @@
           <label class="check"><input type="checkbox" id="set-dividers"> Divider slide before each group <span class="muted small" id="divider-note"></span></label>
         </div>
         <div class="field">
-          <label class="check"><input type="checkbox" id="set-notes" checked> Speaker notes with the iNaturalist link and photo credit</label>
+          <span>Speaker notes <span class="muted small">(only you see these, in PowerPoint's presenter view)</span></span>
+          <label class="check"><input type="checkbox" id="set-notes" checked> Name, iNaturalist link and photo credit</label>
+          <label class="check"><input type="checkbox" id="set-presenter-notes" checked> Presenter notes (typed by you, or written by Claude on the Preview step)</label>
         </div>
       </div>
     </div>
@@ -221,6 +223,7 @@
     <div class="statusline">
       <span id="preview-stats"></span>
       <span class="muted small">This is the actual slide sequence. Drag a photo slide to move its whole observation.</span>
+      <button type="button" class="btn btn-small" id="btn-notes-all" data-notes-claude hidden>Write notes for all slides…</button>
     </div>
     <div id="preview-warnings" class="warnings"></div>
     <div id="preview-grid" class="preview-grid"></div>
@@ -397,6 +400,71 @@
       <input type="search" id="picker-find" placeholder="Filter by name…" maxlength="100">
     </div>
     <div class="picker-scroll"><div id="picker-grid" class="picker-grid"></div><div id="picker-sentinel" class="sentinel"></div></div>
+  </div>
+</div>
+
+<!-- Presenter notes for one observation -->
+<div class="modal" id="notes-modal" hidden>
+  <div class="modal-box narrow" role="dialog" aria-modal="true" aria-labelledby="notes-title">
+    <div class="modal-head">
+      <h2 id="notes-title">Presenter notes</h2>
+      <button type="button" class="icon-btn close" data-close aria-label="Close">×</button>
+    </div>
+    <p class="notes-for" id="notes-for"></p>
+    <div class="warning" id="notes-stale" hidden></div>
+    <textarea id="notes-text" class="notes-text" rows="9" maxlength="4000" aria-label="Presenter notes"
+              placeholder="Type notes here, or let Claude write them."></textarea>
+    <p class="muted small">Shown in PowerPoint's presenter view on every slide of this observation. Saved in the project file.</p>
+    <p class="small" id="notes-status" role="status" hidden></p>
+    <div class="modal-foot">
+      <button type="button" class="btn" id="btn-notes-claude" data-notes-claude hidden>Write with Claude</button>
+      <button type="button" class="btn" id="btn-notes-remove">Remove notes</button>
+      <span class="grow"></span>
+      <button type="button" class="btn btn-primary" data-close>Done</button>
+    </div>
+  </div>
+</div>
+
+<!-- Presenter notes for every slide -->
+<div class="modal" id="notes-all-modal" hidden>
+  <div class="modal-box narrow" role="dialog" aria-modal="true" aria-labelledby="notes-all-title">
+    <div class="modal-head">
+      <h2 id="notes-all-title">Write notes for all slides</h2>
+      <button type="button" class="icon-btn close" data-close aria-label="Close">×</button>
+    </div>
+    <p id="notes-all-summary"></p>
+    <label class="check" id="notes-all-replace-row"><input type="checkbox" id="notes-all-replace"> <span id="notes-all-replace-label"></span></label>
+    <p class="muted small">Claude writes 3 to 5 short points about each name: edibility and toxicity, ecology and range, and the stories behind the name. Observations with the same name get the same notes. You can edit them afterwards.</p>
+    <div id="notes-all-progress" class="progress-block" hidden>
+      <div class="progress"><div class="bar" id="notes-all-bar"></div></div>
+      <p id="notes-all-message" class="small"></p>
+    </div>
+    <div class="modal-foot">
+      <span class="grow"></span>
+      <button type="button" class="btn" id="btn-notes-all-cancel">Cancel</button>
+      <button type="button" class="btn btn-primary" id="btn-notes-all-start">Write notes</button>
+    </div>
+  </div>
+</div>
+
+<!-- Access code for writing notes with Claude -->
+<div class="modal" id="notes-code-modal" hidden>
+  <div class="modal-box narrow" role="dialog" aria-modal="true" aria-labelledby="notes-code-title">
+    <div class="modal-head">
+      <h2 id="notes-code-title">Access code</h2>
+      <button type="button" class="icon-btn close" data-close aria-label="Close">×</button>
+    </div>
+    <form id="notes-code-form">
+      <p class="small" id="notes-code-message">Writing notes with Claude needs the access code for this site.</p>
+      <label class="field">Access code
+        <input type="password" id="notes-code-input" maxlength="200" autocomplete="current-password" required>
+      </label>
+      <div class="modal-foot">
+        <span class="grow"></span>
+        <button type="button" class="btn" data-close>Cancel</button>
+        <button type="submit" class="btn btn-primary">Continue</button>
+      </div>
+    </form>
   </div>
 </div>
 

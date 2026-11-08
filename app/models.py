@@ -14,7 +14,7 @@ from typing import Annotated, Literal, Optional
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator
 
 PROJECT_FORMAT = "dikarya-presentation"
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 PROJECT_EXTENSION = ".dikarya-presentation.json"
 
 SortKey = Literal["taxonomic", "favorites", "observed_on", "created_at", "name", "original", "random", "custom"]
@@ -32,12 +32,15 @@ MAX_RELATED_TAXA = 1000  # species remembered per "more photos" source
 _LIMITS = {"sources": 20, "observations": 10_000, "photos": 200, "ignored": 50_000}
 MAX_PHOTOS = _LIMITS["photos"]    # photos remembered per observation
 MAX_IGNORED = _LIMITS["ignored"]  # ignored observation ids per project
+MAX_NOTES_CHARS = 4000            # presenter notes per observation
 
 # Characters that cannot be written to XML (so not to a .pptx) or to UTF-8.
 _UNENCODABLE = re.compile("[\ud800-\udfff￾￿]")
 # Control characters other than tab, for example a line break pasted from
 # PowerPoint or Word (vertical tab).
 _CONTROL = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
+# The same, but line breaks stay: presenter notes have one point per line.
+_CONTROL_MULTILINE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 
 
 def strip_unencodable(value):
@@ -52,7 +55,16 @@ def clean_text(value):
     return value
 
 
+def clean_multiline(value):
+    """Like clean_text, but line breaks are kept (as \\n)."""
+    if isinstance(value, str):
+        value = value.replace("\r\n", "\n").replace("\r", "\n")
+        return _CONTROL_MULTILINE.sub(" ", _UNENCODABLE.sub("", value))
+    return value
+
+
 Text = Annotated[str, BeforeValidator(clean_text)]
+MultilineText = Annotated[str, BeforeValidator(clean_multiline)]
 Encodable = Annotated[str, BeforeValidator(strip_unencodable)]
 
 
@@ -167,6 +179,8 @@ class PresentationSettings(_Model):
     annotations: AnnotationSettings = Field(default_factory=AnnotationSettings)
     speaker_notes: bool = True
     related: RelatedSettings = Field(default_factory=RelatedSettings)
+    # Each observation's presenter notes (ObservationState.notes) in the deck.
+    presenter_notes: bool = True
 
 
 class AnnotationOverrides(_Model):
@@ -196,6 +210,11 @@ class ObservationState(_Model):
     status: Literal["active", "unavailable"] = "active"
     last_inat_name: Optional[Text] = Field(default=None, max_length=300)
     added_at: Optional[str] = Field(default=None, max_length=40)
+    # Presenter notes for this observation's slides, typed by the user or
+    # written by Claude (app/notes.py), and the name they were written for, so
+    # a changed name can be pointed out. None = no notes.
+    notes: Optional[MultilineText] = Field(default=None, max_length=MAX_NOTES_CHARS)
+    notes_name: Optional[Text] = Field(default=None, max_length=300)
 
     @field_validator("source_ids")
     @classmethod
@@ -253,3 +272,11 @@ class AddObservationsRequest(ProjectRequest):
     placement: Literal["sorted", "append", "after"] = "sorted"
     after_id: Optional[int] = Field(default=None, gt=0)
     ignore_ids: list[int] = Field(default_factory=list, max_length=_LIMITS["observations"])
+
+
+class NotesRequest(ProjectRequest):
+    # Observations to write presenter notes for; None = every observation with
+    # a slide in the presentation.
+    observation_ids: Optional[list[int]] = Field(default=None, max_length=_LIMITS["observations"])
+    # False: skip observations that already have notes.
+    replace: bool = False

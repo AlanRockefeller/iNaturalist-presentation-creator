@@ -83,10 +83,15 @@ class RateLimiter:
                 self._generation += 1
 
 
+INAT_BUDGET_MESSAGE = ("This site has reached its daily iNaturalist request allowance. "
+                       "Please try again tomorrow (UTC).")
+
+
 class DailyBudget:
-    def __init__(self, limit: int, path: Path | None = None, today=None):
+    def __init__(self, limit: int, path: Path | None = None, today=None, message: str = INAT_BUDGET_MESSAGE):
         self.limit = int(limit)
         self.path = path
+        self.message = message  # shown when the budget is used up
         self._today = today or (lambda: datetime.now(timezone.utc).strftime("%Y-%m-%d"))
         self._lock = threading.Lock()
         self._day = self._today()
@@ -114,10 +119,7 @@ class DailyBudget:
         with self._lock:
             self._roll()
             if self._count + n > self.limit:
-                raise BudgetExceeded(
-                    "This site has reached its daily iNaturalist request allowance. "
-                    "Please try again tomorrow (UTC)."
-                )
+                raise BudgetExceeded(self.message)
             self._count += n
             now = time.monotonic()
             if self.path and now - self._last_flush > 5:

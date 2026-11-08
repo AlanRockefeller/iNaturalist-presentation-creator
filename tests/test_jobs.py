@@ -76,11 +76,11 @@ def test_shutdown_cancels_running_and_queued_jobs(one_worker):
     jobs = one_worker
     running, _ = _blocker(jobs, client="other")
     queued = jobs._submit("load", "c1", lambda job: {}, 60)
-    assert jobs.counts() == {"loading": 2, "generating": 0}
+    assert jobs.counts() == {"loading": 2, "generating": 0, "notes": 0}
     assert jobs.shutdown() == 2
     assert queued.state == "cancelled"
     _wait_state(running, ("cancelled",))
-    assert jobs.counts() == {"loading": 0, "generating": 0}
+    assert jobs.counts() == {"loading": 0, "generating": 0, "notes": 0}
     with pytest.raises(JobRejected):
         jobs._submit("load", "c2", lambda job: {}, 60)
 

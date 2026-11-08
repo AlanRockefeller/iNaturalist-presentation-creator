@@ -239,3 +239,44 @@ def wait_job(tc, job_id, timeout=30):
             return job
         time.sleep(0.05)
     raise AssertionError("job did not finish")
+
+
+class FakeNotesWriter:
+    """Stands in for the Claude Code CLI (notes.ClaudeCliWriter). Each note
+    says which name it is about."""
+
+    def __init__(self):
+        self.calls: list[dict] = []
+        self.fail_names: set[str] = set()
+        self.error = None   # a NotesError to raise from every call
+        self.block = None   # a threading.Event every call waits for
+
+    def write_batch(self, subjects, cancelled):
+        from app.notes import NotesCancelled
+
+        self.calls.append(subjects)
+        if self.block is not None:
+            while not self.block.wait(0.02):
+                if cancelled():
+                    raise NotesCancelled()
+        if self.error is not None:
+            raise self.error
+        return {key: f"• About {s['name']}" for key, s in subjects.items() if s["name"] not in self.fail_names}
+
+
+@pytest.fixture
+def notes_writer():
+    return FakeNotesWriter()
+
+
+@pytest.fixture
+def notes_client(settings, client, media, notes_writer):
+    """The app with presenter notes on: access code "letmein", fake writer."""
+    from fastapi.testclient import TestClient
+
+    from app.main import Services, create_app
+
+    settings.notes_access_code = "letmein"
+    services = Services(settings, client=client, media=media, notes_writer=notes_writer)
+    with TestClient(create_app(settings, services)) as tc:
+        yield tc
