@@ -92,7 +92,7 @@ def test_saved_project_refresh_finds_new_and_unavailable(app_client, fake):
     project = _new_project(tc, _source(tc, "https://www.inaturalist.org/observations?taxon_id=47170", "a", username="alice"), _source(tc, URL_B, "b"))
     first = _load(tc, project)
     saved = tc.post("/api/project/export", json={"project": first["project"]}).json()
-    assert saved["format"] == "dikarya-presentation" and saved["schema_version"] == 5
+    assert saved["format"] == "dikarya-presentation" and saved["schema_version"] == 6
     text = json.dumps(saved)
     assert "square.jpg" not in text and "faves_count" not in text
 
@@ -259,3 +259,110 @@ def test_resume_with_live_workspace_does_not_search_again(app_client, fake):
     assert len(fake.api_calls("/v2/observations")) == before
     assert not resumed["first_load"] and resumed["summary"]["new"] == 0
     assert {o["id"] for o in resumed["observations"]} == {1, 2}
+
+
+# ---------------------------------------------------------------- more photos of a species
+MINE_HERE = "https://www.inaturalist.org/observations?place_id=1"
+
+
+def _start_related(tc, project, workspace_id, refresh, taxa):
+    job = tc.post("/api/load", json={"project": project, "workspace_id": workspace_id,
+                                     "refresh_source_ids": refresh, "related_taxa": taxa}).json()
+    return wait_job(tc, job["id"])
+
+
+def _related_load(tc, project, workspace_id, refresh, taxa):
+    done = _start_related(tc, project, workspace_id, refresh, taxa)
+    assert done["state"] == "done", done
+    return done["result"]
+
+
+def _related_source(sid, whose, taxa):
+    return {"id": sid, "type": "related", "url": "", "related": {"whose": whose, "taxon_ids": taxa}}
+
+
+def _searches(fake, since):
+    return [r for r in fake.api_calls("/v2/observations")[since:] if "id" not in r.url.params]
+
+
+def test_more_photos_of_one_species_from_a_card(app_client, fake):
+    tc = app_client
+    fake.add(
+        make_obs(1, 47692, user="alice", faves=2, place_id=1, photos=((11, 900, 600),)),
+        make_obs(2, 47602, user="alice", faves=0, place_id=1, photos=((21, 900, 600),)),
+        make_obs(3, 47692, user="alice", faves=1, place_id=2, photos=((31, 900, 600),)),   # mine, elsewhere
+        make_obs(4, 47692, user="bob", faves=3, place_id=3, photos=((41, 900, 600),)),     # CC BY
+        make_obs(5, 47692, user="carol", faves=9, place_id=3, license="cc-by-nc"),          # not commercial
+        make_obs(6, 47692, user="dave", faves=0, place_id=3, photos=((61, 900, 600),)),    # no favorites
+        make_obs(7, 47602, user="erin", faves=4, place_id=3, photos=((71, 900, 600),)),
+    )
+    first = _load(tc, _new_project(tc, _source(tc, MINE_HERE, "a", "alice")))
+    assert {o["id"] for o in first["project"]["observations"]} == {1, 2}
+    project = first["project"]
+    project["settings"]["related"] = {"username": "alice", "buttons": True}
+    project["sources"].append(_related_source("o", "others", [47692]))
+
+    # "More from others" on observation 1: one search, results offered for review.
+    before = len(fake.api_calls("/v2/observations"))
+    res = _related_load(tc, project, first["workspace_id"], ["o"], [47692])
+    calls = _searches(fake, before)
+    assert len(calls) == 1 and calls[0].url.params["taxon_id"] == "47692"
+    assert calls[0].url.params["not_user_id"] == "alice" and calls[0].url.params["order_by"] == "votes"
+    assert res["summary"]["new_ids"] == [4] and res["summary"]["related_found"] == [4]
+    assert {o["id"] for o in res["project"]["observations"]} == {1, 2}  # not added until chosen
+    assert res["project"]["sources"][1]["label"] == "Other people's photos"
+
+    added = tc.post("/api/observations/add", json={
+        "project": res["project"], "workspace_id": res["workspace_id"], "observation_ids": [4],
+        "selected_photo_ids": {}, "placement": "after", "after_id": 1, "ignore_ids": [],
+    }).json()["project"]
+    assert added["order"] == [2, 1, 4]
+    st4 = next(s for s in added["observations"] if s["id"] == 4)
+    assert st4["source_ids"] == ["o"] and st4["selected_photo_ids"] == [41]
+
+    # Another species on the same source: membership only grows.
+    added["sources"][1]["related"]["taxon_ids"].append(47602)
+    res2 = _related_load(tc, added, res["workspace_id"], ["o"], [47602])
+    assert res2["summary"]["related_found"] == [7]
+    assert next(s for s in res2["project"]["observations"] if s["id"] == 4)["source_ids"] == ["o"]
+    assert res2["summary"]["no_longer_matching"] == 0
+
+    # My own photos of that species from anywhere.
+    project3 = res2["project"]
+    project3["sources"].append(_related_source("m", "mine", [47692]))
+    res3 = _related_load(tc, project3, res2["workspace_id"], ["m"], [47692])
+    assert res3["summary"]["related_found"] == [1, 3] and res3["summary"]["new_ids"][-1] == 3
+
+    # Opening the project again does not repeat these searches; their
+    # observations are refreshed by id.
+    before = len(fake.api_calls("/v2/observations"))
+    reopened = _load(tc, res3["project"])
+    calls = fake.api_calls("/v2/observations")[before:]
+    assert all("taxon_id" not in c.url.params for c in calls)
+    assert any("4" in c.url.params.get("id", "").split(",") for c in calls)
+    assert reopened["summary"]["unavailable"] == 0 and reopened["summary"]["new"] == 0
+
+
+def test_more_of_mine_needs_a_username(app_client, fake):
+    tc = app_client
+    fake.add(make_obs(1, 47692, user="alice", faves=2, place_id=1))
+    first = _load(tc, _new_project(tc, _source(tc, URL_A, "a")))
+    project = first["project"]
+    project["sources"].append(_related_source("m", "mine", [47692]))
+    done = _start_related(tc, project, first["workspace_id"], ["m"], [47692])
+    assert done["state"] == "error" and "username" in done["error"]
+
+
+def test_more_photos_refuses_a_search_bigger_than_whats_left(app_client, fake, services):
+    tc = app_client
+    fake.add(make_obs(1, 47692, user="alice", faves=2, place_id=1))
+    first = _load(tc, _new_project(tc, _source(tc, URL_A, "a")))
+    project = first["project"]
+    taxa = list(range(1000, 1300))
+    project["sources"].append(_related_source("o", "others", taxa))
+    budget = services.client.budget
+    budget.limit = budget.limit - budget.remaining() + 100  # about 100 requests left today
+    before = len(fake.api_calls())
+    done = _start_related(tc, project, first["workspace_id"], ["o"], taxa)
+    assert done["state"] == "error" and "300 species" in done["error"]
+    assert len(fake.api_calls()) == before  # refused before asking iNaturalist anything

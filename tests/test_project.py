@@ -162,7 +162,7 @@ def test_save_load_roundtrip_has_everything_and_no_photos():
     pr = ignore_observations(pr, [99])
     data = project_to_json(pr)
     text = json.dumps(data)
-    assert data["format"] == "dikarya-presentation" and data["schema_version"] == 5
+    assert data["format"] == "dikarya-presentation" and data["schema_version"] == 6
     assert "base64" not in text and "square.jpg" not in text and "faves_count" not in text
     loaded = load_project(json.loads(text))
     assert loaded.order == [3, 1, 2]
@@ -245,7 +245,7 @@ def test_v1_file_migrates_and_single_user_url_source_becomes_username():
                      "url": "https://www.inaturalist.org/observations?taxon_id=47170&user_id=alan_rockefeller"}],
         "observations": [{"id": 1, "selected_photo_ids": [5]}],
     })
-    assert pr.schema_version == 5
+    assert pr.schema_version == 6
     assert pr.sources[0].type == "username" and pr.sources[0].username == "alan_rockefeller"
     assert pr.observations[0].rotations == {} and pr.observations[0].show_lines == {}
 
@@ -289,7 +289,7 @@ USER_URL = "https://www.inaturalist.org/observations?taxon_id=47170&user_id=alan
 def test_v4_file_keeps_its_single_user_url_source_as_the_users_own():
     pr = load_project({"format": "dikarya-presentation", "schema_version": 4,
                        "sources": [{"id": "a", "type": "url", "url": USER_URL}]})
-    assert pr.schema_version == 5
+    assert pr.schema_version == 6
     assert pr.sources[0].type == "username" and pr.sources[0].username == "alan_rockefeller"
 
 
@@ -357,3 +357,91 @@ def test_a_selected_photo_beyond_a_full_known_list_still_saves_and_opens():
     assert len(known) == MAX_PHOTOS and 9999 in known
     again = load_project(json.loads(json.dumps(project_to_json(pr))))
     assert again.observations[0].selected_photo_ids == [9999]
+
+
+# ---------------------------------------------------------------- more photos (schema 6)
+def _related(sid, whose, taxa, **extra):
+    return {"id": sid, "type": "related", "url": "", "related": {"whose": whose, "taxon_ids": taxa}, **extra}
+
+
+def _with_related_settings(pr, **update):
+    return pr.model_copy(update={"settings": pr.settings.model_copy(
+        update={"related": pr.settings.related.model_copy(update=update)})})
+
+
+def test_v5_file_loads_as_v6_with_default_more_photos_settings():
+    pr = load_project({"format": "dikarya-presentation", "schema_version": 5,
+                       "sources": [{"id": "a", "type": "url", "url": URL_CR}]})
+    assert pr.schema_version == 6
+    rel = pr.settings.related
+    assert rel.username == "" and rel.buttons is False
+    assert (rel.mine.per_taxon, rel.mine.min_faves) == (20, 0)
+    assert rel.others.licenses == ["cc0", "cc-by", "cc-by-sa", "cc-by-nd"]
+    assert (rel.others.per_taxon, rel.others.min_faves, rel.others.research_only) == (5, 1, True)
+
+
+def test_related_sources_are_rebuilt_from_their_species_and_settings():
+    pr = load_project({"format": "dikarya-presentation", "schema_version": 6,
+                       "settings": {"related": {"username": "@Alan_Rockefeller"}},
+                       "sources": [{"id": "a", "type": "url", "url": URL_CR},
+                                   _related("m", "mine", [47692, 47692, 47602], username="someone", url="https://evil.example/"),
+                                   _related("o", "others", [47692], label="Best of the rest")]})
+    mine, others = pr.sources[1], pr.sources[2]
+    assert pr.settings.related.username == "Alan_Rockefeller"
+    assert mine.related.taxon_ids == [47692, 47602] and mine.username is None and mine.label == "More of my photos"
+    assert mine.url.startswith("https://www.inaturalist.org/observations?") and "taxon_id=47692,47602" in mine.url
+    assert "user_id=Alan_Rockefeller" in mine.url
+    assert others.label == "Best of the rest" and "not_user_id=Alan_Rockefeller" in others.url
+    assert "photo_license=cc0,cc-by,cc-by-sa,cc-by-nd" in others.url
+    again = load_project(json.loads(json.dumps(project_to_json(pr))))
+    assert again.sources == pr.sources
+    # A "more from others" source may hold other people's photos: credits start on.
+    own_only = project(source("a", USER))
+    assert observer_default(own_only) is False
+    assert observer_default(own_only.model_copy(update={"sources": own_only.sources + [others]})) is True
+
+
+@pytest.mark.parametrize("data, msg", [
+    ({"sources": [{"id": "m", "type": "related", "url": ""}]}, "no species list"),
+    ({"sources": [_related("m", "sometimes", [1])]}, "invalid"),
+    ({"sources": [_related("m", "mine", [0])]}, "invalid"),
+    ({"settings": {"related": {"username": "not a login"}}}, "invalid"),
+    ({"settings": {"related": {"others": {"licenses": []}}}}, "invalid"),
+    ({"settings": {"related": {"others": {"licenses": ["cc-by-xyz"]}}}}, "invalid"),
+])
+def test_bad_more_photos_settings_are_rejected(data, msg):
+    with pytest.raises(ProjectError, match=msg):
+        load_project({"format": "dikarya-presentation", "schema_version": 6, **data})
+
+
+def test_own_logins_come_from_mine_sources_and_more_photos():
+    from app.project import is_own, own_logins
+    pr = project(source("a", USER), source("b", URL_CR))
+    assert own_logins(pr) == {USER}
+    pr = _with_related_settings(pr, username="Second_Login")
+    assert own_logins(pr) == {USER, "second_login"}
+    assert is_own({"user": {"login": "SECOND_LOGIN"}}, pr) and not is_own({"user": {"login": "bob"}}, pr)
+
+
+def test_added_observation_from_others_starts_with_its_first_allowed_photo():
+    from app.models import Source
+    from app.project import allowed_licenses
+    obs = norm(make_obs(1, 47692, user="bob", licenses=["cc-by-nc", "cc-by"], photos=((11, 9, 9), (12, 9, 9))),
+               make_obs(2, 47692, user="carol", licenses=["cc-by-nc"]))
+    others = Source(id="o", type="related", url="", related={"whose": "others", "taxon_ids": [47692]})
+    pr = project(source("a", URL_CR), others)
+    assert allowed_licenses(pr, ["o"]) == {"cc0", "cc-by", "cc-by-sa", "cc-by-nd"}
+    assert allowed_licenses(pr, ["o", "a"]) is None  # another source found it too: any photo
+    pr = add_observations(pr, [1, 2], obs, {1: ["o"], 2: ["o", "a"]})
+    st = {s.id: s for s in pr.observations}
+    assert st[1].selected_photo_ids == [12] and st[2].selected_photo_ids == [1]
+
+
+def test_placing_new_observations_right_after_one():
+    obs = norm(*[make_obs(i, 47692) for i in range(1, 6)])
+    member = {i: ["a"] for i in range(1, 6)}
+    pr = add_observations(project(source("a", URL_CR)), [1, 2, 3], obs, member, placement="append")
+    assert pr.settings.sort.key == "taxonomic"
+    pr = add_observations(pr, [5, 4], obs, member, placement="after", after_id=2)
+    assert pr.order == [1, 2, 5, 4, 3]
+    assert pr.settings.sort.key == "custom" and pr.settings.sort.base_key == "taxonomic"

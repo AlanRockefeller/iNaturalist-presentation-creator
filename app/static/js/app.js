@@ -70,18 +70,48 @@
     return data;
   }
 
+  // Mirror of related.estimate_requests(): the most requests a search of n species can make.
+  function estimateRequests(count) {
+    let total = 0;
+    for (let start = 0; start < count; start += 100) {
+      const size = Math.min(100, count - start);
+      total += 1 + (size > 1 ? size : 0);
+    }
+    return total;
+  }
+  // iNaturalist requests are paced at about one per second.
+  const duration = (requests) => (requests < 60 ? 'under a minute' : `about ${plural(Math.ceil(requests / 60), 'minute')}`);
+
   const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
 
   // ---------------------------------------------------------------- state
   const LIMITS = {
     sources: Number(document.body.dataset.maxSources) || 20,
     imageSlides: Number(document.body.dataset.maxImageSlides) || 2000,
+    relatedTaxa: Number(document.body.dataset.maxRelatedTaxa) || 500, // species per "more photos" search
+    relatedKept: 1000, // species a "more photos" source remembers (models.MAX_RELATED_TAXA)
   };
+
+  // Licenses for other people's photos, as iNaturalist names them; "arr" is
+  // "all rights reserved". Mirrors related.LICENSE_LABELS and models.DEFAULT_LICENSES.
+  const LICENSES = [
+    ['cc0', 'CC0'], ['cc-by', 'CC BY'], ['cc-by-sa', 'CC BY-SA'], ['cc-by-nd', 'CC BY-ND'],
+    ['cc-by-nc', 'CC BY-NC'], ['cc-by-nc-sa', 'CC BY-NC-SA'], ['cc-by-nc-nd', 'CC BY-NC-ND'], ['arr', 'All rights reserved'],
+  ];
+  const LICENSE_LABEL = new Map(LICENSES);
+  const RELATED_LABEL = { mine: 'More of my photos', others: 'Other people\'s photos' };
+  function defaultRelated() {
+    return {
+      username: '', buttons: false,
+      mine: { per_taxon: 20, min_faves: 0 },
+      others: { licenses: ['cc0', 'cc-by', 'cc-by-sa', 'cc-by-nd'], per_taxon: 5, min_faves: 1, research_only: true },
+    };
+  }
 
   function newProject() {
     return {
       format: 'dikarya-presentation',
-      schema_version: 5,
+      schema_version: 6,
       sources: [],
       settings: {
         title: '', presenter: '', background: 'black', title_photo: null,
@@ -89,6 +119,7 @@
         grouping: 'family', dividers: false, min_faves: 0,
         annotations: { scientific: true, common_name: false, date: false, location: false, observer: null },
         speaker_notes: true,
+        related: defaultRelated(),
       },
       observations: [],
       order: [],
@@ -176,13 +207,55 @@
     if (st && st.overrides && st.overrides.scientific !== null && st.overrides.scientific !== undefined) return st.overrides.scientific;
     return (o && o.inat_name) || '';
   }
+  const isRelated = (src) => src.type === 'related' && !!src.related;
+  const relatedSource = (whose) => S.project.sources.find((s) => isRelated(s) && s.related.whose === whose);
+  function relatedSettings() {
+    const s = S.project.settings;
+    if (!s.related) s.related = defaultRelated();
+    return s.related;
+  }
   function observerDefault() {
     const active = S.project.sources.filter((s) => s.enabled);
-    return (active.length ? active : S.project.sources).some((s) => s.type === 'url');
+    return (active.length ? active : S.project.sources).some((s) => s.type === 'url' || (isRelated(s) && s.related.whose === 'others'));
   }
   function observerEnabled() {
     const v = S.project.settings.annotations.observer;
     return v === null || v === undefined ? observerDefault() : v;
+  }
+  // Who the presenter is: their Mine sources and the username in More photos.
+  // Their photos are never credited. Mirror of own_logins() / is_own() in project.py.
+  function ownLogins() {
+    const out = new Set(S.project.sources.filter((s) => s.type === 'username' && s.username).map((s) => s.username.toLowerCase()));
+    const u = relatedSettings().username;
+    if (u) out.add(u.toLowerCase());
+    return out;
+  }
+  function isOwn(id) {
+    const o = S.obs.get(id);
+    const login = ((o && o.user && o.user.login) || '').toLowerCase();
+    return !!login && ownLogins().has(login);
+  }
+  // The licenses an observation's photos are limited to (other people's photos
+  // found only by "More from others"), or null for any. Mirror of
+  // allowed_licenses() / default_photo_ids() in project.py.
+  function allowedLicenses(sourceIds) {
+    const others = new Set(S.project.sources.filter((s) => isRelated(s) && s.related.whose === 'others').map((s) => s.id));
+    if (sourceIds && sourceIds.length && sourceIds.every((sid) => others.has(sid))) return new Set(relatedSettings().others.licenses);
+    return null;
+  }
+  const photoAllowed = (p, allowed) => !allowed || allowed.has(p.license || 'arr');
+  function defaultPhotoIds(id, sourceIds) {
+    const o = S.obs.get(id);
+    const allowed = allowedLicenses(sourceIds);
+    const p = o && o.photos.find((x) => photoAllowed(x, allowed));
+    return p ? [p.id] : [];
+  }
+  // Sources that found an observation waiting in the review dialog.
+  const reviewSources = (id) => (S.pendingNew && S.pendingNew.membership && S.pendingNew.membership[String(id)]) || [];
+  // Mirror of related.is_species(): only these can be searched for more photos.
+  function isSpecies(o) {
+    const t = o && o.taxon;
+    return !!(t && t.id && typeof t.rank_level === 'number' && t.rank_level <= 10);
   }
   function enabledSourceIds() {
     return new Set(S.project.sources.filter((s) => s.enabled).map((s) => s.id));
@@ -373,6 +446,7 @@
     list.replaceChildren();
     $('#sources-empty').hidden = S.project.sources.length > 0;
     S.project.sources.forEach((src) => {
+      if (isRelated(src)) { list.append(relatedSourceItem(src)); return; }
       const count = S.sourceCounts[src.id];
       const mine = src.type === 'username';
       const login = singleUserLogin(src);
@@ -402,23 +476,14 @@
           el('span', { class: 'who', text: whose + (login ? ` Click ${mine ? 'Mine' : 'Search'} to change.` : '') }),
         ),
         el('span', { class: 'count-pill', text: count === undefined ? '' : plural(count, 'observation') }),
-        el('button', {
-          type: 'button', class: 'btn btn-small btn-danger', text: 'Remove',
-          onclick: () => {
-            const exclusive = S.project.observations.filter((st) => st.source_ids.length === 1 && st.source_ids[0] === src.id).length;
-            if (exclusive && !confirm(`Remove "${src.label}"? ${plural(exclusive, 'observation')} found only by this source will leave the project.`)) return;
-            const dropped = removeSourceLocal(src.id);
-            markDirty();
-            renderSources();
-            updateStepper();
-            if (dropped) toast(`Removed ${plural(dropped, 'observation')} that only this source found.`);
-          },
-        }),
+        removeSourceButton(src),
       );
       list.append(item);
     });
     const enabled = S.project.sources.filter((s) => s.enabled);
-    const unloaded = enabled.filter((s) => !S.loadedSources.has(s.id));
+    // "More photos" sources are searched only when asked (Search again), so
+    // they never count as sources waiting to be loaded.
+    const unloaded = enabled.filter((s) => !isRelated(s) && !S.loadedSources.has(s.id));
     const btn = $('#btn-load');
     btn.disabled = enabled.length === 0;
     if (!hasObservations()) {
@@ -437,9 +502,59 @@
     const enabled = S.project.sources.filter((s) => s.enabled);
     if (!enabled.length) return;
     if (!hasObservations()) return startLoad(null);
-    const unloaded = enabled.filter((s) => !S.loadedSources.has(s.id)).map((s) => s.id);
+    const unloaded = enabled.filter((s) => !isRelated(s) && !S.loadedSources.has(s.id)).map((s) => s.id);
     return startLoad(unloaded.length ? unloaded : null);
   });
+
+  function removeSourceButton(src) {
+    return el('button', {
+      type: 'button', class: 'btn btn-small btn-danger', text: 'Remove',
+      onclick: () => {
+        const exclusive = S.project.observations.filter((st) => st.source_ids.length === 1 && st.source_ids[0] === src.id).length;
+        if (exclusive && !confirm(`Remove "${src.label}"? ${plural(exclusive, 'observation')} found only by this source will leave the project.`)) return;
+        const dropped = removeSourceLocal(src.id);
+        markDirty();
+        renderSources();
+        updateStepper();
+        if (dropped) toast(`Removed ${plural(dropped, 'observation')} that only this source found.`);
+      },
+    });
+  }
+
+  // A "More of my photos" / "Other people's photos" source, made by the More
+  // photos buttons on Select & Organize. It lists the species searched so far.
+  function relatedSourceItem(src) {
+    const species = src.related.taxon_ids.length;
+    const kept = S.project.observations.filter((st) => st.source_ids.includes(src.id)).length;
+    const what = src.related.whose === 'mine' ? 'your own photos' : 'other people\'s photos';
+    return el('li', { class: 'source-item related' + (src.enabled ? '' : ' disabled') },
+      el('input', {
+        type: 'checkbox', checked: src.enabled, title: 'Include this source', 'aria-label': 'Include this source',
+        onchange: (e) => { src.enabled = e.target.checked; markDirty(); renderSources(); },
+      }),
+      el('span', { class: 'badge related', text: 'More photos', title: `More ${what} of species in this project` }),
+      el('div', { class: 'source-meta' },
+        el('input', {
+          type: 'text', class: 'label-input', value: src.label || RELATED_LABEL[src.related.whose], maxLength: 120, 'aria-label': 'Source label',
+          onchange: (e) => { src.label = e.target.value.trim().slice(0, 120); markDirty(); },
+        }),
+        src.url ? el('a', { class: 'url', href: src.url, target: '_blank', rel: 'noopener noreferrer', text: src.url }) : null,
+        el('span', { class: 'who', text: `${plural(species, 'species', 'species')} searched for ${what}, using the settings in More photos (Select & Organize). Searched only when you ask, so refreshing does not repeat it.` }),
+      ),
+      el('span', { class: 'count-pill', text: plural(kept, 'observation') }),
+      el('button', {
+        type: 'button', class: 'btn btn-small', text: 'Search again', disabled: !species || !src.enabled,
+        title: 'Search all of these species again with the current More photos settings',
+        onclick: () => {
+          const need = estimateRequests(Math.min(species, LIMITS.relatedTaxa));
+          if (species > LIMITS.relatedTaxa) { toast(`One search can cover at most ${n(LIMITS.relatedTaxa)} species; this source has ${n(species)}.`, true, 9000); return; }
+          if (!confirm(`Search ${plural(species, 'species', 'species')} again for ${what}? That is up to ${plural(need, 'request')} to iNaturalist (${duration(need)}). New observations are offered for review.`)) return;
+          startLoad([src.id], null, { whose: src.related.whose, taxa: null, title: src.label || RELATED_LABEL[src.related.whose] });
+        },
+      }),
+      removeSourceButton(src),
+    );
+  }
 
   // ---------------------------------------------------------------- loading
   let loadJobId = null;
@@ -498,7 +613,9 @@
     if (back && back.isConnected && typeof back.focus === 'function') back.focus();
   }
 
-  async function startLoad(refreshSourceIds, resume = null) {
+  // `related`: a "more photos" search ({whose, taxa (null = all of the
+  // source's species), title, afterId}); its results open in a short review.
+  async function startLoad(refreshSourceIds, resume = null, related = null) {
     const gen = projectGen;
     const modal = $('#load-modal');
     $('#load-message').textContent = 'Starting…';
@@ -506,14 +623,13 @@
     openModal(modal);
     loadCancelled = false;
     try {
-      const job = await api('/api/load', {
-        method: 'POST',
-        body: {
-          project: S.project,
-          workspace_id: refreshSourceIds ? S.workspaceId : null,
-          refresh_source_ids: refreshSourceIds,
-        },
-      });
+      const body = {
+        project: S.project,
+        workspace_id: refreshSourceIds ? S.workspaceId : null,
+        refresh_source_ids: refreshSourceIds,
+      };
+      if (related && related.taxa) body.related_taxa = related.taxa;
+      const job = await api('/api/load', { method: 'POST', body });
       loadJobId = job.id;
       const final = await pollJob(job.id, (j) => {
         $('#load-message').textContent = j.message || 'Working…';
@@ -522,7 +638,7 @@
       if (final.state === 'cancelled' || loadCancelled) { toast('Loading cancelled.'); return; }
       if (final.state !== 'done') throw new Error(final.error || 'Loading failed.');
       if (gen !== projectGen) return; // another project was opened meanwhile
-      applyLoadResult(final.result, resume);
+      applyLoadResult(final.result, resume, related);
     } catch (err) {
       if (gen === projectGen) toast(err.message, true, 9000);
     } finally {
@@ -536,7 +652,7 @@
     if (loadJobId) { try { await api(`/api/jobs/${encodeURIComponent(loadJobId)}`, { method: 'DELETE' }); } catch (e) { /* ignore */ } }
   });
 
-  function applyLoadResult(result, resume = null) {
+  function applyLoadResult(result, resume = null, related = null) {
     setProject(result.project);
     S.obs = new Map(result.observations.map((o) => [o.id, o]));
     S.workspaceId = result.workspace_id;
@@ -554,6 +670,19 @@
       S.pendingNew = null;
       toast(`Loaded ${plural(sum.auto_added || 0, 'observation')} from iNaturalist.`);
       goto('organize');
+    } else if (related) {
+      // Only what this search found; other new observations stay behind the
+      // "Review new observations" button.
+      S.pendingNew = sum.new ? sum : null;
+      const found = new Set(sum.related_found || []);
+      const ids = (sum.new_ids || []).filter((id) => found.has(id));
+      goto(S.step === 'sources' ? 'organize' : S.step);
+      if (ids.length) {
+        showReview({ ...sum, new_ids: ids }, true, { title: related.title, afterId: related.afterId });
+      } else {
+        const what = related.whose === 'mine' ? 'of your photos' : 'from other people';
+        toast(`Nothing new ${what} with the current More photos settings${found.size ? ' (what it found is already in the project or was ignored)' : ''}.`, false, 7000);
+      }
     } else {
       S.pendingNew = sum.new ? sum : null;
       showReview(sum);
@@ -890,6 +1019,153 @@
     markDirty();
   }
 
+  // ------------------------------------------------ more photos of the same species
+  const licenseLabel = (code) => LICENSE_LABEL.get(code || 'arr') || String(code).toUpperCase();
+  // The licenses of an observation's photos, e.g. "CC BY" or "CC BY, CC BY-NC".
+  function licenseText(o) {
+    return [...new Set(o.photos.map((p) => licenseLabel(p.license)))].join(', ');
+  }
+
+  // "More of mine" / "More from others" on a card, when turned on in More photos.
+  function morePhotoButtons(id) {
+    const rel = relatedSettings();
+    if (!rel.buttons) return [];
+    const o = S.obs.get(id);
+    const ok = isSpecies(o);
+    const name = effectiveName(id) || (o && o.inat_name) || 'this species';
+    const why = ok ? '' : 'Only observations identified to species can be searched. ';
+    const make = (whose, text, title) => el('button', {
+      type: 'button', class: 'more-photos', text, disabled: !ok || (whose === 'mine' && !rel.username),
+      title: why + (whose === 'mine' && !rel.username ? 'Enter your iNaturalist username in More photos first.' : title),
+      onclick: () => findMore(whose, [o.taxon.id], { title: `More photos of ${name}`, afterId: id }),
+    });
+    return [
+      make('mine', 'More of mine', `Find more of your own photos of ${name}, from anywhere (up to ${rel.mine.per_taxon}, most favorited first)`),
+      make('others', 'More from others', `Find other people's photos of ${name} (up to ${rel.others.per_taxon}, most favorited first, ${rel.others.licenses.map(licenseLabel).join(', ')})`),
+    ];
+  }
+
+  // Search these species for more photos with the More photos settings: the
+  // species are added to that kind's source (made on first use), and only
+  // they are searched now. What is new opens in the review dialog.
+  function findMore(whose, taxonIds, ctx = {}) {
+    const rel = relatedSettings();
+    if (whose === 'mine' && !rel.username) { openRelated('Enter your iNaturalist username to search your own photos.'); return; }
+    if (!taxonIds.length) { toast('None of the observations listed is identified to species.', true); return; }
+    if (taxonIds.length > LIMITS.relatedTaxa) {
+      toast(`One search can cover at most ${n(LIMITS.relatedTaxa)} species, not ${n(taxonIds.length)}. Use Find to list fewer.`, true, 9000);
+      return;
+    }
+    let src = relatedSource(whose);
+    if (!src) {
+      if (S.project.sources.length >= LIMITS.sources) { toast(`A project can have at most ${LIMITS.sources} sources. Remove one first.`, true, 9000); return; }
+      src = { id: newSourceId(), type: 'related', input: '', username: null, url: '', label: RELATED_LABEL[whose], enabled: true, related: { whose, taxon_ids: [] } };
+      S.project.sources.push(src);
+    }
+    const known = new Set(src.related.taxon_ids);
+    const adding = taxonIds.filter((t) => !known.has(t));
+    if (known.size + adding.length > LIMITS.relatedKept) {
+      toast(`"${src.label}" already lists ${n(known.size)} species; it can hold ${n(LIMITS.relatedKept)}. Remove it on Sources to start a new list.`, true, 9000);
+      return;
+    }
+    src.related.taxon_ids.push(...adding);
+    src.enabled = true;
+    markDirty();
+    startLoad([src.id], null, { whose, taxa: taxonIds, title: ctx.title, afterId: ctx.afterId });
+  }
+
+  // The species of the observations listed on Select & Organize (Find and the
+  // filters narrow it), and how many listed are not identified to species.
+  function listedSpecies() {
+    const taxa = [];
+    const seen = new Set();
+    let skipped = 0;
+    for (const it of organizeItems().items) {
+      if (it.type !== 'obs') continue;
+      const o = S.obs.get(it.id);
+      const st = S.states.get(it.id);
+      if (!o || !st || st.status !== 'active') continue;
+      if (!isSpecies(o)) { skipped++; continue; }
+      if (!seen.has(o.taxon.id)) { seen.add(o.taxon.id); taxa.push(o.taxon.id); }
+    }
+    return { taxa, skipped };
+  }
+
+  // The More photos dialog: how the searches work, and a search of every species listed.
+  function openRelated(message = '') {
+    const rel = relatedSettings();
+    $('#rel-username').value = rel.username || defaultUsername();
+    $('#rel-mine-n').value = rel.mine.per_taxon;
+    $('#rel-mine-faves').value = rel.mine.min_faves;
+    $$('#rel-licenses input').forEach((b) => { b.checked = rel.others.licenses.includes(b.value); });
+    $('#rel-others-n').value = rel.others.per_taxon;
+    $('#rel-others-faves').value = rel.others.min_faves;
+    $('#rel-research').checked = rel.others.research_only;
+    $('#rel-buttons').checked = rel.buttons || (!rel.username && !S.project.sources.some(isRelated)); // on, the first time
+    $('#rel-error').textContent = message;
+    updateRelatedNote();
+    openModal($('#related-modal'));
+  }
+  function defaultUsername() {
+    const mine = S.project.sources.find((s) => s.type === 'username' && s.username);
+    if (mine) return mine.username;
+    try { return localStorage.getItem('dp-username') || ''; } catch (e) { return ''; }
+  }
+  function updateRelatedNote() {
+    const { taxa, skipped } = listedSpecies();
+    const need = estimateRequests(taxa.length);
+    const bits = [`${plural(taxa.length, 'species', 'species')} in the observations listed now`];
+    if (skipped) bits.push(`${n(skipped)} identified only to genus or higher ${skipped === 1 ? 'is' : 'are'} skipped`);
+    let text = bits.join('; ') + '. Use Find to list fewer first.';
+    if (taxa.length > LIMITS.relatedTaxa) text += ` One search can cover at most ${n(LIMITS.relatedTaxa)}.`;
+    else if (taxa.length) text += ` Other people's photos take up to ${plural(need, 'request')} to iNaturalist (${duration(need)}); your own usually far fewer.`;
+    $('#rel-species-note').textContent = text;
+    $('#btn-rel-all-mine').disabled = !taxa.length || taxa.length > LIMITS.relatedTaxa;
+    $('#btn-rel-all-others').disabled = !taxa.length || taxa.length > LIMITS.relatedTaxa;
+  }
+  // Read the dialog into the project's settings. Returns false (with a message) if something is off.
+  function saveRelated() {
+    const err = $('#rel-error');
+    const username = $('#rel-username').value.trim().replace(/^@/, '');
+    if (username && (!LOGIN_RE.test(username) || /^\d+$/.test(username))) { err.textContent = 'That is not a valid iNaturalist username.'; return false; }
+    const int = (sel, lo, hi) => {
+      const v = Number($(sel).value);
+      return Number.isInteger(v) && v >= lo && v <= hi ? v : null;
+    };
+    const mineN = int('#rel-mine-n', 1, 200);
+    const othersN = int('#rel-others-n', 1, 200);
+    const mineF = int('#rel-mine-faves', 0, 1000000);
+    const othersF = int('#rel-others-faves', 0, 1000000);
+    if (mineN === null || othersN === null) { err.textContent = 'How many per species must be a whole number from 1 to 200.'; return false; }
+    if (mineF === null || othersF === null) { err.textContent = 'Minimum favorites must be a whole number, 0 or more.'; return false; }
+    const licenses = $$('#rel-licenses input').filter((b) => b.checked).map((b) => b.value);
+    if (!licenses.length) { err.textContent = 'Tick at least one license for other people\'s photos.'; return false; }
+    S.project.settings.related = {
+      username, buttons: $('#rel-buttons').checked,
+      mine: { per_taxon: mineN, min_faves: mineF },
+      others: { licenses, per_taxon: othersN, min_faves: othersF, research_only: $('#rel-research').checked },
+    };
+    if (username) { try { localStorage.setItem('dp-username', username); } catch (e) { /* ignore */ } }
+    err.textContent = '';
+    markDirty();
+    return true;
+  }
+  $('#btn-related').addEventListener('click', () => openRelated());
+  $('#btn-rel-save').addEventListener('click', () => {
+    if (!saveRelated()) return;
+    closeModal($('#related-modal'));
+    renderOrganize(true);
+  });
+  [['#btn-rel-all-mine', 'mine'], ['#btn-rel-all-others', 'others']].forEach(([sel, whose]) => {
+    $(sel).addEventListener('click', () => {
+      if (!saveRelated()) return;
+      const { taxa } = listedSpecies();
+      closeModal($('#related-modal'));
+      renderOrganize(true);
+      findMore(whose, taxa, { title: `More ${whose === 'mine' ? 'of your photos' : 'photos from others'}: ${plural(taxa.length, 'species', 'species')}` });
+    });
+  });
+
   function obsCard(id, pos, adapter) {
     const st = S.states.get(id);
     const o = S.obs.get(id);
@@ -924,12 +1200,19 @@
     const selCount = photos.filter((p) => adapter.isSelected(p.id)).length;
     const missing = review ? [] : st.selected_photo_ids.filter((pid) => !photos.some((p) => p.id === pid));
     const card = el('div', { class: 'obs', dataset: { id: String(id), pos: String(pos || 0) } });
+    // Other people's photos found only by "More from others" are limited to
+    // the licenses chosen there: others are dimmed and not ticked by default.
+    const allowed = allowedLicenses(review ? reviewSources(id) : st.source_ids);
+    const own = isOwn(id);
 
     const box = el('input', {
       type: 'checkbox', checked: selCount > 0,
       title: 'Include this observation (its first photo). Tick more photos to add them.', 'aria-label': 'Include this observation',
       onchange: (e) => {
-        if (e.target.checked) { if (photos.length) adapter.toggle(photos[0].id, true); } else photos.forEach((p) => adapter.toggle(p.id, false));
+        if (e.target.checked) {
+          const first = photos.find((p) => photoAllowed(p, allowed)) || photos[0];
+          if (first) adapter.toggle(first.id, true);
+        } else photos.forEach((p) => adapter.toggle(p.id, false));
         if (review) refreshReviewCard(id);
       },
     });
@@ -979,6 +1262,7 @@
       el('span', { text: formatDate(o.observed_on) || 'No date' }),
       o.place_guess ? el('span', { text: o.place_guess }) : null,
       el('span', { text: user.name || user.login || '' }),
+      own || !o.photos.length ? null : el('span', { class: 'license', title: 'Photo license on iNaturalist', text: licenseText(o) }),
       el('span', { class: 'faves', title: 'iNaturalist favorites (never shown in the PowerPoint)', text: `♥ ${n(o.faves_count)}` }),
     ));
     const chips = el('div', { class: 'chips' });
@@ -1008,6 +1292,7 @@
         } }),
         el('button', { type: 'button', text: 'Top', onclick: () => { moveToIndex(id, 0); renderOrganize(true); } }),
         el('button', { type: 'button', text: 'Bottom', onclick: () => { moveToIndex(id, 1e9); renderOrganize(true); } }),
+        ...morePhotoButtons(id),
       );
       info.append(actions);
     }
@@ -1021,7 +1306,8 @@
         type: 'button', text: glyph, title: `Rotate ${label}`, 'aria-label': `Rotate photo ${idx + 1} ${label}`,
         onclick: (e) => { e.stopPropagation(); adapter.rotate(p.id, delta); },
       });
-      const t = el('div', { class: 'thumb' + (sel ? ' selected' : '') + (tp && tp.photo_id === p.id ? ' title-pick' : '') },
+      const out = !photoAllowed(p, allowed);
+      const t = el('div', { class: 'thumb' + (sel ? ' selected' : '') + (tp && tp.photo_id === p.id ? ' title-pick' : '') + (out ? ' license-out' : '') },
         el('img', { class: rotClass(rot), src: photoSize(p.url, 'small'), loading: 'lazy', decoding: 'async', alt: `Photo ${idx + 1} of ${name}`, width: 112, height: 112 }),
         el('input', {
           type: 'checkbox', checked: sel, title: 'Include this photo', 'aria-label': `Include photo ${idx + 1}`,
@@ -1069,6 +1355,7 @@
           refreshCard(id);
         });
       }
+      if (out) t.title = `${licenseLabel(p.license)}: not one of the licenses chosen for other people's photos in More photos. ${t.title || 'Click to enlarge.'}`;
       thumbs.append(t);
     });
     missing.forEach((pid) => {
@@ -1105,7 +1392,8 @@
     ];
     // A line's checkbox starts from Presentation Settings; a different choice is
     // stored for this observation only (ObservationState.show_lines).
-    const settingOn = (key) => (key === 'observer' ? observerEnabled() : !!S.project.settings.annotations[key]);
+    // The observer credit is left off the presenter's own photos (annotation_lines() in presentation.py).
+    const settingOn = (key) => (key === 'observer' ? observerEnabled() && !isOwn(id) : !!S.project.settings.annotations[key]);
     st.show_lines = st.show_lines || {};
     const grid = el('div', { class: 'ann-edit' });
     fields.forEach(([key, label, def]) => {
@@ -1477,12 +1765,16 @@
     const auto = s.annotations.observer === null || s.annotations.observer === undefined;
     const note = $('#observer-note');
     note.replaceChildren();
+    const logins = [...ownLogins()];
+    const yours = logins.length
+      ? ` Photos by ${logins.join(' or ')} (you) are never credited.`
+      : ' Every photo is credited until you give your username on Sources or in More photos.';
     if (auto) {
-      note.textContent = observerDefault()
-        ? '(automatic: on, because a source has no username and may include other people\'s photos)'
-        : '(automatic: off, because every source has your username, so these are your own photos)';
+      note.textContent = (observerDefault()
+        ? '(automatic: on, because a source may include other people\'s photos.'
+        : '(automatic: off, because every source is your own photos.') + yours + ')';
     } else {
-      note.append('(set manually · ', el('button', { type: 'button', class: 'linklike', text: 'use automatic', onclick: () => { s.annotations.observer = null; markDirty(); renderSettings(); } }), ')');
+      note.append(`(set manually.${yours} `, el('button', { type: 'button', class: 'linklike', text: 'use automatic', onclick: () => { s.annotations.observer = null; markDirty(); renderSettings(); } }), ')');
     }
     $('#set-dividers').checked = s.dividers;
     $('#divider-note').textContent = s.grouping === 'none' ? '(choose “Group by” on the Select & Organize step first)' : `(grouped by ${GROUP_NAMES[s.grouping].toLowerCase()})`;
@@ -1727,7 +2019,9 @@
     $('#btn-review-add-selected').disabled = chosen === 0 || !!$('#review-modal').dataset.busy;
   }
 
-  function showReview(sum, newOnly = false) {
+  // `ctx` (a "more photos" search): {title, afterId}. With afterId the new
+  // observations can go right after that card.
+  function showReview(sum, newOnly = false, ctx = null) {
     const box = $('#review-summary');
     box.replaceChildren();
     const lines = [];
@@ -1744,7 +2038,8 @@
       if (sum.no_longer_matching) lines.push(`${plural(sum.no_longer_matching, 'observation')} no longer match${sum.no_longer_matching === 1 ? 'es' : ''} any source but ${sum.no_longer_matching === 1 ? 'is' : 'are'} kept`);
     }
     box.append(...lines.map((t, i) => el('div', { class: i < 2 ? 'big' : '', text: t })));
-    $('#review-title').textContent = newOnly ? 'Review new observations' : 'Project refreshed from iNaturalist';
+    $('#review-title').textContent = (ctx && ctx.title) || (newOnly ? 'Review new observations' : 'Project refreshed from iNaturalist');
+    setReviewPlacement(ctx && ctx.afterId);
 
     const ids = (sum.new_ids || []).filter((id) => S.obs.has(id) && !S.states.has(id));
     const hasNew = ids.length > 0;
@@ -1755,14 +2050,17 @@
     if (hasNew) {
       $('#review-new-title').textContent = `${plural(ids.length, 'unique new observation')} to review`;
       const chips = $('#review-by-source');
-      chips.replaceChildren(...S.project.sources.filter((s) => (sum.new_by_source || {})[s.id]).map((s) => el('span', { class: 'chip', text: `${s.label}: ${n(sum.new_by_source[s.id])} new` })));
-      // Like add_observations: only the first photo of each starts selected.
+      const bySource = {};
+      ids.forEach((id) => ((sum.membership || {})[String(id)] || []).forEach((sid) => { bySource[sid] = (bySource[sid] || 0) + 1; }));
+      chips.replaceChildren(...S.project.sources.filter((s) => bySource[s.id]).map((s) => el('span', { class: 'chip', text: `${s.label}: ${n(bySource[s.id])} new` })));
+      // Like add_observations: only the first photo of each starts selected
+      // (the first with an allowed license, for other people's photos).
       // Reopening a review put off with "Decide later" keeps the choices made then.
       const prev = newOnly ? reviewSel : new Map();
       reviewSel = new Map(ids.map((id) => {
         const photos = S.obs.get(id).photos;
-        const kept = prev.has(id) ? photos.filter((p) => prev.get(id).has(p.id)) : photos.slice(0, 1);
-        return [id, new Set(kept.map((p) => p.id))];
+        const kept = prev.has(id) ? photos.filter((p) => prev.get(id).has(p.id)).map((p) => p.id) : defaultPhotoIds(id, reviewSources(id));
+        return [id, new Set(kept)];
       }));
       $('#review-all').checked = ids.every((id) => reviewSel.get(id).size);
       if (reviewRenderer) reviewRenderer.disconnect();
@@ -1775,13 +2073,29 @@
 
   $('#review-all').addEventListener('change', (e) => {
     for (const id of S.reviewIds || []) {
-      reviewSel.set(id, e.target.checked ? new Set(S.obs.get(id).photos.slice(0, 1).map((p) => p.id)) : new Set());
+      reviewSel.set(id, e.target.checked ? new Set(defaultPhotoIds(id, reviewSources(id))) : new Set());
     }
     const count = reviewRenderer ? reviewRenderer.count : 0;
     reviewRenderer.disconnect();
     reviewRenderer = chunkRender($('#review-list'), $('#review-sentinel'), S.reviewIds, (id) => obsCard(id, 0, reviewAdapter(id)), count, 40);
     updateReviewButtons();
   });
+
+  // "Place them": "right after <card>" is offered after a card's More photos button.
+  let reviewAfterId = null;
+  function setReviewPlacement(afterId) {
+    const select = $('#review-placement');
+    const old = $('option[value="after"]', select);
+    if (old) old.remove();
+    reviewAfterId = afterId && S.states.has(afterId) ? afterId : null;
+    if (reviewAfterId) {
+      const name = effectiveName(reviewAfterId) || `observation ${reviewAfterId}`;
+      select.prepend(el('option', { value: 'after', text: `right after ${name}` }));
+      select.value = 'after';
+    } else if (!select.value) {
+      select.value = 'sorted';
+    }
+  }
 
   async function addReviewed(ids, ignoreIds) {
     const modal = $('#review-modal');
@@ -1797,17 +2111,23 @@
     $('#review-new').inert = true;
     const gen = projectGen;
     try {
+      const placement = $('#review-placement').value;
       const res = await api('/api/observations/add', {
         method: 'POST',
         body: {
           project: S.project, workspace_id: S.workspaceId, observation_ids: ids,
-          selected_photo_ids: selected, placement: $('#review-placement').value, ignore_ids: ignoreIds,
+          selected_photo_ids: selected, placement, ignore_ids: ignoreIds,
+          after_id: placement === 'after' ? reviewAfterId : null,
         },
       });
       if (gen !== projectGen) return; // another project was opened meanwhile
       setProject(res.project);
       markDirty();
-      const remaining = (S.reviewIds || []).filter((id) => !S.states.has(id) && !S.project.ignored_observation_ids.includes(id));
+      // Still waiting: everything new that was not added or ignored, including
+      // observations a "more photos" review did not show (other searches').
+      const pending = new Set([...((S.pendingNew && S.pendingNew.new_ids) || []), ...(S.reviewIds || [])]);
+      const ignored = new Set(S.project.ignored_observation_ids);
+      const remaining = [...pending].filter((id) => !S.states.has(id) && !ignored.has(id));
       if (S.pendingNew) S.pendingNew.new_ids = remaining;
       if (!remaining.length) S.pendingNew = null;
       closeModal($('#review-modal'));
@@ -1824,9 +2144,10 @@
     }
   }
   $('#btn-review-add-all').addEventListener('click', () => {
-    // Every observation goes in; keep photo choices made here, else its first photo.
+    // Every observation goes in; keep photo choices made here, else its first
+    // photo (its first with an allowed license, for other people's photos).
     for (const id of S.reviewIds) {
-      if (!reviewSel.get(id) || !reviewSel.get(id).size) reviewSel.set(id, new Set(S.obs.get(id).photos.slice(0, 1).map((p) => p.id)));
+      if (!reviewSel.get(id) || !reviewSel.get(id).size) reviewSel.set(id, new Set(defaultPhotoIds(id, reviewSources(id))));
     }
     addReviewed(S.reviewIds.slice(), []);
   });

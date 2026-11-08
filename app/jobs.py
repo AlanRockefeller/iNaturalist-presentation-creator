@@ -29,6 +29,7 @@ from .inaturalist import INatClient, INatError, SourceError, count_requests, sou
 from .models import Project
 from .presentation import build_slide_plan, write_pptx
 from .project import ProjectError, add_observations, refresh_project, safe_filename
+from .related import LABELS as RELATED_LABELS, estimate_requests, run_related_search
 from .ratelimit import BudgetExceeded
 from .workspace import WorkspaceExpired, WorkspaceStore
 
@@ -392,11 +393,13 @@ class JobManager:
 
     # -- load ----------------------------------------------------------------
 
-    def start_load(self, client: str, project: Project, workspace_id: str | None, refresh_ids: list[str] | None) -> Job:
-        return self._submit("load", client, lambda job: self._load(job, project, workspace_id, refresh_ids),
+    def start_load(self, client: str, project: Project, workspace_id: str | None, refresh_ids: list[str] | None,
+                   related_taxa: list[int] | None = None) -> Job:
+        return self._submit("load", client, lambda job: self._load(job, project, workspace_id, refresh_ids, related_taxa),
                             self.settings.load_timeout_seconds)
 
-    def _load(self, job: Job, project: Project, workspace_id: str | None, refresh_ids: list[str] | None) -> dict:
+    def _load(self, job: Job, project: Project, workspace_id: str | None, refresh_ids: list[str] | None,
+              related_taxa: list[int] | None = None) -> dict:
         s = self.settings
         prev = None
         if workspace_id and refresh_ids is not None:
@@ -407,11 +410,14 @@ class JobManager:
         enabled = [src for src in project.sources if src.enabled]
         if not project.sources:
             raise JobFailed("Add at least one source first.")
+        refresh = set(refresh_ids or [])
+        # "More photos" sources are searched only when asked for by id; on any
+        # other load their observations are refreshed by id below.
+        searchable = [src for src in enabled if src.type != "related" or src.id in refresh]
         if prev is None:
-            to_query = enabled
+            to_query = searchable
         else:
-            refresh = set(refresh_ids or [])
-            to_query = [src for src in enabled if src.id in refresh or src.id not in prev["source_results"]]
+            to_query = [src for src in searchable if src.id in refresh or src.id not in prev["source_results"]]
 
         source_results: dict[str, list[int]] = {}
         observations: dict[int, dict] = {}
@@ -423,7 +429,20 @@ class JobManager:
             observations.update(prev["observations"])
 
         raw_all: list[dict] = []
+        related_found: list[int] = []
         for n, src in enumerate(to_query, 1):
+            if src.type == "related":
+                raws = self._search_related(job, src, project, related_taxa, n, len(to_query))
+                found = [int(r["id"]) for r in raws if r.get("id")]
+                related_found.extend(found)
+                # Membership only grows: a search of one species must not take
+                # this source away from observations it found before.
+                earlier = prev["source_results"].get(src.id, []) if prev else []
+                listed = [st.id for st in project.observations if src.id in st.source_ids]
+                source_results[src.id] = list(dict.fromkeys(found + earlier + listed))
+                raw_all.extend(raws)
+                self._check_unique(source_results, enabled)
+                continue
             params = source_params(src)
             label = src.label or src.url
             job.progress("search", 0, 0, f"Searching {label} ({n} of {len(to_query)})")
@@ -437,15 +456,7 @@ class JobManager:
             raw_all.extend(raws)
             log_event(log, logging.INFO, "load.source", source=src.url, results=len(source_results[src.id]),
                       total=total, duration_ms=(time.monotonic() - started) * 1000)
-            # Only enabled sources count: a disabled one keeps its results in the
-            # workspace (re-enabling it is instant) but is not in the project.
-            enabled_ids = {e.id for e in enabled}
-            unique = set().union(*(ids for sid, ids in source_results.items() if sid in enabled_ids))
-            if len(unique) > s.max_observations_per_project:
-                raise JobFailed(
-                    f"Together these sources match {len(unique):,} observations; the limit is "
-                    f"{s.max_observations_per_project:,}. Narrow a source or disable one."
-                )
+            self._check_unique(source_results, enabled)
 
         if raw_all:
             job.progress("taxa", 0, 0, "Looking up taxonomy")
@@ -468,6 +479,9 @@ class JobManager:
             observations.update(self.client.normalize_all(raws))
 
         project, summary = refresh_project(project, observations, source_results)
+        # What this load's "more photos" search found, so the browser can show
+        # just those (other new observations may still be waiting for review).
+        summary["related_found"] = list(dict.fromkeys(related_found))
         first_load = not project.observations
         workspace = {"observations": observations, "source_results": source_results}
         new_count = summary["new"]
@@ -501,6 +515,57 @@ class JobManager:
             "summary": summary,
             "first_load": first_load,
         }
+
+    def _check_unique(self, source_results: dict[str, list[int]], enabled) -> None:
+        # Only enabled sources count: a disabled one keeps its results in the
+        # workspace (re-enabling it is instant) but is not in the project.
+        limit = self.settings.max_observations_per_project
+        enabled_ids = {e.id for e in enabled}
+        unique = set().union(*(ids for sid, ids in source_results.items() if sid in enabled_ids))
+        if len(unique) > limit:
+            raise JobFailed(
+                f"Together these sources match {len(unique):,} observations; the limit is "
+                f"{limit:,}. Narrow a source or disable one."
+            )
+
+    def _search_related(self, job: Job, src, project: Project, related_taxa: list[int] | None,
+                        n: int, of: int) -> list[dict]:
+        """Run one "more photos" search (see related.py) within the request budgets."""
+        listed = src.related.taxon_ids
+        if related_taxa is None:
+            taxa = list(listed)
+        else:
+            known = set(listed)
+            taxa = [t for t in dict.fromkeys(related_taxa) if t in known]
+        if not taxa:
+            return []
+        limit = self.settings.max_related_taxa
+        if len(taxa) > limit:
+            raise JobFailed(f"One search can cover at most {limit:,} species, not {len(taxa):,}. "
+                            "Use Find on Select & Organize to list fewer.")
+        need = estimate_requests(len(taxa))
+        with self._lock:
+            share_left = self.api_share() - self._client_usage(job.client)
+        left = min(self.client.budget.remaining(), share_left)
+        if need > left:
+            raise JobFailed(
+                f"Searching {len(taxa):,} species can take up to {need:,} iNaturalist requests, and only "
+                f"{max(0, left):,} are left for you today. Search fewer species, or try again tomorrow (UTC)."
+            )
+        whose = src.related.whose
+        what = "your photos" if whose == "mine" else "other people's photos"
+        species = f"{len(taxa):,} species" if len(taxa) != 1 else "1 species"
+        prefix = f"Searching {what} of {species}" + (f" ({n} of {of})" if of > 1 else "")
+        job.progress("search", 0, need, prefix)
+        started = time.monotonic()
+        raws = run_related_search(
+            self.client, whose, taxa, project.settings.related,
+            lambda done, total: job.progress("search", done, total, f"{prefix}: {done:,} of up to {total:,} requests"),
+            job.cancel_event.is_set,
+        )
+        log_event(log, logging.INFO, "load.related", whose=whose, label=src.label or RELATED_LABELS[whose],
+                  species=len(taxa), results=len(raws), duration_ms=(time.monotonic() - started) * 1000)
+        return raws
 
     # -- generate ------------------------------------------------------------
 
