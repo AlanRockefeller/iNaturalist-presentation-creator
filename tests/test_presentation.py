@@ -99,17 +99,35 @@ def test_annotation_fields_overrides_and_observer_rules():
     lines = annotation_lines(obs[1], st[1], pr)
     assert [l["text"] for l in lines] == ["Hygrocybe conica", "Witch's Hat", "November 14, 2026", "Point Reyes, CA, US"]
     assert [l["italic"] for l in lines] == [True, False, False, False]
-    # username-only project: no observer line unless asked for
+    # username-only project (alice's): no observer line unless asked for, and
+    # even then not on alice's own photos, only on other people's
     pr_obs = pr.model_copy(update={"settings": pr.settings.model_copy(update={"annotations": on.model_copy(update={"observer": True})})})
-    assert annotation_lines(obs[1], st[1], pr_obs)[-1]["text"] == "Photo: Alice Smith"
+    assert annotation_lines(obs[1], st[1], pr_obs)[-1]["text"] == "Point Reyes, CA, US"
     assert annotation_lines(obs[3], st[3], pr_obs)[-1]["text"] == "Photo: carol"  # login fallback
-    # URL project: observer on by default
+    # URL project with no username: who the presenter is is unknown, so everyone is credited
     url_pr, _ = _deck(sources=[source("a", URL)])
     assert annotation_lines(obs[1], st[1], url_pr)[-1]["text"] == "Photo: Alice Smith"
     # user edits win; "" hides a line
     edited = st[1].model_copy(update={"overrides": AnnotationOverrides(scientific="Hygrocybe sp. nov.", location="", date="Fall 2026")})
     texts = [l["text"] for l in annotation_lines(obs[1], edited, pr)]
     assert texts == ["Hygrocybe sp. nov.", "Witch's Hat", "Fall 2026"]
+
+
+def test_observer_credit_skips_the_presenters_own_photos():
+    # A place search (credits on) plus "More photos" knowing the presenter is alice.
+    pr, obs = _deck(sources=[source("a", URL)])
+    pr = pr.model_copy(update={"settings": pr.settings.model_copy(
+        update={"related": pr.settings.related.model_copy(update={"username": "Alice"})})})
+    st = {s.id: s for s in pr.observations}
+    assert "Photo: Alice Smith" not in [l["text"] for l in annotation_lines(obs[1], st[1], pr)]
+    assert annotation_lines(obs[3], st[3], pr)[-1]["text"] == "Photo: carol"
+    # The per-observation choice still wins: credit one of your own by hand.
+    forced = st[1].model_copy(update={"show_lines": {"observer": True}})
+    assert annotation_lines(obs[1], forced, pr)[-1]["text"] == "Photo: Alice Smith"
+    # The plan uses the same rule.
+    plan = build_slide_plan(pr, obs)
+    texts = {s["observation_id"]: [l["text"] for l in s["lines"]] for s in plan["slides"] if s["kind"] == "image"}
+    assert not any(t.startswith("Photo:") for t in texts[1]) and "Photo: carol" in texts[3]
 
 
 def test_per_observation_lines_override_the_settings():

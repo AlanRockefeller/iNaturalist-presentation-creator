@@ -38,7 +38,7 @@ from pptx.parts.image import ImagePart
 from pptx.util import Emu, Pt
 
 from .models import ObservationState, Project
-from .project import observer_enabled
+from .project import is_own, observer_enabled, own_logins
 from .sorting import GROUP_LABELS, effective_name, group_of, passes_filters
 
 SLIDE_W = Emu(12192000)  # 13.333 in
@@ -91,12 +91,13 @@ def observer_name(obs: dict) -> str:
     return (user.get("name") or user.get("login") or "").strip()
 
 
-def annotation_lines(obs: dict, state: ObservationState, project: Project) -> list[dict]:
+def annotation_lines(obs: dict, state: ObservationState, project: Project, logins: set[str] | None = None) -> list[dict]:
     """Text lines for an image slide, in display order.
 
     Each line: {"field", "text", "italic", "size"}. Only the scientific name is
     italic. ``state.show_lines`` turns a line on or off for this observation
-    regardless of the settings; an override of "" also hides it.
+    regardless of the settings; an override of "" also hides it. The observer
+    credit is left off the presenter's own photos unless show_lines asks for it.
     """
     ann = project.settings.annotations
     ov = state.overrides
@@ -116,7 +117,9 @@ def annotation_lines(obs: dict, state: ObservationState, project: Project) -> li
     add("date", ann.date, ov.date, format_date(obs.get("observed_on")), False, DETAIL_PT)
     add("location", ann.location, ov.location, obs.get("place_guess") or "", False, DETAIL_PT)
     name = observer_name(obs)
-    add("observer", observer_enabled(project), ov.observer, f"Photo: {name}" if name else "", False, DETAIL_PT)
+    # The presenter's own photos are not credited (``logins``: own_logins()).
+    own = is_own(obs, project, logins)
+    add("observer", observer_enabled(project) and not own, ov.observer, f"Photo: {name}" if name else "", False, DETAIL_PT)
     return lines
 
 
@@ -135,6 +138,7 @@ def build_slide_plan(project: Project, workspace_obs: dict[int, dict], max_image
     """The exact slide sequence, plus warnings and counts."""
     settings = project.settings
     states = {s.id: s for s in project.observations}
+    logins = own_logins(project)
     slides: list[dict] = []
     warnings: list[str] = []
 
@@ -204,7 +208,7 @@ def build_slide_plan(project: Project, workspace_obs: dict[int, dict], max_image
                     "italic": grouping == "genus" and label != "Unclassified",
                 })
                 divider_count += 1
-        lines = annotation_lines(obs, st, project)
+        lines = annotation_lines(obs, st, project, logins)
         observations_used += 1
         for p in photos:
             rotation = st.rotations.get(p["id"], 0)

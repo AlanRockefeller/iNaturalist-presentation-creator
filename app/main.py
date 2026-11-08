@@ -241,6 +241,7 @@ def create_app(settings: Settings | None = None, services: Services | None = Non
                 "max_observations": settings.max_observations_per_project,
                 "max_observations_per_source": settings.max_observations_per_source,
                 "max_image_slides": settings.max_image_slides,
+                "max_related_taxa": settings.max_related_taxa,
             },
         })
 
@@ -302,9 +303,11 @@ def create_app(settings: Settings | None = None, services: Services | None = Non
     def start_load(body: LoadRequest, request: Request):
         project = checked(body.project)
         annotate(sources=sum(1 for s in project.sources if s.enabled), observations=len(project.observations),
-                 refresh=body.refresh_source_ids if body.workspace_id else None)
+                 refresh=body.refresh_source_ids if body.workspace_id else None,
+                 related_taxa=len(body.related_taxa) if body.related_taxa is not None else None)
         try:
-            job = svc.jobs.start_load(client_key(request), project, body.workspace_id, body.refresh_source_ids)
+            job = svc.jobs.start_load(client_key(request), project, body.workspace_id, body.refresh_source_ids,
+                                      body.related_taxa)
         except JobRejected as exc:
             raise HTTPException(429, str(exc)) from None
         annotate(job_id=job.id)
@@ -387,7 +390,8 @@ def create_app(settings: Settings | None = None, services: Services | None = Non
                 selected[int(k)] = [int(p) for p in v][:200]
         try:
             project = add_observations(project, observation_ids, ws["observations"], membership,
-                                       selected, body.placement, ws, settings.max_observations_per_project)
+                                       selected, body.placement, ws, settings.max_observations_per_project,
+                                       after_id=body.after_id)
         except ProjectError as exc:
             raise HTTPException(422, str(exc)) from None
         if body.ignore_ids:

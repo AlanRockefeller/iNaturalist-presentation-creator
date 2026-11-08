@@ -14,7 +14,7 @@ from typing import Annotated, Literal, Optional
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator
 
 PROJECT_FORMAT = "dikarya-presentation"
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 PROJECT_EXTENSION = ".dikarya-presentation.json"
 
 SortKey = Literal["taxonomic", "favorites", "observed_on", "created_at", "name", "original", "random", "custom"]
@@ -22,6 +22,12 @@ Grouping = Literal["none", "kingdom", "phylum", "class", "order", "family", "gen
 SOURCE_ID_PATTERN = r"^[A-Za-z0-9_-]{1,40}$"
 Rotation = Literal[0, 90, 180, 270]
 LineField = Literal["scientific", "common_name", "date", "location", "observer"]
+# Photo licenses as iNaturalist names them; "arr" is "all rights reserved"
+# (a photo with no license).
+LicenseCode = Literal["cc0", "cc-by", "cc-by-sa", "cc-by-nd", "cc-by-nc", "cc-by-nc-sa", "cc-by-nc-nd", "arr"]
+DEFAULT_LICENSES = ["cc0", "cc-by", "cc-by-sa", "cc-by-nd"]  # allow commercial use
+LOGIN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\-]{0,39}$")
+MAX_RELATED_TAXA = 1000  # species remembered per "more photos" source
 
 _LIMITS = {"sources": 20, "observations": 10_000, "photos": 200, "ignored": 50_000}
 MAX_PHOTOS = _LIMITS["photos"]    # photos remembered per observation
@@ -56,17 +62,35 @@ class _Model(BaseModel):
     model_config = ConfigDict(extra="ignore", str_strip_whitespace=False)
 
 
+class RelatedSource(_Model):
+    """A "more photos of these species" source: which photos, and the species
+    searched so far. How to search (licenses, how many) is in
+    PresentationSettings.related, so changing it affects the next search."""
+
+    whose: Literal["mine", "others"]
+    taxon_ids: list[Annotated[int, Field(gt=0)]] = Field(default_factory=list, max_length=MAX_RELATED_TAXA)
+
+    @field_validator("taxon_ids")
+    @classmethod
+    def _once(cls, v):
+        return list(dict.fromkeys(v))
+
+
 class Source(_Model):
     id: str = Field(pattern=SOURCE_ID_PATTERN)
     # "username": the presenter's own photos (photo credits start off).
     # "url": may include other people's photos (credits start on).
     # Since schema 5 this is the user's choice and is kept as saved.
-    type: Literal["username", "url"]
+    # "related" (schema 6): more photos of species already in the project,
+    # searched only when the user asks (see app/related.py).
+    type: Literal["username", "url", "related"]
     input: Encodable = Field(default="", max_length=2000)
     username: Optional[str] = Field(default=None, max_length=40)
-    url: Encodable = Field(max_length=2500)
+    # A related source's link lists its species, so it can be longer.
+    url: Encodable = Field(max_length=12_000)
     label: Text = Field(default="", max_length=120)
     enabled: bool = True
+    related: Optional[RelatedSource] = None
 
 
 class AnnotationSettings(_Model):
@@ -93,6 +117,44 @@ class TitlePhoto(_Model):
     position: Literal["center", "top", "bottom"] = "center"
 
 
+class RelatedMine(_Model):
+    per_taxon: int = Field(default=20, ge=1, le=200)
+    min_faves: int = Field(default=0, ge=0, le=1_000_000)
+
+
+class RelatedOthers(_Model):
+    licenses: list[LicenseCode] = Field(default_factory=lambda: list(DEFAULT_LICENSES), min_length=1, max_length=8)
+    per_taxon: int = Field(default=5, ge=1, le=200)
+    min_faves: int = Field(default=1, ge=0, le=1_000_000)
+    research_only: bool = True
+
+    @field_validator("licenses")
+    @classmethod
+    def _once(cls, v):
+        return list(dict.fromkeys(v))
+
+
+class RelatedSettings(_Model):
+    """How "More of mine" / "More from others" search (set in the More photos
+    dialog on Select & Organize)."""
+
+    # The presenter's iNaturalist login: needed for "mine", left out of
+    # "others", and never credited on slides. "" = not given.
+    username: str = Field(default="", max_length=40)
+    # Show the two buttons on each observation card.
+    buttons: bool = False
+    mine: RelatedMine = Field(default_factory=RelatedMine)
+    others: RelatedOthers = Field(default_factory=RelatedOthers)
+
+    @field_validator("username", mode="before")
+    @classmethod
+    def _login(cls, v):
+        v = (v or "").strip().lstrip("@") if isinstance(v, str) else v
+        if isinstance(v, str) and v and (not LOGIN_RE.match(v) or v.isdigit()):
+            raise ValueError("not a valid iNaturalist username")
+        return v
+
+
 class PresentationSettings(_Model):
     title: Text = Field(default="", max_length=200)
     presenter: Text = Field(default="", max_length=200)
@@ -104,6 +166,7 @@ class PresentationSettings(_Model):
     min_faves: int = Field(default=0, ge=0, le=1_000_000)
     annotations: AnnotationSettings = Field(default_factory=AnnotationSettings)
     speaker_notes: bool = True
+    related: RelatedSettings = Field(default_factory=RelatedSettings)
 
 
 class AnnotationOverrides(_Model):
@@ -166,6 +229,9 @@ class LoadRequest(_Model):
     workspace_id: Optional[str] = Field(default=None, max_length=64)
     # Only re-query these sources (e.g. one just added); None = all enabled sources.
     refresh_source_ids: Optional[list[str]] = Field(default=None, max_length=_LIMITS["sources"])
+    # "More photos" sources in refresh_source_ids search only these species this
+    # time (one card's button, or the species listed); None = all of theirs.
+    related_taxa: Optional[list[Annotated[int, Field(gt=0)]]] = Field(default=None, max_length=MAX_RELATED_TAXA)
 
 
 class ProjectRequest(_Model):
@@ -183,5 +249,7 @@ class AddObservationsRequest(ProjectRequest):
     observation_ids: list[int] = Field(max_length=_LIMITS["observations"])
     # Per-observation photo choice from the review dialog; missing = first photo only.
     selected_photo_ids: dict[str, list[int]] = Field(default_factory=dict, max_length=_LIMITS["observations"])
-    placement: Literal["sorted", "append"] = "sorted"
+    # "after": right after after_id (the card whose "More photos" button was used).
+    placement: Literal["sorted", "append", "after"] = "sorted"
+    after_id: Optional[int] = Field(default=None, gt=0)
     ignore_ids: list[int] = Field(default_factory=list, max_length=_LIMITS["observations"])

@@ -9,7 +9,7 @@
   <link rel="stylesheet" href="/static/css/app.css?v={{ version }}">
   <script src="/static/js/theme.js?v={{ version }}"></script>
 </head>
-<body data-max-sources="{{ limits.max_sources }}" data-max-observations="{{ limits.max_observations }}" data-max-image-slides="{{ limits.max_image_slides }}">
+<body data-max-sources="{{ limits.max_sources }}" data-max-observations="{{ limits.max_observations }}" data-max-image-slides="{{ limits.max_image_slides }}" data-max-related-taxa="{{ limits.max_related_taxa }}">
 
 <nav class="topnav">
   <div class="topnav-inner">
@@ -139,6 +139,10 @@
           <button type="button" class="btn btn-small" id="btn-select-none" title="Deselect every photo of the observations shown">Select none</button>
         </div>
       </div>
+      <div class="tool">
+        <label>&nbsp;</label>
+        <button type="button" class="btn btn-small btn-gold" id="btn-related" title="Pull in more photos of the species in this project: your own from anywhere, or other people's">More photos…</button>
+      </div>
     </div>
     <div class="statusline">
       <span id="org-stats"></span>
@@ -196,7 +200,7 @@
           <label class="check"><input type="checkbox" id="ann-common"> English common name</label>
           <label class="check"><input type="checkbox" id="ann-date"> Observation date</label>
           <label class="check"><input type="checkbox" id="ann-location"> Location (iNaturalist place description)</label>
-          <label class="check"><input type="checkbox" id="ann-observer"> Observer credit <span class="muted small" id="observer-note"></span></label>
+          <label class="check"><input type="checkbox" id="ann-observer"> Observer credit on other people's photos <span class="muted small" id="observer-note"></span></label>
         </div>
         <div class="field">
           <span>Groups</span>
@@ -293,6 +297,64 @@
       <button type="button" class="btn" id="btn-review-add-selected" hidden>Add selected</button>
       <button type="button" class="btn btn-primary" id="btn-review-add-all" hidden>Add all</button>
       <button type="button" class="btn btn-primary" id="btn-review-close" data-close>Continue</button>
+    </div>
+  </div>
+</div>
+
+<!-- More photos of the same species -->
+<div class="modal" id="related-modal" hidden>
+  <div class="modal-box medium" role="dialog" aria-modal="true" aria-labelledby="related-title">
+    <div class="modal-head">
+      <h2 id="related-title">More photos of the same species</h2>
+      <button type="button" class="icon-btn close" data-close aria-label="Close">×</button>
+    </div>
+    <div class="related-body">
+      <p class="muted small">Pull in more observations of species already in this project: your own from anywhere, or other people's. Set how it works here once; then use <strong>More of mine</strong> or <strong>More from others</strong> on any observation. New observations are offered for review and are not added until you choose.</p>
+      <label class="field">Your iNaturalist username
+        <input type="text" id="rel-username" maxlength="40" placeholder="your_username" autocapitalize="off" spellcheck="false">
+      </label>
+      <p class="muted small">Needed for your own photos. Your observations are left out of other people's, and your photos never get the observer credit.</p>
+      <fieldset class="rel-group">
+        <legend>My photos</legend>
+        <div class="rel-row">
+          <label class="small">Up to <input type="number" id="rel-mine-n" min="1" max="200" step="1"> per species</label>
+          <label class="small">Minimum favorites <input type="number" id="rel-mine-faves" min="0" max="1000000" step="1"></label>
+        </div>
+      </fieldset>
+      <fieldset class="rel-group">
+        <legend>Other people's photos</legend>
+        <div class="rel-licenses" id="rel-licenses" role="group" aria-label="Photo licenses">
+          <label class="check small"><input type="checkbox" value="cc0"> CC0</label>
+          <label class="check small"><input type="checkbox" value="cc-by"> CC BY</label>
+          <label class="check small"><input type="checkbox" value="cc-by-sa"> CC BY-SA</label>
+          <label class="check small"><input type="checkbox" value="cc-by-nd"> CC BY-ND</label>
+          <label class="check small"><input type="checkbox" value="cc-by-nc"> CC BY-NC</label>
+          <label class="check small"><input type="checkbox" value="cc-by-nc-sa"> CC BY-NC-SA</label>
+          <label class="check small"><input type="checkbox" value="cc-by-nc-nd"> CC BY-NC-ND</label>
+          <label class="check small"><input type="checkbox" value="arr"> All rights reserved</label>
+        </div>
+        <p class="muted small">CC0, CC BY, CC BY-SA and CC BY-ND allow commercial use. The most favorited come first.</p>
+        <div class="rel-row">
+          <label class="small">Up to <input type="number" id="rel-others-n" min="1" max="200" step="1"> per species</label>
+          <label class="small">Minimum favorites <input type="number" id="rel-others-faves" min="0" max="1000000" step="1"></label>
+          <label class="check small"><input type="checkbox" id="rel-research"> Research grade only</label>
+        </div>
+      </fieldset>
+      <label class="check"><input type="checkbox" id="rel-buttons"> Show <strong>More of mine</strong> and <strong>More from others</strong> on each observation</label>
+      <div class="rel-all">
+        <h3>Search every species listed now</h3>
+        <p class="small" id="rel-species-note"></p>
+        <div class="row-start">
+          <button type="button" class="btn btn-small" id="btn-rel-all-mine">My photos</button>
+          <button type="button" class="btn btn-small" id="btn-rel-all-others">Other people's photos</button>
+        </div>
+      </div>
+      <p class="form-error" id="rel-error" role="alert"></p>
+    </div>
+    <div class="modal-foot">
+      <span class="grow"></span>
+      <button type="button" class="btn" data-close>Cancel</button>
+      <button type="button" class="btn btn-primary" id="btn-rel-save">Save</button>
     </div>
   </div>
 </div>

@@ -16,6 +16,7 @@ from .inaturalist import SourceError, build_source, parse_source_input, single_u
 from .models import (
     MAX_IGNORED, MAX_PHOTOS, PROJECT_FORMAT, SCHEMA_VERSION, ObservationState, Project, Source,
 )
+from .related import photo_allowed, related_fields
 
 
 class ProjectError(ValueError):
@@ -49,6 +50,10 @@ def _migrate(data: dict) -> dict:
         # to one user's login counted as that user's own photos. Keep that.
         data["sources"] = [_typed_source(src) for src in data.get("sources") or []]
         data["schema_version"] = version = 5
+    if version == 5:
+        # v6 added "more photos" (related) sources and settings.related; a v5
+        # file simply has none, and the defaults fill in the settings.
+        data["schema_version"] = version = 6
     if version == SCHEMA_VERSION:
         return data
     raise ProjectError(f"Unsupported project schema version {version!r}.")
@@ -98,6 +103,14 @@ def normalize_project(project: Project) -> Project:
         if src.id in seen_ids:
             raise ProjectError("The project file contains duplicate source ids.")
         seen_ids.add(src.id)
+        if src.type == "related":
+            if src.related is None:
+                raise ProjectError(f"Source {src.label or src.id!r} is not valid: it has no species list.")
+            fields = related_fields(src, project.settings.related)
+            sources.append(src.model_copy(update={
+                "input": "", "username": None, "url": fields["url"], "label": src.label or fields["label"],
+            }))
+            continue
         try:
             if src.type == "username" and not src.username:
                 raise SourceError("a username source needs a username")
@@ -111,6 +124,7 @@ def normalize_project(project: Project) -> Project:
             "url": parsed["url"],
             "username": parsed["username"],
             "label": src.label or parsed["label"],
+            "related": None,
         }))
     source_ids = {s.id for s in sources}
 
@@ -180,14 +194,53 @@ def safe_filename(title: str, suffix: str, default: str = "presentation") -> str
 
 def observer_default(project: Project) -> bool:
     """Username-only projects are probably the presenter's own photos: no credit
-    line by default. Any URL source may contain other people's photos: credit on."""
+    line by default. Any URL source may contain other people's photos: credit on,
+    as does a "more photos from others" source."""
     active = [s for s in project.sources if s.enabled] or project.sources
-    return any(s.type == "url" for s in active)
+    return any(s.type == "url" or (s.type == "related" and s.related and s.related.whose == "others") for s in active)
 
 
 def observer_enabled(project: Project) -> bool:
     explicit = project.settings.annotations.observer
     return observer_default(project) if explicit is None else bool(explicit)
+
+
+def own_logins(project: Project) -> set[str]:
+    """Who the presenter is: the usernames of their own (Mine) sources and the
+    one given in More photos. Their photos are never credited. Mirrored by
+    ownLogins() in app.js."""
+    logins = {s.username.lower() for s in project.sources if s.type == "username" and s.username}
+    if project.settings.related.username:
+        logins.add(project.settings.related.username.lower())
+    return logins
+
+
+def is_own(obs: dict | None, project: Project, logins: set[str] | None = None) -> bool:
+    login = (((obs or {}).get("user") or {}).get("login") or "").lower()
+    return bool(login) and login in (own_logins(project) if logins is None else logins)
+
+
+# ---------------------------------------------------------------------------
+# Licenses of "more from others" photos
+# ---------------------------------------------------------------------------
+
+def allowed_licenses(project: Project, source_ids: list[str]) -> set[str] | None:
+    """The licenses an observation's photos are limited to: those chosen for
+    other people's photos, when that search is the only source that found it.
+    None = any. Mirrored by allowedLicenses() in app.js."""
+    others = {s.id for s in project.sources if s.type == "related" and s.related and s.related.whose == "others"}
+    if source_ids and all(sid in others for sid in source_ids):
+        return set(project.settings.related.others.licenses)
+    return None
+
+
+def default_photo_ids(obs: dict, allowed: set[str] | None) -> list[int]:
+    """The photo selected when an observation is added: its first, or its first
+    with an allowed license. Mirrored by defaultPhotoIds() in app.js."""
+    for p in obs.get("photos", []):
+        if allowed is None or photo_allowed(p, allowed):
+            return [p["id"]]
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -328,8 +381,13 @@ def add_observations(
     placement: str = "sorted",
     workspace: dict | None = None,
     max_observations: int | None = None,
+    after_id: int | None = None,
 ) -> Project:
     """Add observations (first photo selected unless ``selected`` says otherwise).
+
+    ``placement``: "sorted" (where the automatic sort puts them), "append", or
+    "after" (right after ``after_id``, in the order given; this is a hand-made
+    order, so the sort becomes "custom").
 
     Raises ProjectError if the project would hold more than ``max_observations``,
     so it never grows past what a project file may contain.
@@ -355,7 +413,10 @@ def add_observations(
         photo_ids = [p["id"] for p in obs.get("photos", [])]
         chosen = selected.get(oid)
         available = set(photo_ids)
-        chosen = photo_ids[:1] if chosen is None else [p for p in chosen if p in available]
+        if chosen is None:
+            chosen = default_photo_ids(obs, allowed_licenses(project, list(membership.get(oid, []))))
+        else:
+            chosen = [p for p in chosen if p in available]
         new_states.append(ObservationState(
             id=oid,
             selected_photo_ids=chosen,
@@ -368,13 +429,23 @@ def add_observations(
         return project
     project = project.model_copy(update={"observations": project.observations + new_states})
     new_ids = [s.id for s in new_states]
-    if placement == "append":
+    settings = project.settings
+    if placement == "after" and after_id in project.order:
+        at = project.order.index(after_id) + 1
+        order = project.order[:at] + new_ids + project.order[at:]
+        sort = settings.sort
+        if sort.key != "custom":  # like markCustomOrder() in app.js
+            update = {"key": "custom"}
+            if sort.key != "random":
+                update.update(base_key=sort.key, base_direction=sort.direction)
+            settings = settings.model_copy(update={"sort": sort.model_copy(update=update)})
+    elif placement == "append":
         order = project.order + new_ids
     else:
         order = insert_sorted(project.order, new_ids, observations, project, workspace)
     added = set(new_ids)
     ignored = [i for i in project.ignored_observation_ids if i not in added]
-    return project.model_copy(update={"order": order, "ignored_observation_ids": ignored})
+    return project.model_copy(update={"order": order, "ignored_observation_ids": ignored, "settings": settings})
 
 
 def ignore_observations(project: Project, ids: list[int]) -> Project:

@@ -714,6 +714,18 @@ class INatClient:
             ordered.append(r)
         return ordered, total
 
+    def search_page(self, params: dict[str, str], page: int, per_page: int = PER_PAGE) -> tuple[list[dict], int]:
+        """One page of a search: (results, total_results). Callers page on
+        their own (see related.py); never past iNaturalist's 10,000 results."""
+        per_page = max(1, min(PER_PAGE, int(per_page)))
+        if page < 1 or page * per_page > 10_000:
+            raise INatError("That search goes past the 10,000 results iNaturalist allows.")
+        query = api_search_params(params)
+        query["per_page"] = str(per_page)
+        query["page"] = str(page)
+        data = self._get("/v2/observations", query)
+        return list(data.get("results") or []), int(data.get("total_results") or 0)
+
     def fetch_by_ids(self, ids: Iterable[int], progress: ProgressFn | None = None) -> list[dict]:
         """Observations by id, batched; ids that no longer exist are absent."""
         ids = sorted({int(i) for i in ids})

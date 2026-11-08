@@ -70,6 +70,9 @@ class Settings:
     max_observations_per_project: int = field(default_factory=lambda: _env_int("PRESENTATIONS_MAX_OBSERVATIONS", 10_000))
     max_photos_per_observation: int = 200  # at most models.MAX_PHOTOS
     max_image_slides: int = field(default_factory=lambda: _env_int("PRESENTATIONS_MAX_IMAGE_SLIDES", 2000))
+    # Species in one "more photos" search (other people's photos cost about one
+    # request per species). At most models.MAX_RELATED_TAXA.
+    max_related_taxa: int = field(default_factory=lambda: _env_int("PRESENTATIONS_MAX_RELATED_TAXA", 500))
     max_body_bytes: int = 8 * MIB
 
     # Jobs.

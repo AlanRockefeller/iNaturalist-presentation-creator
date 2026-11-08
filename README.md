@@ -19,6 +19,7 @@ small JSON project file; the server holds only short-lived temporary data.
 - [Architecture](#architecture)
 - [iNaturalist API limits](#inaturalist-api-limits)
 - [Sources, merging and de-duplication](#sources-merging-and-de-duplication)
+- [More photos of the same species](#more-photos-of-the-same-species)
 - [Project files](#project-files)
 - [How refresh works](#how-refresh-works)
 - [PowerPoint generation rules](#powerpoint-generation-rules)
@@ -45,7 +46,10 @@ small JSON project file; the server holds only short-lived temporary data.
    iNaturalist order, random), group (kingdom … genus, or source), filter by minimum
    favorites, drag to reorder, edit the name or any annotation line. Click a photo
    to inspect it at 1024 px, zooming to the full-resolution original only when
-   needed.
+   needed. **More photos…** pulls in more observations of a species already in
+   the project: your own from anywhere (**More of mine** on a card) or other
+   people's under the licenses you choose (**More from others**), most
+   favorited first.
 3. **Presentation settings**: title, presenter, optional title background photo
    (any loaded photo), black or white background, annotation lines, divider slides,
    speaker notes.
@@ -66,6 +70,7 @@ browser (vanilla JS, no framework)          FastAPI (single Uvicorn worker)
                                                      ├─ presentation.py slide plan + python-pptx writer
                                                      ├─ images.py       trusted downloads, cache, Pillow prep
                                                      ├─ workspace.py    temp store of fetched metadata
+                                                     ├─ related.py      "more photos" searches of a project's species
                                                      ├─ jobs.py         background load/generate jobs
                                                      ├─ ratelimit.py    1 req/s limiter, daily/hourly budgets
                                                      └─ diagnostics.py  request and job logging
@@ -81,6 +86,7 @@ browser (vanilla JS, no framework)          FastAPI (single Uvicorn worker)
 | `app/presentation.py` | `build_slide_plan()` (used by both Preview and Generate, so they always match) and the PPTX writer. |
 | `app/images.py` | Downloads originals from allowlisted hosts with size caps and a byte budget, a 2-hour cache, EXIF/format fixes, title-photo treatment. |
 | `app/workspace.py` | Gzipped JSON of the metadata the last load fetched, keyed by an unguessable id, expiring after 24 h. |
+| `app/related.py` | "More photos of the same species": search parameters, licenses, and the request plan (top N per species, most favorited first). |
 | `app/jobs.py` | Thread-pool jobs with progress, cancellation, timeouts, per-client and global limits, cleanup. |
 | `app/diagnostics.py` | Request IDs, one log line per request and per job, client addresses (IPv6 grouped by /64). |
 
@@ -111,6 +117,11 @@ Implemented as recommended in iNaturalist's
   on disk for 30 days.
 - **No bulk paging**: a source matching more than 10,000 observations is refused
   after a single request, asking the user to add filters.
+- **More photos** searches cost at most one request per species plus one per
+  100 species, are checked against what is left of the day's budgets before
+  they start, and run only when the user asks (never on a refresh). A
+  one-species request asks for just the N it keeps (`per_page=N`) instead of 200:
+  it is one page either way, and fewer bytes for iNaturalist.
 - **429/5xx** are retried with backoff that respects `Retry-After`, slowing the
   shared limiter for everyone.
 - **Media**: thumbnails and the zoom viewer load directly from iNaturalist in the
@@ -159,6 +170,47 @@ The add-source form has two fields: an **observations URL** (required) and an
 - Adding a source to a loaded project queries only that source. Its new
   observations go to the review dialog.
 
+## More photos of the same species
+
+On Select & Organize, **More photos…** opens one dialog where the user sets how
+"more photos" searches work, and can search every species listed at once. With
+**Show More of mine and More from others on each observation** ticked, each
+card gets those two buttons, which search that observation's species with the
+saved settings, so they ask nothing.
+
+- **Your iNaturalist username**: needed for your own photos. Your observations
+  are left out of other people's (`not_user_id`), and your photos never get the
+  observer credit.
+- **My photos**: your observations of the species from anywhere, up to N per
+  species (default 20), with an optional minimum of favorites.
+- **Other people's photos**: limited to the ticked photo licenses (default CC0,
+  CC BY, CC BY-SA and CC BY-ND, which allow commercial use), up to N per species
+  (default 5), at least N favorites (default 1), research grade only (default).
+  "All rights reserved" cannot be asked of the API, so with it and only some
+  other licenses ticked the licenses are checked on the server instead.
+- Results are sorted by favorites (`order_by=votes`), and each species keeps its
+  own top N, so popular species do not crowd out rare ones. A variety counts
+  under the species that was searched.
+- Only observations identified to species or finer (`rank_level` 10 or lower)
+  can be searched; the dialog says how many listed are skipped. One search
+  covers at most 500 species (`PRESENTATIONS_MAX_RELATED_TAXA`).
+- New observations open in a short review dialog ("More photos of *X*"), with
+  **right after this observation** as the default placement (the order then
+  counts as hand-made). Nothing is added until the user chooses. In "others"
+  results, a photo outside the chosen licenses is dimmed, marked "Other license"
+  and not ticked by default; the first allowed photo is.
+- Behind the scenes a project has at most two `related` sources, "More of my
+  photos" and "Other people's photos". Each lists the species searched so far
+  (up to 1,000); the search settings live in `settings.related`, so a change
+  applies to the next search. On Sources they show a **More photos** badge, the
+  species count and **Search again** (all of their species, with the current
+  settings, after a confirm showing the cost). They can be relabeled, disabled
+  or removed like any source.
+- They are **searched only when asked**. An ordinary refresh (or opening the
+  file) refreshes their observations by id, which is cheap, and never repeats
+  the per-species searches. Their membership only grows: searching one species
+  never takes the source away from observations it found earlier.
+
 ## Project files
 
 Saved as `<title>.dikarya-presentation.json`, typically a few kB to a few hundred
@@ -167,7 +219,7 @@ kB. Photos and full iNaturalist metadata are **not** embedded.
 ```json
 {
   "format": "dikarya-presentation",
-  "schema_version": 5,
+  "schema_version": 6,
   "saved_at": "2026-10-06T03:40:00Z",
   "app_version": "1.0.0",
   "sources": [
@@ -179,7 +231,11 @@ kB. Photos and full iNaturalist metadata are **not** embedded.
      "input": "https://www.inaturalist.org/observations?place_id=6924&taxon_id=47170",
      "username": null,
      "url": "https://www.inaturalist.org/observations?place_id=6924&taxon_id=47170",
-     "label": "Costa Rica", "enabled": true}
+     "label": "Costa Rica", "enabled": true},
+    {"id": "s9a8b7c6d5e4", "type": "related", "input": "", "username": null,
+     "url": "https://www.inaturalist.org/observations?not_user_id=alan_rockefeller&order=desc&order_by=votes&photo_license=cc0,cc-by,cc-by-sa,cc-by-nd&popular=true&quality_grade=research&taxon_id=47692,118289",
+     "label": "Other people's photos", "enabled": true,
+     "related": {"whose": "others", "taxon_ids": [47692, 118289]}}
   ],
   "settings": {
     "title": "Fungi of Costa Rica", "presenter": "Alan Rockefeller",
@@ -189,7 +245,11 @@ kB. Photos and full iNaturalist metadata are **not** embedded.
     "grouping": "family", "dividers": true, "min_faves": 0,
     "annotations": {"scientific": true, "common_name": false, "date": false,
                     "location": false, "observer": null},
-    "speaker_notes": true
+    "speaker_notes": true,
+    "related": {"username": "alan_rockefeller", "buttons": true,
+                "mine": {"per_taxon": 20, "min_faves": 0},
+                "others": {"licenses": ["cc0", "cc-by", "cc-by-sa", "cc-by-nd"],
+                           "per_taxon": 5, "min_faves": 1, "research_only": true}}
   },
   "observations": [
     {"id": 123, "selected_photo_ids": [456, 457], "known_photo_ids": [456, 457, 458],
@@ -208,7 +268,13 @@ kB. Photos and full iNaturalist metadata are **not** embedded.
   fills them back in. Settings and sources are always written in full.
 - `type` of a source: `username` (Mine: the presenter's own photos) or `url`
   (Search). Since schema 5 it is kept as saved; before, every load re-derived
-  it from the URL, and loading an older file still does that once.
+  it from the URL, and loading an older file still does that once. Schema 6
+  added `related` sources (see [More photos](#more-photos-of-the-same-species)):
+  `related.whose` (`mine` | `others`) and the `taxon_ids` searched; their `url`
+  and `username` are rebuilt from those and `settings.related` on load.
+- `settings.related`: the More photos settings. `username` is the presenter's
+  iNaturalist login (`""` = not given); `buttons` shows the two buttons on each
+  card. Added in schema 6; an older file loads with the defaults.
 - `overrides`: `null` (or left out) means "use the live iNaturalist value"; a
   string replaces it on the slide; `""` hides that line for this observation.
 - `annotations.observer: null` means automatic (see below); `true`/`false` is the
@@ -232,7 +298,7 @@ kB. Photos and full iNaturalist metadata are **not** embedded.
   parser as new input are all rejected with a readable message. Unknown keys are
   ignored. Inconsistent `order`/duplicate observations are normalized.
 - **Schema versions**: `_migrate()` in `app/project.py` upgrades older files one
-  version at a time (currently 1 to 5). Bump `SCHEMA_VERSION` in `app/models.py`
+  version at a time (currently 1 to 6). Bump `SCHEMA_VERSION` in `app/models.py`
   and add a step there when the format or its meaning changes.
 - **Limits that keep a file loadable**: at most 200 photos are remembered per
   observation (iNaturalist photos past that are not offered) and the newest
@@ -243,7 +309,8 @@ kB. Photos and full iNaturalist metadata are **not** embedded.
 Opening a project file (or pressing *Refresh from iNaturalist*):
 
 1. The file is validated on the server.
-2. Every enabled source's saved URL is searched again.
+2. Every enabled source's saved URL is searched again, except More photos
+   (`related`) sources, which are searched only when the user asks.
 3. Saved observations that no source returned are looked up by id (batched), so
    they are refreshed even if they no longer match a search.
 4. `refresh_project()` compares live data with the project:
@@ -291,9 +358,13 @@ first photo of each selected, in default taxonomic order.
   identified only as **Life** gets no taxon annotation. A "Provisional Species
   Name" observation field is offered as a one-click override.
 - **Observer default**: if every enabled source was added with the presenter's
-  username, the observer line defaults **off**. If any source has no username, it
-  defaults **on**, since that search may include other people's photos. An
-  explicit choice is saved and always wins.
+  username, the observer line defaults **off**. If any source has no username
+  (or is a "more from others" search), it defaults **on**, since it may include
+  other people's photos. An explicit choice is saved and always wins.
+- **The presenter's own photos are never credited**, whatever the setting. "The
+  presenter" is every Mine source's username plus the username in More photos;
+  with none given, every photo is credited. Showing the observer line in one
+  observation's Slide text still credits it.
 - **Favorite counts never appear in the deck**, including the notes.
 - **Title slide**: title (54 pt bold; 44 pt over 70 characters, 36 pt over 120,
   so long titles stay on the slide) and presenter (28 pt) centred with a gold

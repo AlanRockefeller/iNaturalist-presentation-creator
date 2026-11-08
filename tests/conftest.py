@@ -53,26 +53,42 @@ def ancestors(tid: int) -> list[int]:
     return list(reversed(chain))
 
 
+RANK_LEVELS = {"kingdom": 70, "phylum": 60, "class": 50, "order": 40, "family": 30, "genus": 20,
+               "section": 13, "species": 10, "variety": 5, "subspecies": 5}
+
+
+def _attribution(user, code):
+    """Like iNaturalist's: "(c) alice, some rights reserved (CC BY-NC)"."""
+    if code is None:
+        return f"(c) {user}, all rights reserved"
+    if code == "cc0":
+        return f"{user}, no rights reserved (CC0)"
+    return f"(c) {user}, some rights reserved (CC {code[3:].upper()})"
+
+
 def make_obs(oid, taxon_id, user="alice", faves=0, observed_on="2026-10-01", photos=((1, 1600, 1200),),
-             created_at=None, place="Point Reyes, CA, US", name=None, ofvs=None, place_id=1):
+             created_at=None, place="Point Reyes, CA, US", name=None, ofvs=None, place_id=1,
+             license="cc-by", licenses=None, quality="research"):
+    """``licenses``: one license code (None = all rights reserved) per photo;
+    otherwise every photo has ``license``."""
     taxon = None
     if taxon_id is not None:
         tname, rank, _ = TAXA[taxon_id]
         taxon = {
-            "id": taxon_id, "name": tname, "rank": rank, "rank_level": 10,
+            "id": taxon_id, "name": tname, "rank": rank, "rank_level": RANK_LEVELS.get(rank, 10),
             "preferred_common_name": COMMON.get(taxon_id), "ancestor_ids": ancestors(taxon_id),
         }
     return {
         "id": oid, "uuid": f"u-{oid}", "faves_count": faves, "observed_on": observed_on,
         "created_at": created_at or f"2026-10-{(oid % 28) + 1:02d}T10:00:00-07:00",
-        "place_guess": place, "quality_grade": "research", "obscured": False,
+        "place_guess": place, "quality_grade": quality, "obscured": False,
         "user": {"login": user, "name": name},
         "taxon": taxon,
         "photos": [
             {"id": pid, "url": f"https://{PHOTO_HOST}/photos/{pid}/square.jpg", "hidden": False,
-             "license_code": "cc-by", "attribution": f"(c) {user}, some rights reserved (CC BY)",
+             "license_code": code, "attribution": _attribution(user, code),
              "original_dimensions": {"width": w, "height": h}}
-            for pid, w, h in photos
+            for (pid, w, h), code in zip(photos, licenses if licenses is not None else [license] * len(photos))
         ],
         "ofvs": ofvs or [],
         "_place_id": place_id,
@@ -142,11 +158,22 @@ class FakeINat:
         res = list(self.observations)
         if "user_id" in q:
             res = [o for o in res if o["user"]["login"] == q["user_id"]]
+        if "not_user_id" in q:
+            res = [o for o in res if o["user"]["login"] != q["not_user_id"]]
+        if "quality_grade" in q:
+            res = [o for o in res if o["quality_grade"] in q["quality_grade"].split(",")]
+        if q.get("popular") == "true":
+            res = [o for o in res if o["faves_count"] > 0]
+        if "photo_license" in q:
+            allowed = set(q["photo_license"].split(","))
+            res = [o for o in res if any(p["license_code"] in allowed for p in o["photos"])]
         if "taxon_id" in q:
             want = {int(t) for t in q["taxon_id"].split(",")}
             res = [o for o in res if o["taxon"] and want & set(o["taxon"]["ancestor_ids"])]
         if "place_id" in q:
             res = [o for o in res if str(o["_place_id"]) == q["place_id"]]
+        if q.get("order_by") == "votes":  # favorites, most first (stable, like id order)
+            res.sort(key=lambda o: o["faves_count"], reverse=q.get("order") != "asc")
         page = int(q.get("page", 1))
         chunk = res[(page - 1) * per_page: page * per_page]
         return httpx.Response(200, json={
