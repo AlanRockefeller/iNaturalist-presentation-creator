@@ -264,3 +264,19 @@ def test_an_error_body_cut_at_the_capture_limit_still_logs_its_text(caplog):
     _asgi(RequestDiagnosticsMiddleware(big_error))
     line = _lines(caplog, "request.failed")[-1].message
     assert 'detail="{\\"detail\\": \\"xxx' in line
+
+
+def test_a_client_that_disconnects_is_not_a_server_crash(caplog):
+    from starlette.requests import ClientDisconnect
+
+    from app.diagnostics import RequestDiagnosticsMiddleware
+
+    async def gone(scope, receive, send):
+        raise ClientDisconnect()
+
+    caplog.set_level(logging.INFO)
+    _, exc = _asgi(RequestDiagnosticsMiddleware(gone), scope_path="/api/load")
+    assert isinstance(exc, ClientDisconnect)
+    line = _lines(caplog, "request")[-1]
+    assert "status=499" in line.message and "cancelled=true" in line.message
+    assert line.levelno == logging.INFO and line.exc_info is None

@@ -418,3 +418,26 @@ def test_search_again_looks_up_what_it_kept_but_no_longer_finds(app_client, fake
     assert any("4" in c.url.params.get("id", "").split(",") for c in calls)
     st4 = next(s for s in again["project"]["observations"] if s["id"] == 4)
     assert st4["status"] == "unavailable" and st4["source_ids"] == ["o"]
+
+
+
+# ---------------------------------------------------------------- review fixes
+def test_a_selected_photo_past_the_photo_limit_is_not_reported_deleted(app_client, fake, settings):
+    tc = app_client
+    fake.add(make_obs(1, 47692, user="alice", place_id=1, photos=((11, 9, 9), (12, 9, 9), (13, 9, 9))))
+    settings.max_photos_per_observation = 2
+    first = _load(tc, _new_project(tc, _source(tc, URL_A, "a")))
+    project = first["project"]
+    project["observations"][0]["selected_photo_ids"] = [13]
+    again = _load(tc, project)
+    assert again["summary"]["missing_photos"] == {}
+    assert 13 in [p["id"] for p in next(o for o in again["observations"] if o["id"] == 1)["photos"]]
+
+
+def test_an_older_project_sent_straight_to_load_is_migrated(app_client, fake):
+    tc = app_client
+    fake.add(make_obs(1, 47692, user="alice", place_id=1))
+    project = {"format": "dikarya-presentation", "schema_version": 4,
+               "sources": [{"id": "a", "type": "url", "url": "https://www.inaturalist.org/observations?user_id=alice"}]}
+    res = _load(tc, project)
+    assert res["project"]["sources"][0]["type"] == "username" and res["project"]["schema_version"] == 6

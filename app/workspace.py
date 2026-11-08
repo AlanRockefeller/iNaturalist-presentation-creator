@@ -21,6 +21,10 @@ import time
 from collections import OrderedDict
 from pathlib import Path
 
+from .diagnostics import get_logger
+
+log = get_logger(__name__)
+
 WORKSPACE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{20,64}$")
 
 
@@ -81,7 +85,6 @@ class WorkspaceStore:
     def get(self, wid: str) -> dict:
         """The workspace, if it was used within the TTL. Each use extends it."""
         path = self._path(wid)
-        now = time.time()
         with self._lock:
             ws = self._mem.get(wid)
             if ws is not None:
@@ -95,30 +98,41 @@ class WorkspaceStore:
                 raise WorkspaceExpired() from None
             ws["used"] = used
             self._remember(wid, ws)
-        if now - ws["used"] > self.ttl:
-            raise WorkspaceExpired()
-        try:
-            # The file's time is the last use, for restarts and for cleanup().
-            os.utime(path)
-        except FileNotFoundError:
-            # Its file is gone, so it could not outlive this process: treat it
-            # as expired rather than alive in memory only.
-            with self._lock:
+        # Checked and extended under the lock, which cleanup() also takes: two
+        # uses at once cannot put the time back, and cleanup cannot delete the
+        # file between this check and its new time.
+        with self._lock:
+            now = time.time()
+            if now - ws["used"] > self.ttl:
+                raise WorkspaceExpired()
+            try:
+                # The file's time is the last use, for restarts and for cleanup().
+                os.utime(path)
+            except FileNotFoundError:
+                # Its file is gone, so it could not outlive this process: treat
+                # it as expired rather than alive in memory only.
                 self._mem.pop(wid, None)
-            raise WorkspaceExpired() from None
-        except OSError:
-            return ws  # the use could not be recorded; leave both times as they were
-        ws["used"] = now
+                raise WorkspaceExpired() from None
+            except OSError as exc:
+                # Still in use: keep it alive in memory (cleanup() checks that
+                # too), and say so, since a restart would now lose it sooner.
+                log.warning("event=workspace.touch_failed error_type=%s", type(exc).__name__)
+            ws["used"] = max(ws["used"], now)
         return ws
 
     def cleanup(self) -> None:
         now = time.time()
         for p in self.directory.glob("*"):
-            try:
-                if now - p.stat().st_mtime > self.ttl:
+            with self._lock:  # see get()
+                try:
+                    if now - p.stat().st_mtime <= self.ttl:
+                        continue
+                    mem = self._mem.get(p.name.split(".", 1)[0])
+                    if mem is not None and now - mem["used"] <= self.ttl:
+                        continue  # in use, though its file's time could not be updated
                     p.unlink(missing_ok=True)
-            except OSError:
-                continue
+                except OSError:
+                    continue
         with self._lock:
             for wid in [w for w, ws in self._mem.items() if now - ws["used"] > self.ttl]:
                 self._mem.pop(wid, None)

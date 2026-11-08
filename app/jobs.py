@@ -448,6 +448,7 @@ class JobManager:
 
         raw_all: list[dict] = []
         related_found: list[int] = []
+        selected_photos = {pid for st in project.observations for pid in st.selected_photo_ids}
         recheck: set[int] = set()
         for n, src in enumerate(to_query, 1):
             if src.type == "related":
@@ -483,7 +484,7 @@ class JobManager:
 
         if raw_all:
             job.progress("taxa", 0, 0, "Looking up taxonomy")
-            observations.update(self.client.normalize_all(raw_all))
+            observations.update(self.client.normalize_all(raw_all, selected_photos))
         returned = {int(r["id"]) for r in raw_all if r.get("id")}
         for oid in recheck - returned:
             observations.pop(oid, None)  # cached metadata: refreshed by id below
@@ -502,7 +503,7 @@ class JobManager:
             job.progress("refresh", 0, len(missing), f"Refreshing {len(missing):,} saved observations")
             raws = self.client.fetch_by_ids(
                 missing, lambda d, t: job.progress("refresh", d, t, "Refreshing saved observations"))
-            observations.update(self.client.normalize_all(raws))
+            observations.update(self.client.normalize_all(raws, selected_photos))
 
         project, summary = refresh_project(project, observations, source_results)
         # What this load's "more photos" search found, so the browser can show

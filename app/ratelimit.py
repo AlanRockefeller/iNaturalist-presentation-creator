@@ -215,27 +215,46 @@ class ByteBudget:
         reserved, so a deck that downloads more than it estimated cannot use
         up another deck's share."""
         with self._lock:
+            hour, day = self._totals()
+            # Never past the real allowance, reserved or not: a download that
+            # overshot it must not let reserved downloads add to the overshoot.
+            self._refuse_if(1, self.hourly - hour, self.daily - day)
             if reservation is not None and reservation.left > 0:
                 return
             self._refuse_if(1, *self._unreserved())
 
     def _use(self, reservation: "Reservation", nbytes: int) -> None:
         with self._lock:  # downloads run in several threads
-            take = min(reservation.left, max(0, int(nbytes)))
-            reservation.left -= take
-            self._reserved = max(0, self._reserved - take)
+            self._use_locked(reservation, nbytes)
+
+    def _use_locked(self, reservation: "Reservation", nbytes: int) -> None:
+        take = min(reservation.left, max(0, int(nbytes)))
+        reservation.left -= take
+        self._reserved = max(0, self._reserved - take)
+
+    def record(self, nbytes: int, reservation: "Reservation | None" = None) -> None:
+        """Count downloaded bytes and take them from ``reservation`` in one step,
+        so another deck checking its allowance never sees them counted twice."""
+        with self._lock:
+            self._add_locked(nbytes)
+            if reservation is not None:
+                self._use_locked(reservation, nbytes)
 
     def add(self, nbytes: int) -> None:
         with self._lock:
-            minute = int(self._clock() // 60)
-            self._buckets[minute] = self._buckets.get(minute, 0) + int(nbytes)
-            now = time.monotonic()
-            if self.path and now - self._last_flush > 10:
-                self._last_flush = now
-                try:
-                    _atomic_write_json(self.path, self._buckets)
-                except OSError:
-                    pass
+            self._add_locked(nbytes)
+
+    def _add_locked(self, nbytes: int) -> None:
+        """The caller holds the lock."""
+        minute = int(self._clock() // 60)
+        self._buckets[minute] = self._buckets.get(minute, 0) + int(nbytes)
+        now = time.monotonic()
+        if self.path and now - self._last_flush > 10:
+            self._last_flush = now
+            try:
+                _atomic_write_json(self.path, self._buckets)
+            except OSError:
+                pass
 
     def flush(self) -> None:
         if not self.path:
