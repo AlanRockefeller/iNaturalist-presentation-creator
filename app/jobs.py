@@ -758,7 +758,11 @@ class JobManager:
         total = len(groups)
         notes: dict[str, dict] = {}
         failed: list[str] = []
+        unfunded = 0  # names left out because the daily allowance ran out
         stop = threading.Event()  # set when the job ends early, so running calls stop
+        # Set once the daily allowance is used up: later calls are not started,
+        # but calls already paid for finish and keep their notes.
+        budget_used_up = threading.Event()
 
         def publish() -> dict:
             # A new object each time: a poll may be serialising the last one.
@@ -767,13 +771,32 @@ class JobManager:
                 job.result = result
             return result
 
-        def write(batch: list[dict]) -> dict[str, str]:
+        def fund(n: int) -> int:
+            """How many of ``n`` names the daily allowance pays for (all or
+            what is left of it), counted against the allowance now."""
+            if budget_used_up.is_set():
+                return 0
+            take = min(n, self.notes_budget.remaining())
+            try:
+                if take:
+                    self.notes_budget.consume(take)
+            except BudgetExceeded:  # another call took the rest meanwhile
+                take = 0
+            if take < n:
+                budget_used_up.set()
+            return take
+
+        def write(batch: list[dict]) -> tuple[dict[str, str], int]:
+            """Claude's notes by key, and how many names of the batch were paid for."""
             if job.cancel_event.is_set() or stop.is_set():
                 raise JobCancelled()
-            self.notes_budget.consume(len(batch))
-            subjects = {f"n{i}": g["subject"] for i, g in enumerate(batch)}
+            funded = fund(len(batch))
+            if not funded:
+                return {}, 0
+            subjects = {f"n{i}": g["subject"] for i, g in enumerate(batch[:funded])}
             try:
-                return self.notes_writer.write_batch(subjects, lambda: job.cancel_event.is_set() or stop.is_set())
+                return self.notes_writer.write_batch(
+                    subjects, lambda: job.cancel_event.is_set() or stop.is_set()), funded
             except NotesCancelled:
                 raise JobCancelled() from None
 
@@ -789,14 +812,16 @@ class JobManager:
                     for fut in as_completed(futures):
                         batch = futures[fut]
                         try:
-                            written = fut.result()
+                            written, funded = fut.result()
                         except NotesError as exc:
                             if exc.fatal:
                                 raise
-                            written = {}
+                            written, funded = {}, len(batch)
                         for i, g in enumerate(batch):
                             text = written.get(f"n{i}")
-                            if text:
+                            if i >= funded:
+                                unfunded += 1
+                            elif text:
                                 for oid in g["ids"]:
                                     notes[str(oid)] = {"text": text, "name": g["subject"]["name"]}
                             else:
@@ -810,8 +835,11 @@ class JobManager:
                         f.cancel()
                     raise
         finally:
-            job.log_fields.update(written=len(notes), failed=len(failed))
+            job.log_fields.update(written=len(notes), failed=len(failed), unfunded=unfunded)
         if failed:
             shown = ", ".join(failed[:10]) + (", ..." if len(failed) > 10 else "")
             job.warnings.append(f"Claude could not write notes for {len(failed)} name(s): {shown}.")
+        if budget_used_up.is_set():
+            # What was written stays in job.result (see Job.public).
+            raise BudgetExceeded(self.notes_budget.message)
         return publish()

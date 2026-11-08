@@ -180,6 +180,37 @@ def test_daily_limit_keeps_what_was_written(notes_client, fake, settings):
     assert len({v["name"] for v in job["result"]["notes"].values()}) == 2
 
 
+def test_daily_limit_lets_a_paid_call_finish(notes_client, fake, notes_writer, settings):
+    """One call is paid for and still writing when the other finds the
+    allowance used up: the first one's notes are kept."""
+    tc = notes_client
+    result = _loaded(tc, fake)  # 4 names
+    settings.notes_batch_size = 2
+    settings.notes_concurrency = 2
+    tc.app.state.services.notes_budget.limit = 2
+    notes_writer.block = threading.Event()
+    r = tc.post("/api/notes", headers=CODE, json={"project": result["project"], "workspace_id": result["workspace_id"]})
+    job_id = r.json()["id"]
+    deadline = time.time() + 5
+    while tc.get(f"/api/jobs/{job_id}").json()["done"] < 2 and time.time() < deadline:
+        time.sleep(0.02)  # the unpaid batch has been counted while the paid one writes
+    assert len(notes_writer.calls) == 1
+    notes_writer.block.set()
+    job = wait_job(tc, job_id)
+    assert job["state"] == "error" and "daily allowance of presenter notes" in job["error"]
+    assert len({v["name"] for v in job["result"]["notes"].values()}) == 2
+    assert job["result"]["failed"] == []
+
+
+def test_daily_limit_pays_for_part_of_a_batch(notes_client, fake, notes_writer, settings):
+    tc = notes_client
+    result = _loaded(tc, fake)  # 4 names in one batch, 3 left in the allowance
+    tc.app.state.services.notes_budget.limit = 3
+    job = _notes(tc, result)
+    assert job["state"] == "error" and len(notes_writer.calls[0]) == 3
+    assert len({v["name"] for v in job["result"]["notes"].values()}) == 3
+
+
 def test_failed_names_are_reported_and_fatal_errors_stop(notes_client, fake, notes_writer):
     tc = notes_client
     result = _loaded(tc, fake)
