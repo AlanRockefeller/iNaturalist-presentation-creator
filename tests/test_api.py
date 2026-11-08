@@ -366,3 +366,55 @@ def test_more_photos_refuses_a_search_bigger_than_whats_left(app_client, fake, s
     done = _start_related(tc, project, first["workspace_id"], ["o"], taxa)
     assert done["state"] == "error" and "300 species" in done["error"]
     assert len(fake.api_calls()) == before  # refused before asking iNaturalist anything
+
+
+def _with_others_search(tc, fake):
+    """A loaded project of alice's (observation 1) whose "others" search found bob's observation 4."""
+    fake.add(
+        make_obs(1, 47692, user="alice", faves=2, place_id=1),
+        make_obs(4, 47692, user="bob", faves=3, place_id=3, photos=((41, 900, 600),)),
+    )
+    first = _load(tc, _new_project(tc, _source(tc, MINE_HERE, "a", "alice")))
+    project = first["project"]
+    project["settings"]["related"] = {"username": "alice"}
+    project["sources"].append(_related_source("o", "others", [47692]))
+    res = _related_load(tc, project, first["workspace_id"], ["o"], [47692])
+    assert res["summary"]["new_ids"] == [4]
+    return res
+
+
+def test_search_again_in_an_empty_project_still_offers_for_review(app_client, fake):
+    tc = app_client
+    res = _with_others_search(tc, fake)
+    project = res["project"]
+    project["observations"], project["order"] = [], []  # the user removed everything
+    again = _related_load(tc, project, res["workspace_id"], ["o"], None)
+    assert again["first_load"] is False and again["project"]["observations"] == []
+    assert again["summary"]["related_found"] == [4] and 4 in again["summary"]["new_ids"]
+
+
+def test_a_full_refresh_keeps_more_photos_waiting_for_review(app_client, fake):
+    tc = app_client
+    res = _with_others_search(tc, fake)  # "Decide later": 4 is not added
+    before = len(fake.api_calls("/v2/observations"))
+    refreshed = _load(tc, res["project"], res["workspace_id"], None)
+    calls = fake.api_calls("/v2/observations")[before:]
+    assert not any(c.url.params.get("order_by") == "votes" for c in calls)  # not searched again
+    assert refreshed["summary"]["new_ids"] == [4]
+    assert refreshed["summary"]["membership"]["4"] == ["o"]
+
+
+def test_search_again_looks_up_what_it_kept_but_no_longer_finds(app_client, fake):
+    tc = app_client
+    res = _with_others_search(tc, fake)
+    added = tc.post("/api/observations/add", json={
+        "project": res["project"], "workspace_id": res["workspace_id"], "observation_ids": [4],
+        "selected_photo_ids": {}, "placement": "append", "ignore_ids": [],
+    }).json()["project"]
+    fake.remove(4)  # deleted on iNaturalist
+    before = len(fake.api_calls("/v2/observations"))
+    again = _related_load(tc, added, res["workspace_id"], ["o"], None)
+    calls = fake.api_calls("/v2/observations")[before:]
+    assert any("4" in c.url.params.get("id", "").split(",") for c in calls)
+    st4 = next(s for s in again["project"]["observations"] if s["id"] == 4)
+    assert st4["status"] == "unavailable" and st4["source_ids"] == ["o"]

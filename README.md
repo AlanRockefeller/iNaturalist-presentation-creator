@@ -127,7 +127,8 @@ Implemented as recommended in iNaturalist's
 - **No bulk paging**: a source matching more than 10,000 observations is refused
   after a single request, asking the user to add filters.
 - **More photos** searches cost at most one request per species plus one per
-  100 species, are checked against what is left of the day's budgets before
+  100 species (three per species when licenses must be checked on the server,
+  see below), are checked against what is left of the day's budgets before
   they start, and run only when the user asks (never on a refresh). A
   one-species request asks for just the N it keeps (`per_page=N`) instead of 200:
   it is one page either way, and fewer bytes for iNaturalist.
@@ -196,7 +197,9 @@ saved settings, so they ask nothing.
   CC BY, CC BY-SA and CC BY-ND, which allow commercial use), up to N per species
   (default 5), at least N favorites (default 1), research grade only (default).
   "All rights reserved" cannot be asked of the API, so with it and only some
-  other licenses ticked the licenses are checked on the server instead.
+  other licenses ticked the licenses are checked on the server instead, looking
+  through up to three pages of 200 per species. Every login of yours (Mine
+  sources and this username) is left out.
 - Results are sorted by favorites (`order_by=votes`), and each species keeps its
   own top N, so popular species do not crowd out rare ones. A variety counts
   under the species that was searched.
@@ -217,8 +220,12 @@ saved settings, so they ask nothing.
   or removed like any source.
 - They are **searched only when asked**. An ordinary refresh (or opening the
   file) refreshes their observations by id, which is cheap, and never repeats
-  the per-species searches. Their membership only grows: searching one species
-  never takes the source away from observations it found earlier.
+  the per-species searches; what they found that still waits for review is
+  kept. Their membership only grows: searching one species never takes the
+  source away from observations it found earlier. **Search again** looks up by
+  id anything it kept but no longer finds, so a deleted one becomes unavailable.
+- What a search finds is always offered for review, even in a project with no
+  observations left (only an ordinary first load adds everything at once).
 
 ## Project files
 

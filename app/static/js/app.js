@@ -70,12 +70,17 @@
     return data;
   }
 
-  // Mirror of related.estimate_requests(): the most requests a search of n species can make.
-  function estimateRequests(count) {
+  // Mirror of related.estimate_requests() and pages_per_species(): the most
+  // requests a search of n species can make. With "All rights reserved" and
+  // only some other licenses ticked, licenses are checked on the server, which
+  // can take up to 3 pages per species.
+  function estimateRequests(count, whose = 'others') {
+    const lic = whose === 'others' ? relatedSettings().others.licenses : [];
+    const pages = lic.includes('arr') && lic.length < LICENSES.length ? 3 : 1;
     let total = 0;
     for (let start = 0; start < count; start += 100) {
       const size = Math.min(100, count - start);
-      total += 1 + (size > 1 ? size : 0);
+      total += size > 1 ? 1 + size * pages : pages;
     }
     return total;
   }
@@ -562,7 +567,7 @@
         type: 'button', class: 'btn btn-small', text: 'Search again', disabled: !species || !src.enabled,
         title: 'Search all of these species again with the current More photos settings',
         onclick: () => {
-          const need = estimateRequests(Math.min(species, LIMITS.relatedTaxa));
+          const need = estimateRequests(Math.min(species, LIMITS.relatedTaxa), src.related.whose);
           if (species > LIMITS.relatedTaxa) { toast(`One search can cover at most ${n(LIMITS.relatedTaxa)} species; this source has ${n(species)}.`, true, 9000); return; }
           if (!confirm(`Search ${plural(species, 'species', 'species')} again for ${what}? That is up to ${plural(need, 'request')} to iNaturalist (${duration(need)}). New observations are offered for review.`)) return;
           startLoad([src.id], null, { whose: src.related.whose, taxa: null, title: src.label || RELATED_LABEL[src.related.whose] });
@@ -690,13 +695,20 @@
   }
 
   // Dialogs: focus moves into one when it opens and back where it was when it
-  // closes. Closing the review dialog refreshes its "Review new" button.
+  // closes. While one is open the page behind it is inert, so Tab stays in the
+  // dialog. Closing the review dialog refreshes its "Review new" button.
   const modalReturn = new Map();
   const modalOnClose = new Map(); // dialog -> function called once when it closes
+  const PAGE_PARTS = '.topnav, .hero, .stepper-bar, main, .footer';
+  function syncInert() {
+    const open = $$('.modal').some((m) => !m.hidden);
+    $$(PAGE_PARTS).forEach((part) => { part.inert = open; });
+  }
   function openModal(m) {
     if (!m.hidden) return;
     modalReturn.set(m, document.activeElement);
     m.hidden = false;
+    syncInert();
     const box = $('.modal-box', m);
     box.setAttribute('tabindex', '-1');
     box.focus();
@@ -704,6 +716,7 @@
   function closeModal(m) {
     if (m.hidden) return;
     m.hidden = true;
+    syncInert();
     if (m.id === 'review-modal') updateStats();
     const onClose = modalOnClose.get(m);
     modalOnClose.delete(m);
@@ -723,9 +736,11 @@
     openModal(modal);
     loadCancelled = false;
     try {
+      // A full refresh (no ids) searches every source again; the workspace is
+      // still sent so "more photos" results waiting for review are kept.
       const body = {
         project: S.project,
-        workspace_id: refreshSourceIds ? S.workspaceId : null,
+        workspace_id: S.workspaceId,
         refresh_source_ids: refreshSourceIds,
       };
       if (related && related.taxa) body.related_taxa = related.taxa;
@@ -738,6 +753,9 @@
       if (final.state === 'cancelled' || loadCancelled) { toast('Loading cancelled.'); return; }
       if (final.state !== 'done') throw new Error(final.error || 'Loading failed.');
       if (gen !== projectGen) return; // another project was opened meanwhile
+      // Close this first, so a review dialog that opens next returns focus to
+      // the page, not to this hidden dialog.
+      closeModal(modal);
       applyLoadResult(final.result, resume, related);
     } catch (err) {
       if (gen === projectGen) toast(err.message, true, 9000);
@@ -1205,7 +1223,10 @@
     $('#rel-others-n').value = rel.others.per_taxon;
     $('#rel-others-faves').value = rel.others.min_faves;
     $('#rel-research').checked = rel.others.research_only;
-    $('#rel-buttons').checked = rel.buttons || (!rel.username && !S.project.sources.some(isRelated)); // on, the first time
+    // Ticked the first time this browser opens the dialog; after a Save it shows what was saved.
+    let seen = true;
+    try { seen = localStorage.getItem('dp-related-seen') === '1'; } catch (e) { /* ignore */ }
+    $('#rel-buttons').checked = rel.buttons || (!seen && !S.project.sources.some(isRelated));
     $('#rel-error').textContent = message;
     updateRelatedNote();
     openModal($('#related-modal'));
@@ -1249,7 +1270,10 @@
       mine: { per_taxon: mineN, min_faves: mineF },
       others: { licenses, per_taxon: othersN, min_faves: othersF, research_only: $('#rel-research').checked },
     };
-    if (username) { try { localStorage.setItem('dp-username', username); } catch (e) { /* ignore */ } }
+    try {
+      if (username) localStorage.setItem('dp-username', username);
+      localStorage.setItem('dp-related-seen', '1');
+    } catch (e) { /* ignore */ }
     err.textContent = '';
     markDirty();
     return true;
@@ -1314,8 +1338,13 @@
       title: 'Include this observation (its first photo). Tick more photos to add them.', 'aria-label': 'Include this observation',
       onchange: (e) => {
         if (e.target.checked) {
-          const first = photos.find((p) => photoAllowed(p, allowed)) || photos[0];
+          // Never a photo outside the licenses chosen for other people's photos.
+          const first = photos.find((p) => photoAllowed(p, allowed));
           if (first) adapter.toggle(first.id, true);
+          else {
+            e.target.checked = false;
+            toast('None of this observation\'s photos has one of the licenses chosen in More photos.', true);
+          }
         } else photos.forEach((p) => adapter.toggle(p.id, false));
         if (review) refreshReviewCard(id);
       },
