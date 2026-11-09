@@ -118,8 +118,9 @@ def test_a_store_that_keeps_nothing_in_memory_still_reads_from_disk(tmp_path):
     store = WorkspaceStore(tmp_path, ttl_seconds=100, memory_items=0)
     wid = store.create({1: {"id": 1}}, {})
     assert not store._mem
-    assert store.get(wid)["observations"][1] == {"id": 1}
-    assert store.get(wid)["observations"][1] == {"id": 1}
+    for _ in range(2):
+        assert store.get(wid)["observations"][1] == {"id": 1}
+        assert not store._mem
 
 
 def test_a_renewal_made_while_the_file_was_read_counts(tmp_path, monkeypatch):
@@ -136,3 +137,34 @@ def test_a_renewal_made_while_the_file_was_read_counts(tmp_path, monkeypatch):
 
     monkeypatch.setattr(fresh, "_inflate", read_while_another_request_renews)
     assert fresh.get(wid)["observations"][1] == {"id": 1}
+
+
+def test_an_expired_workspace_is_not_kept_in_memory(tmp_path):
+    wid = WorkspaceStore(tmp_path, ttl_seconds=100).create({1: {"id": 1}}, {})
+    old = time.time() - 150
+    os.utime(tmp_path / f"{wid}.json.gz", (old, old))
+    fresh = WorkspaceStore(tmp_path, ttl_seconds=100)
+    with pytest.raises(WorkspaceExpired):
+        fresh.get(wid)
+    assert wid not in fresh._mem
+
+
+def test_a_use_that_could_not_touch_the_file_outlives_the_cache(tmp_path, monkeypatch):
+    store = WorkspaceStore(tmp_path, ttl_seconds=100)
+    wid = store.create({1: {"id": 1}}, {})
+    path = tmp_path / f"{wid}.json.gz"
+    old = time.time() - 150
+    os.utime(path, (old, old))
+    real_utime = os.utime
+
+    def refuse(*args, **kwargs):
+        raise PermissionError()
+
+    monkeypatch.setattr("app.workspace.os.utime", refuse)
+    store.get(wid)  # used now, but the file keeps its old time
+    store._mem.clear()  # other workspaces pushed it out of memory
+    assert store.get(wid)["observations"][1] == {"id": 1}
+    store._mem.clear()
+    store.cleanup()
+    assert path.exists()
+    monkeypatch.setattr("app.workspace.os.utime", real_utime)
