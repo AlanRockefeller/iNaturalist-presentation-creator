@@ -69,3 +69,17 @@ def test_two_uses_at_once_never_put_the_time_back(tmp_path):
     later = time.time() + 50
     store._mem[wid]["used"] = later  # a use that finished after this one began
     assert store.get(wid)["used"] == later
+
+
+def test_a_copy_loaded_meanwhile_does_not_replace_a_renewed_one(tmp_path, monkeypatch):
+    wid = WorkspaceStore(tmp_path, ttl_seconds=100).create({1: {"id": 1}}, {})
+    fresh = WorkspaceStore(tmp_path, ttl_seconds=100)  # nothing in memory: get() reads the file
+    newer = {"created": 0, "observations": {}, "source_results": {}, "used": time.time() + 30}
+    real = WorkspaceStore._inflate
+
+    def read_while_another_request_publishes(data):
+        fresh._mem[wid] = newer  # loaded and renewed by another request meanwhile
+        return real(data)
+
+    monkeypatch.setattr(fresh, "_inflate", read_while_another_request_publishes)
+    assert fresh.get(wid) is newer and fresh._mem[wid] is newer

@@ -448,7 +448,10 @@ class JobManager:
 
         raw_all: list[dict] = []
         related_found: list[int] = []
+        # Photos kept even past the per-observation limit: those on slides, and the title photo.
         selected_photos = {pid for st in project.observations for pid in st.selected_photo_ids}
+        if project.settings.title_photo:
+            selected_photos.add(project.settings.title_photo.photo_id)
         recheck: set[int] = set()
         for n, src in enumerate(to_query, 1):
             if src.type == "related":
@@ -457,8 +460,11 @@ class JobManager:
                 related_found.extend(found)
                 # Membership only grows: a search of one species must not take
                 # this source away from observations it found before.
-                earlier = prev["source_results"].get(src.id, []) if prev else []
                 listed = [st.id for st in project.observations if src.id in st.source_ids]
+                # A search of some species keeps what earlier searches found and
+                # still waits for review; a full search again decides that anew,
+                # so a pending one it no longer finds (deleted, say) is dropped.
+                earlier = prev["source_results"].get(src.id, []) if prev and related_taxa is not None else []
                 source_results[src.id] = list(dict.fromkeys(found + earlier + listed))
                 if related_taxa is None:
                     # A full search again: what it kept but did not find now

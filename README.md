@@ -280,7 +280,8 @@ kB. Photos and full iNaturalist metadata are **not** embedded.
   `related.whose` (`mine` | `others`) and the `taxon_ids` searched; their `url`
   and `username` are rebuilt from those and `settings.related` on load.
 - `settings.related`: the More photos settings. `username` is the presenter's
-  iNaturalist login (`""` = not given); `buttons` shows the two buttons on each
+  iNaturalist login (`""` = not given); `buttons` (`null` until the dialog is
+  first saved, when it is offered ticked) shows the two buttons on each
   card. Added in schema 6; an older file loads with the defaults.
 - `overrides`: `null` (or left out) means "use the live iNaturalist value"; a
   string replaces it on the slide; `""` hides that line for this observation.

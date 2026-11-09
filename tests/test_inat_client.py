@@ -353,3 +353,18 @@ def test_cleanup_leaves_a_photo_that_is_being_handed_to_a_deck(settings, fake, m
         assert media.cached_path(11) is not None
     media.cleanup()  # the next cleanup trims it
     assert media.cached_path(11) is None
+
+
+def test_cleanup_counts_a_busy_photo_toward_the_cap(settings, fake, media):
+    import os
+    import time
+
+    fake.add(make_obs(1, 47692, photos=((11, 64, 48), (12, 64, 48))))
+    for pid in (11, 12):
+        media.fetch_original(pid, f"https://{PHOTO_HOST}/photos/{pid}/square.jpg")
+    old = time.time() - 50
+    os.utime(media.cached_path(11), (old, old))  # 11 is the oldest
+    settings.media_cache_max_bytes = media.cached_path(12).stat().st_size  # room for one
+    with media._lock_for(11):  # 11 is busy, so it stays and still counts
+        media.cleanup()
+    assert media.cached_path(11) is not None and media.cached_path(12) is None

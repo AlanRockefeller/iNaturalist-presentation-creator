@@ -374,7 +374,7 @@ def test_v5_file_loads_as_v6_with_default_more_photos_settings():
                        "sources": [{"id": "a", "type": "url", "url": URL_CR}]})
     assert pr.schema_version == 6
     rel = pr.settings.related
-    assert rel.username == "" and rel.buttons is False
+    assert rel.username == "" and rel.buttons is None
     assert (rel.mine.per_taxon, rel.mine.min_faves) == (20, 0)
     assert rel.others.licenses == ["cc0", "cc-by", "cc-by-sa", "cc-by-nd"]
     assert (rel.others.per_taxon, rel.others.min_faves, rel.others.research_only) == (5, 1, True)

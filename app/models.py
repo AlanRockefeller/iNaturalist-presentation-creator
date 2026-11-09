@@ -141,8 +141,9 @@ class RelatedSettings(_Model):
     # The presenter's iNaturalist login: needed for "mine", left out of
     # "others", and never credited on slides. "" = not given.
     username: str = Field(default="", max_length=40)
-    # Show the two buttons on each observation card.
-    buttons: bool = False
+    # Show the two buttons on each observation card. None: not chosen yet
+    # (the dialog then offers them ticked).
+    buttons: Optional[bool] = None
     mine: RelatedMine = Field(default_factory=RelatedMine)
     others: RelatedOthers = Field(default_factory=RelatedOthers)
 

@@ -74,8 +74,9 @@
   // requests a search of n species can make. With "All rights reserved" and
   // only some other licenses ticked, licenses are checked on the server, which
   // can take up to 3 pages per species.
-  function estimateRequests(count, whose = 'others') {
-    const lic = whose === 'others' ? relatedSettings().others.licenses : [];
+  // `licenses`: the ones ticked in the dialog now; else the saved ones.
+  function estimateRequests(count, whose = 'others', licenses = null) {
+    const lic = whose === 'others' ? (licenses || relatedSettings().others.licenses) : [];
     const pages = lic.includes('arr') && lic.length < LICENSES.length ? 3 : 1;
     let total = 0;
     for (let start = 0; start < count; start += 100) {
@@ -107,7 +108,7 @@
   const RELATED_LABEL = { mine: 'More of my photos', others: 'Other people\'s photos' };
   function defaultRelated() {
     return {
-      username: '', buttons: false,
+      username: '', buttons: null,
       mine: { per_taxon: 20, min_faves: 0 },
       others: { licenses: ['cc0', 'cc-by', 'cc-by-sa', 'cc-by-nd'], per_taxon: 5, min_faves: 1, research_only: true },
     };
@@ -607,9 +608,13 @@
     const open = $$('.modal').some((m) => !m.hidden);
     $$(PAGE_PARTS).forEach((part) => { part.inert = open; });
   }
-  function openModal(m) {
+  // `fallback()` gives the element to focus on closing when the one focused at
+  // opening is gone (a card the list re-rendered meanwhile, say).
+  const modalFallback = new Map();
+  function openModal(m, fallback = null) {
     if (!m.hidden) return;
     modalReturn.set(m, document.activeElement);
+    if (fallback) modalFallback.set(m, fallback); else modalFallback.delete(m);
     m.hidden = false;
     syncInert();
     const box = $('.modal-box', m);
@@ -621,8 +626,11 @@
     m.hidden = true;
     syncInert();
     if (m.id === 'review-modal') updateStats();
-    const back = modalReturn.get(m);
+    let back = modalReturn.get(m);
+    const fallback = modalFallback.get(m);
     modalReturn.delete(m);
+    modalFallback.delete(m);
+    if (!(back && back.isConnected && back !== document.body) && fallback) back = fallback();
     if (back && back.isConnected && typeof back.focus === 'function') back.focus();
   }
 
@@ -1047,7 +1055,7 @@
   // "More of mine" / "More from others" on a card, when turned on in More photos.
   function morePhotoButtons(id) {
     const rel = relatedSettings();
-    if (!rel.buttons) return [];
+    if (rel.buttons !== true) return [];
     const o = S.obs.get(id);
     const ok = isSpecies(o);
     const name = effectiveName(id) || (o && o.inat_name) || 'this species';
@@ -1119,10 +1127,8 @@
     $('#rel-others-n').value = rel.others.per_taxon;
     $('#rel-others-faves').value = rel.others.min_faves;
     $('#rel-research').checked = rel.others.research_only;
-    // Ticked the first time this browser opens the dialog; after a Save it shows what was saved.
-    let seen = true;
-    try { seen = localStorage.getItem('dp-related-seen') === '1'; } catch (e) { /* ignore */ }
-    $('#rel-buttons').checked = rel.buttons || (!seen && !S.project.sources.some(isRelated));
+    // Offered ticked until this project's choice is saved (null = not chosen yet).
+    $('#rel-buttons').checked = rel.buttons === null || rel.buttons === undefined ? true : rel.buttons;
     $('#rel-error').textContent = message;
     updateRelatedNote();
     openModal($('#related-modal'));
@@ -1134,7 +1140,8 @@
   }
   function updateRelatedNote() {
     const { taxa, skipped } = listedSpecies();
-    const need = estimateRequests(taxa.length);
+    const ticked = $$('#rel-licenses input').filter((b) => b.checked).map((b) => b.value);
+    const need = estimateRequests(taxa.length, 'others', ticked.length ? ticked : null);
     const bits = [`${plural(taxa.length, 'species', 'species')} in the observations listed now`];
     if (skipped) bits.push(`${n(skipped)} identified only to genus or higher ${skipped === 1 ? 'is' : 'are'} skipped`);
     let text = bits.join('; ') + '. Use Find to list fewer first.';
@@ -1166,15 +1173,13 @@
       mine: { per_taxon: mineN, min_faves: mineF },
       others: { licenses, per_taxon: othersN, min_faves: othersF, research_only: $('#rel-research').checked },
     };
-    try {
-      if (username) localStorage.setItem('dp-username', username);
-      localStorage.setItem('dp-related-seen', '1');
-    } catch (e) { /* ignore */ }
+    if (username) { try { localStorage.setItem('dp-username', username); } catch (e) { /* ignore */ } }
     err.textContent = '';
     markDirty();
     return true;
   }
   $('#btn-related').addEventListener('click', () => openRelated());
+  $$('#rel-licenses input').forEach((b) => b.addEventListener('change', updateRelatedNote));
   $('#btn-rel-save').addEventListener('click', () => {
     if (!saveRelated()) return;
     closeModal($('#related-modal'));
@@ -2096,7 +2101,13 @@
       reviewRenderer = chunkRender($('#review-list'), $('#review-sentinel'), ids, (id) => obsCard(id, 0, reviewAdapter(id)), 0, 40);
       updateReviewButtons();
     }
-    openModal($('#review-modal'));
+    // After a card's More photos button the list was re-rendered, so focus
+    // goes back to that card's rebuilt button (or More photos… in the toolbar).
+    const after = ctx && ctx.afterId;
+    openModal($('#review-modal'), ctx ? () => {
+      const card = after ? renderedCards.get(after) : null;
+      return (card && card.isConnected && $('.more-photos', card)) || $('#btn-related');
+    } : null);
     S.reviewIds = ids;
   }
 
