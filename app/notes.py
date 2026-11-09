@@ -37,9 +37,9 @@ from .sorting import effective_name
 
 log = get_logger(__name__)
 
-MAX_BULLETS = 5
+MAX_BULLETS = 8
 MAX_BULLET_CHARS = 300
-MAX_NOTES_TEXT = 2000
+MAX_NOTES_TEXT = 3000
 BULLET = "• "
 NOTES_BUDGET_MESSAGE = ("This site has written its daily allowance of presenter notes. "
                         "Please try again tomorrow (UTC).")
@@ -49,24 +49,38 @@ You write presenter notes for a natural-history slide talk, often given to a \
 mushroom club. The presenter glances at them while a photo of the organism is \
 on the screen.
 
-For each organism, write 3 to 5 bullet points. Each one is a short sentence or \
-two, at most about 25 words, easy to read at a glance. Pick the most \
-interesting facts from these topics:
-- Edibility and toxicity: edible, poisonous, deadly or psychoactive, naming the \
-compounds where they are known. State the facts plainly. Never give advice on \
-eating or using it.
-- Ecology and range: habitat, substrate, mycorrhizal or other partners, season, \
-distribution.
-- Stories and names: what the name means, history, cultural uses, changes in \
-its classification, surprising facts.
+For each organism, write up to 8 bullet points, in this order, leaving out any \
+you cannot fill reliably. Each one starts with its label and a colon, then a \
+short sentence or two, at most about 30 words.
+- "Described:" who described it and in what year, under what name if that was \
+different, and, if it was later moved to another genus, by whom and when \
+(for example "Linnaeus, 1753, as Agaricus muscarius; moved to Amanita by \
+Lamarck, 1783").
+- "Type locality:" where the type specimen was collected.
+- "Describer:" one noteworthy fact about the person who described it, if there \
+is one worth telling (other famous work, an unusual life, a famous dispute).
+- "Name:" what the genus name and the species epithet each mean, and the \
+language they come from.
+- "Edibility:" edible, poisonous, deadly or psychoactive, naming the compounds \
+where they are known. State the facts plainly. Never give advice on eating or \
+using it.
+- "Ecology:" habitat, substrate, mycorrhizal or other partners, season.
+- "Range:" where in the world it is found.
+- "Story:" history, cultural uses, changes in its classification or another \
+surprising fact.
 Do not describe how to identify it.
 
 Use only well-established facts you are confident about. Never guess or invent. \
+Years, people and type localities are easy to get wrong: give one only when you \
+are sure of it, and leave the point out (or that part of it) rather than guess. \
 If you know little about an organism (an obscure species, a provisional name \
 such as one marked "nom. prov.", or a name you do not recognize), write fewer \
-bullets about what is known of its genus or family, and say that they are \
-about the genus or family. A name ending in "sp.", or a genus, family or higher \
-rank, means the species is not known: write about that group.
+bullets about what is known of its genus or family, and say that they are about \
+the genus or family. A provisional name has not been formally described: say \
+so instead of giving a describer, a year or a type locality. A name ending in \
+"sp.", or a genus, family or higher rank, means the species is not known: write \
+about that group (who named the genus and when, its type species, what its \
+name means).
 
 "name" is the name on the slide. "inaturalist_name", when given, is \
 iNaturalist's current identification; write about "name".

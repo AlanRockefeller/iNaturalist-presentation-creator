@@ -55,14 +55,14 @@ def test_clean_notes():
         42,
         "",
         "x" * 400,
-        "Four", "Five", "Six",
+        "Four", "Five", "Six", "Seven", "Eight", "Nine",
     ])
     lines = text.split("\n")
     assert len(lines) == MAX_BULLETS
     assert lines[0] == "• First point, with a dash"
     assert lines[1] == "• Second point here"
     assert lines[2].startswith("• xxx") and lines[2].endswith("…") and len(lines[2]) == 2 + 300
-    assert lines[3:] == ["• Four", "• Five"]
+    assert lines[3:] == ["• Four", "• Five", "• Six", "• Seven", "• Eight"]
     assert clean_notes(None) == "" and clean_notes(["   "]) == ""
 
 

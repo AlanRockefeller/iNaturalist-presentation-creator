@@ -403,9 +403,20 @@ first photo of each selected, in default taxonomic order.
 
 ## Presenter notes
 
-Notes the presenter sees in PowerPoint's presenter view: 3 to 5 short points
-per organism about edibility and toxicity, ecology and range, and the stories
-behind its name. They can be typed, or written by Claude:
+Notes the presenter sees in PowerPoint's presenter view. They can be typed, or
+written by Claude: up to 8 short points per organism, each starting with a label,
+in this order, leaving out any Claude cannot fill reliably:
+
+- **Described**: who described it and when, under what name, and when and by
+  whom it was moved to another genus;
+- **Type locality**: where the type specimen was collected;
+- **Describer**: something noteworthy about the person who described it;
+- **Name**: what the genus name and the species epithet mean;
+- **Edibility**, **Ecology**, **Range** and **Story**.
+
+Years, people and type localities are only given when Claude is sure of them.
+A provisional name gets "not formally described" instead, and a genus-level
+name (`Psilocybe sp.`) gets notes about the genus. Where notes come from:
 
 - **One slide**: the **Notes** button on a Preview slide (or on a card in
   Select & Organize) opens the notes, with **Write with Claude**.
