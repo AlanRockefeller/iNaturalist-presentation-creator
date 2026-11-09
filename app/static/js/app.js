@@ -111,16 +111,17 @@
   function newProject() {
     return {
       format: 'dikarya-presentation',
-      schema_version: 7,
+      schema_version: 8,
       sources: [],
       settings: {
         title: '', presenter: '', background: 'black', title_photo: null,
         sort: { key: 'taxonomic', direction: 'asc', base_key: 'taxonomic', base_direction: 'asc' },
         grouping: 'family', dividers: false, min_faves: 0,
-        annotations: { scientific: true, common_name: false, date: false, location: false, observer: null },
+        annotations: { scientific: true, common_name: false, date: false, location: false, observer: null, rarity: true },
         speaker_notes: true,
         related: defaultRelated(),
         presenter_notes: true,
+        about_slide: true,
       },
       observations: [],
       order: [],
@@ -209,6 +210,13 @@
     return (o && o.inat_name) || '';
   }
   const isRelated = (src) => src.type === 'related' && !!src.related;
+  const isRare = (src) => src.type === 'rare' && !!src.rare;
+  // "12 observations worldwide" (rank added on the slides). Mirror of rarity_text() in presentation.py.
+  function rarityText(info, rank) {
+    if (!info) return '';
+    const text = `${n(info.world)} observation${info.world === 1 ? '' : 's'} worldwide`;
+    return rank ? `${text} · #${rank} rarest` : text;
+  }
   const relatedSource = (whose) => S.project.sources.find((s) => isRelated(s) && s.related.whose === whose);
   function relatedSettings() {
     const s = S.project.settings;
@@ -217,7 +225,8 @@
   }
   function observerDefault() {
     const active = S.project.sources.filter((s) => s.enabled);
-    return (active.length ? active : S.project.sources).some((s) => s.type === 'url' || (isRelated(s) && s.related.whose === 'others'));
+    return (active.length ? active : S.project.sources).some((s) => s.type === 'url'
+      || (isRelated(s) && s.related.whose === 'others') || (isRare(s) && !s.username));
   }
   function observerEnabled() {
     const v = S.project.settings.annotations.observer;
@@ -226,7 +235,7 @@
   // Who the presenter is: their Mine sources and the username in More photos.
   // Their photos are never credited. Mirror of own_logins() / is_own() in project.py.
   function ownLogins() {
-    const out = new Set(S.project.sources.filter((s) => s.type === 'username' && s.username).map((s) => s.username.toLowerCase()));
+    const out = new Set(S.project.sources.filter((s) => (s.type === 'username' || isRare(s)) && s.username).map((s) => s.username.toLowerCase()));
     const u = relatedSettings().username;
     if (u) out.add(u.toLowerCase());
     return out;
@@ -240,10 +249,15 @@
   // found only by "More from others"), or null for any. Mirror of
   // allowed_licenses() / default_photo_ids() in project.py.
   function allowedLicenses(sourceIds) {
-    const others = new Set(S.project.sources.filter((s) => isRelated(s) && s.related.whose === 'others').map((s) => s.id));
-    if (sourceIds && sourceIds.length && sourceIds.every((sid) => others.has(sid))) return new Set(relatedSettings().others.licenses);
-    return null;
+    const limits = new Map();
+    S.project.sources.forEach((s) => {
+      if (isRelated(s) && s.related.whose === 'others') limits.set(s.id, relatedSettings().others.licenses);
+      else if (isRare(s) && s.rare.commercial_only) limits.set(s.id, COMMERCIAL_LICENSES);
+    });
+    if (!sourceIds || !sourceIds.length || !sourceIds.every((sid) => limits.has(sid))) return null;
+    return new Set(sourceIds.flatMap((sid) => limits.get(sid)));
   }
+  const COMMERCIAL_LICENSES = ['cc0', 'cc-by', 'cc-by-sa', 'cc-by-nd']; // models.DEFAULT_LICENSES
   const photoAllowed = (p, allowed) => !allowed || allowed.has(p.license || 'arr');
   function defaultPhotoIds(id, sourceIds) {
     const o = S.obs.get(id);
@@ -448,6 +462,7 @@
     $('#sources-empty').hidden = S.project.sources.length > 0;
     S.project.sources.forEach((src) => {
       if (isRelated(src)) { list.append(relatedSourceItem(src)); return; }
+      if (isRare(src)) { list.append(rareSourceItem(src)); return; }
       const count = S.sourceCounts[src.id];
       const mine = src.type === 'username';
       const login = singleUserLogin(src);
@@ -556,6 +571,86 @@
       removeSourceButton(src),
     );
   }
+
+  // A Rare finds source: the rarest species in its search, by worldwide count
+  // (rare.py). Searched when first loaded and again only with Search again.
+  function rareSourceItem(src) {
+    const kept = S.project.observations.filter((st) => st.source_ids.includes(src.id)).length;
+    const r = src.rare;
+    const how = [`the ${plural(r.top, 'rarest species', 'rarest species')}`, `${plural(r.per_taxon, 'observation')} each`];
+    if (r.described_only) how.push('described species only');
+    if (r.commercial_only) how.push('commercial-use photos only');
+    const searched = S.loadedSources.has(src.id) || kept > 0;
+    return el('li', { class: 'source-item rare' + (src.enabled ? '' : ' disabled') },
+      el('input', {
+        type: 'checkbox', checked: src.enabled, title: 'Include this source', 'aria-label': 'Include this source',
+        onchange: (e) => { src.enabled = e.target.checked; markDirty(); renderSources(); },
+      }),
+      el('span', { class: 'badge rare', text: 'Rare finds', title: 'The rarest species in this search, by observations worldwide' }),
+      el('div', { class: 'source-meta' },
+        el('input', {
+          type: 'text', class: 'label-input', value: src.label, maxLength: 120, 'aria-label': 'Source label',
+          onchange: (e) => { src.label = e.target.value.trim().slice(0, 120); markDirty(); },
+        }),
+        el('a', { class: 'url', href: src.url, target: '_blank', rel: 'noopener noreferrer', text: src.url }),
+        el('span', { class: 'who', text: `${how.join(', ')}. Searched only when you ask, so refreshing does not repeat it; the counts are updated.` }),
+      ),
+      el('span', { class: 'count-pill', text: plural(kept, 'observation') }),
+      searched ? el('button', {
+        type: 'button', class: 'btn btn-small', text: 'Search again', disabled: !src.enabled,
+        title: 'Rank this search again and offer anything new for review',
+        onclick: () => {
+          if (!confirm(`Find the ${plural(r.top, 'rarest species', 'rarest species')} in this search again? That is about 30 to 60 requests to iNaturalist. New observations are offered for review.`)) return;
+          startLoad([src.id], null, { rare: true, title: src.label || 'Rare finds' });
+        },
+      }) : null,
+      removeSourceButton(src),
+    );
+  }
+
+  $('#btn-add-rare').addEventListener('click', () => {
+    const url = $('#source-url').value.trim();
+    $('#source-error').textContent = '';
+    if (!url) { $('#source-error').textContent = 'Paste the link to an iNaturalist observations search first.'; return; }
+    if (S.project.sources.length >= LIMITS.sources) { $('#source-error').textContent = `A project can have at most ${LIMITS.sources} sources.`; return; }
+    $('#rare-search').textContent = url;
+    $('#rare-error').textContent = '';
+    openModal($('#rare-modal'));
+    $('#rare-top').focus();
+  });
+
+  $('#rare-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const url = $('#source-url').value.trim();
+    const username = $('#source-username').value.trim().replace(/^@/, '');
+    const top = Math.min(100, Math.max(1, parseInt($('#rare-top').value, 10) || 15));
+    const per = Math.min(20, Math.max(1, parseInt($('#rare-per').value, 10) || 1));
+    const btn = $('#btn-rare-add');
+    btn.disabled = true;
+    const gen = projectGen;
+    try {
+      const parsed = await api('/api/sources/parse', { method: 'POST', body: { url, username } });
+      if (gen !== projectGen) return;
+      if (S.project.sources.some((s) => isRare(s) && s.url === parsed.url)) {
+        $('#rare-error').textContent = 'Rare finds for that search is already in the project.';
+        return;
+      }
+      S.project.sources.push({
+        id: newSourceId(), type: 'rare', input: parsed.input, username: parsed.username || null,
+        url: parsed.url, label: `Rare finds: ${parsed.label}`, enabled: true,
+        rare: { top, per_taxon: per, described_only: $('#rare-described').checked, commercial_only: $('#rare-commercial').checked },
+      });
+      $('#source-url').value = '';
+      closeModal($('#rare-modal'));
+      markDirty();
+      renderSources();
+      toast(hasObservations() ? 'Added. Press Load to find the rarest species; they are offered for review.' : 'Added. Press Load observations to find the rarest species.', false, 7000);
+    } catch (err) {
+      $('#rare-error').textContent = err.message;
+    } finally {
+      btn.disabled = false;
+    }
+  });
 
   // ---------------------------------------------------------------- loading
   let loadJobId = null;
@@ -685,8 +780,12 @@
       if (ids.length) {
         showReview({ ...sum, new_ids: ids }, true, { title: related.title, afterId: related.afterId });
       } else {
-        const what = related.whose === 'mine' ? 'of your photos' : 'from other people';
-        toast(`Nothing new ${what} with the current More photos settings${found.size ? ' (what it found is already in the project or was ignored)' : ''}.`, false, 7000);
+        if (related.rare) {
+          toast(`No new rare finds${found.size ? ': what the search found is already in the project or was ignored' : ''}. The counts are up to date.`, false, 7000);
+        } else {
+          const what = related.whose === 'mine' ? 'of your photos' : 'from other people';
+          toast(`Nothing new ${what} with the current More photos settings${found.size ? ' (what it found is already in the project or was ignored)' : ''}.`, false, 7000);
+        }
       }
     } else {
       S.pendingNew = sum.new ? sum : null;
@@ -1284,6 +1383,7 @@
       });
     }
     if (missing.length) chips.append(el('span', { class: 'chip warn', text: `${plural(missing.length, 'selected photo')} deleted on iNaturalist` }));
+    if (o.rare) chips.append(el('span', { class: 'chip rare', text: `${n(o.rare.world)} worldwide`, title: `${rarityText(o.rare)} on iNaturalist; ${n(o.rare.local)} in the Rare finds search` }));
     if (!review && notesStale(id)) chips.append(el('span', { class: 'chip warn', text: `Notes are about ${st.notes_name}` }));
     if (chips.childNodes.length) info.append(chips);
 
@@ -1393,6 +1493,7 @@
     const fields = [
       ['scientific', 'Scientific name', o.inat_name || ''],
       ['common_name', 'Common name', o.common_name || ''],
+      ...(o.rare ? [['rarity', 'Rare finds', rarityText(o.rare)]] : []),
       ['date', 'Date', formatDate(o.observed_on)],
       ['location', 'Location', o.place_guess || ''],
       ['observer', 'Observer', (user.name || user.login) ? `Photo: ${user.name || user.login}` : ''],
@@ -1787,6 +1888,8 @@
     $('#divider-note').textContent = s.grouping === 'none' ? '(choose “Group by” on the Select & Organize step first)' : `(grouped by ${GROUP_NAMES[s.grouping].toLowerCase()})`;
     $('#set-notes').checked = s.speaker_notes;
     $('#set-presenter-notes').checked = s.presenter_notes !== false;
+    $('#ann-rarity').checked = s.annotations.rarity !== false;
+    $('#set-about-slide').checked = s.about_slide !== false;
     $('#title-position').value = (s.title_photo && s.title_photo.position) || 'center';
     renderTitlePhoto();
   }
@@ -1812,6 +1915,8 @@
   $('#set-dividers').addEventListener('change', (e) => { S.project.settings.dividers = e.target.checked; markDirty(); });
   $('#set-notes').addEventListener('change', (e) => { S.project.settings.speaker_notes = e.target.checked; markDirty(); });
   $('#set-presenter-notes').addEventListener('change', (e) => { S.project.settings.presenter_notes = e.target.checked; markDirty(); });
+  $('#ann-rarity').addEventListener('change', (e) => { S.project.settings.annotations.rarity = e.target.checked; markDirty(); });
+  $('#set-about-slide').addEventListener('change', (e) => { S.project.settings.about_slide = e.target.checked; markDirty(); });
   $('#title-position').addEventListener('change', (e) => {
     if (S.project.settings.title_photo) { S.project.settings.title_photo.position = e.target.value; markDirty(); }
   });
@@ -1867,6 +1972,10 @@
         el('div', { class: 't-title' + (spec.title_size && spec.title_size !== 54 ? ` s${spec.title_size}` : ''), text: spec.title }),
         el('div', { class: 't-rule' }),
         spec.presenter ? el('div', { class: 't-presenter', text: spec.presenter }) : null));
+    } else if (spec.kind === 'about') {
+      slide.append(el('div', { class: 'about' },
+        el('div', { class: 'a-title', text: spec.title }),
+        el('ul', {}, (spec.lines || []).map((line) => el('li', { text: line })))));
     } else if (spec.kind === 'divider') {
       slide.append(el('div', { class: 'center' },
         spec.rank_label ? el('div', { class: 'd-rank', text: spec.rank_label.toUpperCase() }) : null,
@@ -1887,7 +1996,7 @@
     let plan;
     try { plan = await fetchPlan(); } catch (err) { handleApiError(err); return; }
     const c = plan.counts;
-    $('#preview-stats').textContent = `${plural(c.total, 'slide')}: 1 title, ${plural(c.dividers, 'divider')}, ${plural(c.images, 'photo slide')} from ${plural(c.observations, 'observation')}`;
+    $('#preview-stats').textContent = `${plural(c.total, 'slide')}: 1 title, ${plural(c.dividers, 'divider')}, ${plural(c.images, 'photo slide')} from ${plural(c.observations, 'observation')}${c.about ? ', and an About these numbers slide' : ''}`;
     $('#preview-warnings').replaceChildren(...plan.warnings.map((w) => el('div', { class: 'warning', text: w })));
     if (previewRenderer) previewRenderer.disconnect();
     $('#btn-notes-all').hidden = !Notes.claudeOn || c.images === 0;

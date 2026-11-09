@@ -14,7 +14,7 @@ from pydantic import ValidationError
 
 from .inaturalist import SourceError, build_source, parse_source_input, single_user_login
 from .models import (
-    MAX_IGNORED, MAX_PHOTOS, PROJECT_FORMAT, SCHEMA_VERSION, ObservationState, Project, Source,
+    DEFAULT_LICENSES, MAX_IGNORED, MAX_PHOTOS, PROJECT_FORMAT, SCHEMA_VERSION, ObservationState, Project, Source,
 )
 from .related import photo_allowed, related_fields
 
@@ -58,6 +58,10 @@ def _migrate(data: dict) -> dict:
         # v7 added per-observation presenter notes (notes, notes_name) and
         # settings.presenter_notes; a v6 file simply has none.
         data["schema_version"] = version = 7
+    if version == 7:
+        # v8 added "rare finds" sources, the rarity line and settings.about_slide;
+        # a v7 file simply has none.
+        data["schema_version"] = version = 8
     if version == SCHEMA_VERSION:
         return data
     raise ProjectError(f"Unsupported project schema version {version!r}.")
@@ -113,6 +117,18 @@ def normalize_project(project: Project) -> Project:
             fields = related_fields(src, project.settings.related)
             sources.append(src.model_copy(update={
                 "input": "", "username": None, "url": fields["url"], "label": src.label or fields["label"],
+            }))
+            continue
+        if src.type == "rare":
+            if src.rare is None:
+                raise ProjectError(f"Source {src.label or src.id!r} is not valid: it has no Rare finds settings.")
+            try:
+                parsed = build_source(src.url, src.username, infer_username=False)
+            except SourceError as exc:
+                raise ProjectError(f"Source {src.label or src.id!r} is not valid: {exc}") from None
+            sources.append(src.model_copy(update={
+                "url": parsed["url"], "username": parsed["username"],
+                "label": src.label or f"Rare finds: {parsed['label']}", "related": None,
             }))
             continue
         try:
@@ -201,7 +217,8 @@ def observer_default(project: Project) -> bool:
     line by default. Any URL source may contain other people's photos: credit on,
     as does a "more photos from others" source."""
     active = [s for s in project.sources if s.enabled] or project.sources
-    return any(s.type == "url" or (s.type == "related" and s.related and s.related.whose == "others") for s in active)
+    return any(s.type == "url" or (s.type == "related" and s.related and s.related.whose == "others")
+               or (s.type == "rare" and not s.username) for s in active)
 
 
 def observer_enabled(project: Project) -> bool:
@@ -213,7 +230,7 @@ def own_logins(project: Project) -> set[str]:
     """Who the presenter is: the usernames of their own (Mine) sources and the
     one given in More photos. Their photos are never credited. Mirrored by
     ownLogins() in app.js."""
-    logins = {s.username.lower() for s in project.sources if s.type == "username" and s.username}
+    logins = {s.username.lower() for s in project.sources if s.type in ("username", "rare") and s.username}
     if project.settings.related.username:
         logins.add(project.settings.related.username.lower())
     return logins
@@ -229,12 +246,18 @@ def is_own(obs: dict | None, project: Project, logins: set[str] | None = None) -
 # ---------------------------------------------------------------------------
 
 def allowed_licenses(project: Project, source_ids: list[str]) -> set[str] | None:
-    """The licenses an observation's photos are limited to: those chosen for
-    other people's photos, when that search is the only source that found it.
-    None = any. Mirrored by allowedLicenses() in app.js."""
-    others = {s.id for s in project.sources if s.type == "related" and s.related and s.related.whose == "others"}
-    if source_ids and all(sid in others for sid in source_ids):
-        return set(project.settings.related.others.licenses)
+    """The licenses an observation's photos are limited to, when only sources
+    that limit licenses found it: "more from others" (the licenses chosen
+    there) and Rare finds with "commercial use only". None = any. Mirrored by
+    allowedLicenses() in app.js."""
+    limits: dict[str, set[str]] = {}
+    for src in project.sources:
+        if src.type == "related" and src.related and src.related.whose == "others":
+            limits[src.id] = set(project.settings.related.others.licenses)
+        elif src.type == "rare" and src.rare and src.rare.commercial_only:
+            limits[src.id] = set(DEFAULT_LICENSES)
+    if source_ids and all(sid in limits for sid in source_ids):
+        return set().union(*(limits[sid] for sid in source_ids))
     return None
 
 

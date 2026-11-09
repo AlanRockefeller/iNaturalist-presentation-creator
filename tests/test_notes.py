@@ -428,6 +428,6 @@ def test_v6_file_migrates_with_no_notes():
     data = {"format": "dikarya-presentation", "schema_version": 6,
             "observations": [{"id": 1, "selected_photo_ids": [11]}], "order": [1]}
     pr = load_project(data)
-    assert pr.schema_version == 7 and pr.observations[0].notes is None
+    assert pr.schema_version == 8 and pr.observations[0].notes is None
     assert pr.settings.presenter_notes is True
-    assert project_to_json(pr)["schema_version"] == 7
+    assert project_to_json(pr)["schema_version"] == 8

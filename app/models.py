@@ -14,20 +14,22 @@ from typing import Annotated, Literal, Optional
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator
 
 PROJECT_FORMAT = "dikarya-presentation"
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 PROJECT_EXTENSION = ".dikarya-presentation.json"
 
-SortKey = Literal["taxonomic", "favorites", "observed_on", "created_at", "name", "original", "random", "custom"]
+SortKey = Literal["taxonomic", "favorites", "observed_on", "created_at", "name", "original", "random", "custom",
+                  "rarity"]
 Grouping = Literal["none", "kingdom", "phylum", "class", "order", "family", "genus", "source"]
 SOURCE_ID_PATTERN = r"^[A-Za-z0-9_-]{1,40}$"
 Rotation = Literal[0, 90, 180, 270]
-LineField = Literal["scientific", "common_name", "date", "location", "observer"]
+LineField = Literal["scientific", "common_name", "date", "location", "observer", "rarity"]
 # Photo licenses as iNaturalist names them; "arr" is "all rights reserved"
 # (a photo with no license).
 LicenseCode = Literal["cc0", "cc-by", "cc-by-sa", "cc-by-nd", "cc-by-nc", "cc-by-nc-sa", "cc-by-nc-nd", "arr"]
 DEFAULT_LICENSES = ["cc0", "cc-by", "cc-by-sa", "cc-by-nd"]  # allow commercial use
 LOGIN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\-]{0,39}$")
 MAX_RELATED_TAXA = 1000  # species remembered per "more photos" source
+MAX_RARE_TOP = 100       # the most species one "rare finds" source keeps
 
 _LIMITS = {"sources": 20, "observations": 10_000, "photos": 200, "ignored": 50_000}
 MAX_PHOTOS = _LIMITS["photos"]    # photos remembered per observation
@@ -88,6 +90,17 @@ class RelatedSource(_Model):
         return list(dict.fromkeys(v))
 
 
+class RareSource(_Model):
+    """A "rare finds" source: the rarest species in its search, by how many
+    observations iNaturalist has of each worldwide (see app/rare.py). The counts
+    are not kept here: they are fetched again on each load."""
+
+    top: int = Field(default=15, ge=1, le=MAX_RARE_TOP)  # how many species
+    per_taxon: int = Field(default=1, ge=1, le=20)       # observations kept per species
+    described_only: bool = False   # leave out provisional names
+    commercial_only: bool = False  # only photos licensed for commercial use
+
+
 class Source(_Model):
     id: str = Field(pattern=SOURCE_ID_PATTERN)
     # "username": the presenter's own photos (photo credits start off).
@@ -95,7 +108,9 @@ class Source(_Model):
     # Since schema 5 this is the user's choice and is kept as saved.
     # "related" (schema 6): more photos of species already in the project,
     # searched only when the user asks (see app/related.py).
-    type: Literal["username", "url", "related"]
+    # "rare" (schema 8): the rarest species in a search, searched only when the
+    # user asks (see app/rare.py).
+    type: Literal["username", "url", "related", "rare"]
     input: Encodable = Field(default="", max_length=2000)
     username: Optional[str] = Field(default=None, max_length=40)
     # A related source's link lists its species, so it can be longer.
@@ -103,6 +118,7 @@ class Source(_Model):
     label: Text = Field(default="", max_length=120)
     enabled: bool = True
     related: Optional[RelatedSource] = None
+    rare: Optional[RareSource] = None
 
 
 class AnnotationSettings(_Model):
@@ -112,6 +128,8 @@ class AnnotationSettings(_Model):
     location: bool = False
     # None = automatic: off for username-only projects, on if any source is a URL.
     observer: Optional[bool] = None
+    # "12 observations worldwide · #3 rarest", on slides from a rare finds source.
+    rarity: bool = True
 
 
 class SortSettings(_Model):
@@ -181,6 +199,8 @@ class PresentationSettings(_Model):
     related: RelatedSettings = Field(default_factory=RelatedSettings)
     # Each observation's presenter notes (ObservationState.notes) in the deck.
     presenter_notes: bool = True
+    # An "About these numbers" slide at the end when the deck has rare finds.
+    about_slide: bool = True
 
 
 class AnnotationOverrides(_Model):
@@ -191,6 +211,7 @@ class AnnotationOverrides(_Model):
     date: Optional[Text] = Field(default=None, max_length=300)
     location: Optional[Text] = Field(default=None, max_length=300)
     observer: Optional[Text] = Field(default=None, max_length=300)
+    rarity: Optional[Text] = Field(default=None, max_length=300)
 
 
 class ObservationState(_Model):

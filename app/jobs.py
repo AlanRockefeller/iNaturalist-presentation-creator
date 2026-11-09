@@ -31,6 +31,7 @@ from .models import Project
 from .notes import NotesCancelled, NotesError, subject_for
 from .presentation import build_slide_plan, write_pptx
 from .project import ProjectError, add_observations, refresh_project, safe_filename
+from . import rare as rare_finds
 from .related import LABELS as RELATED_LABELS, estimate_requests, run_related_search
 from .ratelimit import BudgetExceeded, DailyBudget
 from .workspace import WorkspaceExpired, WorkspaceStore
@@ -426,9 +427,15 @@ class JobManager:
         if not project.sources:
             raise JobFailed("Add at least one source first.")
         refresh = set(refresh_ids or [])
-        # "More photos" sources are searched only when asked for by id; on any
+        # "More photos" and "Rare finds" sources are searched only when asked for
+        # by id (a Rare finds source also when it was never searched); on any
         # other load their observations are refreshed by id below.
-        searchable = [src for src in enabled if src.type != "related" or src.id in refresh]
+        def searched_before(src) -> bool:
+            return (prev is not None and src.id in prev["source_results"]) or any(
+                src.id in st.source_ids for st in project.observations)
+
+        searchable = [src for src in enabled if src.type not in ("related", "rare") or src.id in refresh
+                      or (src.type == "rare" and not searched_before(src))]
         if prev is None:
             to_query = searchable
         else:
@@ -445,7 +452,18 @@ class JobManager:
 
         raw_all: list[dict] = []
         related_found: list[int] = []
+        rare_counts: dict[str, dict[int, tuple[int, int]]] = {}  # this load's Rare finds searches
         for n, src in enumerate(to_query, 1):
+            if src.type == "rare":
+                raws, rare_counts[src.id] = self._search_rare(job, src, n, len(to_query))
+                found = [int(r["id"]) for r in raws if r.get("id")]
+                related_found.extend(found)  # shown on their own for review, like "more photos"
+                earlier = prev["source_results"].get(src.id, []) if prev else []
+                listed = [st.id for st in project.observations if src.id in st.source_ids]
+                source_results[src.id] = list(dict.fromkeys(found + earlier + listed))
+                raw_all.extend(raws)
+                self._check_unique(source_results, enabled)
+                continue
             if src.type == "related":
                 raws = self._search_related(job, src, project, related_taxa, n, len(to_query))
                 found = [int(r["id"]) for r in raws if r.get("id")]
@@ -473,6 +491,12 @@ class JobManager:
                       total=total, duration_ms=(time.monotonic() - started) * 1000)
             self._check_unique(source_results, enabled)
 
+        for src in enabled:
+            if src.type == "rare" and src.id not in source_results:
+                # Not searched this time: it keeps the observations it found, so
+                # it counts as loaded (Load must not offer to search it again).
+                source_results[src.id] = [st.id for st in project.observations if src.id in st.source_ids]
+
         if raw_all:
             job.progress("taxa", 0, 0, "Looking up taxonomy")
             observations.update(self.client.normalize_all(raw_all))
@@ -493,6 +517,7 @@ class JobManager:
                 missing, lambda d, t: job.progress("refresh", d, t, "Refreshing saved observations"))
             observations.update(self.client.normalize_all(raws))
 
+        self._mark_rare(job, project, enabled, observations, source_results, rare_counts)
         project, summary = refresh_project(project, observations, source_results)
         # What this load's "more photos" search found, so the browser can show
         # just those (other new observations may still be waiting for review).
@@ -505,6 +530,12 @@ class JobManager:
             ids = summary["new_ids"]
             from .sorting import sort_ids
             sort = project.settings.sort
+            if enabled and all(src.type == "rare" for src in enabled) and sort.key == "taxonomic":
+                # A deck of rare finds starts rarest first.
+                sort = sort.model_copy(update={"key": "rarity", "direction": "asc", "base_key": "rarity",
+                                               "base_direction": "asc"})
+                project = project.model_copy(update={
+                    "settings": project.settings.model_copy(update={"sort": sort})})
             key = sort.key if sort.key not in ("custom",) else "taxonomic"
             ordered = sort_ids(ids, observations, project, key, sort.direction, workspace)
             try:
@@ -542,6 +573,59 @@ class JobManager:
                 f"Together these sources match {len(unique):,} observations; the limit is "
                 f"{limit:,}. Narrow a source or disable one."
             )
+
+    def _search_rare(self, job: Job, src, n: int, of: int) -> tuple[list[dict], dict[int, tuple[int, int]]]:
+        """Run one Rare finds search (see rare.py) within the request budgets.
+        Returns the observations to offer, and (worldwide, in the search)
+        counts of the chosen species."""
+        rare = src.rare
+        need = rare_finds.estimate_requests(rare.top)
+        with self._lock:
+            share_left = self.api_share() - self._client_usage(job.client)
+        left = min(self.client.budget.remaining(), share_left)
+        if need > left:
+            raise JobFailed(
+                f"Finding the {rare.top:,} rarest species can take up to {need:,} iNaturalist requests, and only "
+                f"{max(0, left):,} are left for you today. Ask for fewer species, or try again tomorrow (UTC).")
+        label = src.label or "Rare finds"
+        prefix = f"{label}" + (f" ({n} of {of})" if of > 1 else "")
+        steps = {"scan": "reading the species in the search", "count": "counting observations worldwide",
+                 "photos": "finding the observations"}
+
+        def progress(phase: str, done: int, total: int) -> None:
+            job.progress("search", done, total, f"{prefix}: {steps[phase]}")
+
+        job.progress("search", 0, 0, prefix)
+        started = time.monotonic()
+        result = rare_finds.search(self.client, source_params(src), rare, progress, job.cancel_event.is_set)
+        log_event(log, logging.INFO, "load.rare", source=src.url, taxa=result["taxa"], species=len(result["species"]),
+                  results=len(result["raws"]), capped=result["capped"], duration_ms=(time.monotonic() - started) * 1000)
+        if not result["species"]:
+            raise JobFailed(f"{label}: iNaturalist found no observations for that search." if not result["taxa"] else
+                            f"{label}: none of the observations in that search is identified to species, "
+                            "so there is nothing to rank.")
+        return result["raws"], {sp["id"]: (sp["world"], sp["local"]) for sp in result["species"]}
+
+    def _mark_rare(self, job: Job, project: Project, enabled, observations: dict[int, dict],
+                   source_results: dict[str, list[int]], scanned: dict[str, dict[int, tuple[int, int]]]) -> None:
+        """Put worldwide and in-search counts on the observations of enabled Rare
+        finds sources (``obs["rare"]``): from this load's search, or counted again
+        for observations fetched fresh (two requests per 200 species). Ones kept
+        from the previous workspace keep theirs."""
+        counted_at = rare_finds.today()
+        for src in enabled:
+            if src.type != "rare" or src.rare is None:
+                continue
+            ids = set(source_results.get(src.id, [])) | {st.id for st in project.observations if src.id in st.source_ids}
+            counts = dict(scanned.get(src.id, {}))
+            need = {
+                obs["taxon"]["id"] for oid in ids
+                if (obs := observations.get(oid)) and "rare" not in obs and (obs.get("taxon") or {}).get("id")
+            } - set(counts)
+            if need:
+                job.progress("counts", 0, 0, f"{src.label or 'Rare finds'}: counting observations worldwide")
+                counts.update(rare_finds.counts_for(self.client, source_params(src), need, job.cancel_event.is_set))
+            rare_finds.mark(observations, ids, src.id, counts, counted_at)
 
     def _search_related(self, job: Job, src, project: Project, related_taxa: list[int] | None,
                         n: int, of: int) -> list[dict]:
