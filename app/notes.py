@@ -88,6 +88,15 @@ iNaturalist's current identification; write about "name".
 Plain text only: no markdown, no bullet characters, no em dashes. Write in English.
 """
 
+WEB_SEARCH_PROMPT = """
+You can search the web. Use it to check what you are unsure of, above all the \
+describer, the year, the original name, the type locality and the meaning of \
+the name. Prefer Index Fungorum, MycoBank, the original description and \
+Wikipedia. Keep to one or two searches per organism. If good sources disagree, \
+say so briefly or leave the point out. Do not include URLs, citations or \
+specimen numbers, and do not mention the searches.
+"""
+
 NOTES_SCHEMA = {
     "type": "object",
     "properties": {
@@ -186,19 +195,22 @@ class ClaudeCliWriter:
     def __init__(self, settings: Settings):
         self.settings = settings
 
-    def command(self) -> list[str]:
+    def command(self, web_search: bool = False) -> list[str]:
         s = self.settings
+        # No tools, or only WebSearch (it runs at Anthropic; WebFetch would
+        # fetch pages from this server and stays off).
+        tools = ["--tools", "WebSearch", "--allowedTools", "WebSearch"] if web_search else ["--tools", ""]
         return [
             s.notes_cli, "-p",
             "--output-format", "json",
             "--json-schema", json.dumps(NOTES_SCHEMA, separators=(",", ":")),
             "--model", s.notes_model,
             "--effort", s.notes_effort,
-            "--tools", "",
+            *tools,
             "--strict-mcp-config",
             "--no-session-persistence",
             "--disable-slash-commands",
-            "--system-prompt", SYSTEM_PROMPT,
+            "--system-prompt", SYSTEM_PROMPT + (WEB_SEARCH_PROMPT if web_search else ""),
         ]
 
     def environment(self) -> dict[str, str]:
@@ -215,7 +227,8 @@ class ClaudeCliWriter:
             "DISABLE_ERROR_REPORTING": "1",
         }
 
-    def write_batch(self, subjects: dict[str, dict], cancelled: Callable[[], bool]) -> dict[str, str]:
+    def write_batch(self, subjects: dict[str, dict], cancelled: Callable[[], bool],
+                    web_search: bool = False) -> dict[str, str]:
         """Notes for each key of ``subjects`` that Claude answered; keys it left
         out are missing. Raises NotesError or NotesCancelled."""
         work = self.settings.claude_dir / "work"
@@ -223,13 +236,14 @@ class ClaudeCliWriter:
         started = time.monotonic()
         try:
             proc = subprocess.Popen(
-                self.command(), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                self.command(web_search), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 cwd=work, env=self.environment(), start_new_session=True,
             )
         except OSError as exc:
             log_event(log, logging.ERROR, "notes.cli_missing", error=type(exc).__name__)
             raise NotesError("Claude Code is not installed correctly on this server.", fatal=True) from None
-        out, err = self._communicate(proc, build_prompt(subjects).encode(), cancelled)
+        timeout = self.settings.notes_web_call_timeout if web_search else self.settings.notes_call_timeout
+        out, err = self._communicate(proc, build_prompt(subjects).encode(), cancelled, timeout)
         data = _result(out)
         if data is None or data.get("is_error") or data.get("subtype") != "success":
             raise _error_for(data, err, proc.returncode)
@@ -248,12 +262,13 @@ class ClaudeCliWriter:
                 text = clean_notes(item.get("bullets"))
                 if text:
                     written[item["key"]] = text
-        log_event(log, logging.INFO, "notes.call", names=len(subjects), written=len(written),
+        log_event(log, logging.INFO, "notes.call", names=len(subjects), written=len(written), web_search=web_search,
                   duration_ms=(time.monotonic() - started) * 1000, cost_usd=data.get("total_cost_usd"))
         return written
 
-    def _communicate(self, proc: subprocess.Popen, prompt: bytes, cancelled: Callable[[], bool]) -> tuple[bytes, bytes]:
-        deadline = time.monotonic() + self.settings.notes_call_timeout
+    def _communicate(self, proc: subprocess.Popen, prompt: bytes, cancelled: Callable[[], bool],
+                     timeout: float) -> tuple[bytes, bytes]:
+        deadline = time.monotonic() + timeout
         send = prompt
         while True:
             try:
@@ -265,7 +280,7 @@ class ClaudeCliWriter:
                     raise NotesCancelled() from None
                 if time.monotonic() > deadline:
                     _kill(proc)
-                    log_event(log, logging.WARNING, "notes.timeout", seconds=self.settings.notes_call_timeout)
+                    log_event(log, logging.WARNING, "notes.timeout", seconds=timeout)
                     raise NotesError("Claude took too long to answer.") from None
 
 

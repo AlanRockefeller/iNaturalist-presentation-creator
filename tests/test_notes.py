@@ -132,10 +132,10 @@ def _loaded(tc, fake):
     return _load(tc, _new_project(tc, _source(tc, URL_A, "a"), _source(tc, URL_B, "b")))
 
 
-def _notes(tc, result, ids=None, replace=False):
+def _notes(tc, result, ids=None, replace=False, web_search=False):
     r = tc.post("/api/notes", headers=CODE, json={
         "project": result["project"], "workspace_id": result["workspace_id"],
-        "observation_ids": ids, "replace": replace})
+        "observation_ids": ids, "replace": replace, "web_search": web_search})
     assert r.status_code == 200, r.text
     return wait_job(tc, r.json()["id"])
 
@@ -261,6 +261,29 @@ def test_notes_finished_after_stop_are_not_kept(notes_client, fake, notes_writer
     assert job["state"] == "cancelled" and job["result"]["notes"] == {}
 
 
+def test_selected_observations_only(notes_client, fake, notes_writer):
+    tc = notes_client
+    result = _loaded(tc, fake)
+    job = _notes(tc, result, ids=[1, 3])
+    assert job["state"] == "done" and set(job["result"]["notes"]) == {"1", "3"}
+
+
+def test_web_search_uses_smaller_batches_and_can_be_off(notes_client, fake, notes_writer, settings):
+    tc = notes_client
+    result = _loaded(tc, fake)  # 4 names
+    settings.notes_web_batch_size = 2
+    assert 'data-notes-web="1"' in tc.get("/").text
+    job = _notes(tc, result, web_search=True)
+    assert job["state"] == "done" and notes_writer.web_search == [True, True]
+    assert sorted(len(c) for c in notes_writer.calls) == [2, 2]
+
+    settings.notes_web_search = False
+    r = tc.post("/api/notes", headers=CODE, json={
+        "project": result["project"], "workspace_id": result["workspace_id"], "web_search": True, "replace": True})
+    assert r.status_code == 422 and "turned off" in r.json()["detail"]
+    assert 'data-notes-web="0"' in tc.get("/").text
+
+
 # ---------------------------------------------------------------- the CLI wrapper
 
 FAKE_CLI = r'''#!{python}
@@ -305,10 +328,10 @@ def cli(settings, tmp_path):
     settings.notes_access_code = "letmein"
     settings.claude_dir.mkdir(parents=True, exist_ok=True)
 
-    def run(mode, subjects=None, cancelled=lambda: False):
+    def run(mode, subjects=None, cancelled=lambda: False, web_search=False):
         (settings.claude_dir / "mode").write_text(mode)
         subjects = subjects or {"n0": {"name": "Amanita muscaria"}, "n1": {"name": "Hygrocybe conica"}}
-        return ClaudeCliWriter(settings).write_batch(subjects, cancelled)
+        return ClaudeCliWriter(settings).write_batch(subjects, cancelled, web_search=web_search)
 
     run.called = lambda: json.loads((settings.claude_dir / "called.json").read_text())
     return run
@@ -327,6 +350,16 @@ def test_cli_runs_without_tools_or_inherited_environment(cli, settings, monkeypa
     assert argv[argv.index("--model") + 1] == "claude-opus-5-5"
     assert "SOME_SERVER_SECRET" not in called["env"] and "CLAUDE_CODE_OAUTH_TOKEN" in called["env"]
     assert called["cwd"] == str(settings.claude_dir / "work")
+    assert "--allowedTools" not in argv and "You can search the web" not in argv[argv.index("--system-prompt") + 1]
+
+
+def test_cli_with_web_search_allows_only_websearch(cli, settings):
+    cli("ok", web_search=True)
+    argv = cli.called()["argv"]
+    assert argv[argv.index("--tools") + 1] == "WebSearch"
+    assert argv[argv.index("--allowedTools") + 1] == "WebSearch"
+    assert "WebFetch" not in " ".join(argv[:argv.index("--system-prompt")])
+    assert "You can search the web" in argv[argv.index("--system-prompt") + 1]
 
 
 def test_cli_answer_as_text_and_missing_keys(cli):

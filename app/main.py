@@ -256,6 +256,7 @@ def create_app(settings: Settings | None = None, services: Services | None = Non
                 "max_related_taxa": settings.max_related_taxa,
             },
             "notes_enabled": svc.notes_writer is not None,
+            "notes_web_search": svc.notes_writer is not None and settings.notes_web_search,
         })
 
     @app.get("/healthz")
@@ -350,11 +351,14 @@ def create_app(settings: Settings | None = None, services: Services | None = Non
         if verdict != "ok":
             raise HTTPException(403, "An access code is needed to write notes with Claude." if verdict == "missing"
                                 else "That access code is not right.")
+        if body.web_search and not settings.notes_web_search:
+            raise HTTPException(422, "Web search for notes is turned off on this server.")
         project = checked(body.project)
-        annotate(requested="all" if body.observation_ids is None else len(body.observation_ids), replace=body.replace)
+        annotate(requested="all" if body.observation_ids is None else len(body.observation_ids), replace=body.replace,
+                 web_search=body.web_search)
         try:
             job = svc.jobs.start_notes(client_key(request), project, body.workspace_id, body.observation_ids,
-                                       body.replace)
+                                       body.replace, body.web_search)
         except WorkspaceExpired:
             raise HTTPException(410, "Your session data expired. Reload the sources to continue.") from None
         except JobRejected as exc:

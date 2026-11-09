@@ -713,7 +713,7 @@ class JobManager:
     # -- presenter notes -----------------------------------------------------
 
     def start_notes(self, client: str, project: Project, workspace_id: str, ids: list[int] | None,
-                    replace: bool) -> Job:
+                    replace: bool, web_search: bool = False) -> Job:
         """Write presenter notes for ``ids`` (None: every observation with a
         slide). Observations that already have notes are skipped unless
         ``replace``. Notes are written once per name and given to every
@@ -749,11 +749,12 @@ class JobManager:
         if self.notes_budget.remaining() <= 0:
             raise JobRejected(self.notes_budget.message)
         work = list(groups.values())
-        return self._submit("notes", client, lambda job: self._notes(job, work, skipped),
+        return self._submit("notes", client, lambda job: self._notes(job, work, skipped, web_search),
                             self.settings.notes_timeout_seconds)
 
-    def _notes(self, job: Job, groups: list[dict], skipped: int) -> dict:
-        size = max(1, self.settings.notes_batch_size)
+    def _notes(self, job: Job, groups: list[dict], skipped: int, web_search: bool = False) -> dict:
+        # Searching the web takes longer per name, so fewer names per call.
+        size = max(1, self.settings.notes_web_batch_size if web_search else self.settings.notes_batch_size)
         batches = [groups[i:i + size] for i in range(0, len(groups), size)]
         total = len(groups)
         notes: dict[str, dict] = {}
@@ -795,14 +796,16 @@ class JobManager:
                 return {}, 0
             subjects = {f"n{i}": g["subject"] for i, g in enumerate(batch[:funded])}
             try:
-                written = self.notes_writer.write_batch(subjects, lambda: job.cancel_event.is_set() or stop.is_set())
+                written = self.notes_writer.write_batch(
+                    subjects, lambda: job.cancel_event.is_set() or stop.is_set(), web_search=web_search)
             except NotesCancelled:
                 raise JobCancelled() from None
             return written, funded
 
         publish()
         job.progress("notes", 0, total, f"Writing notes: 0 / {total}")
-        job.log_fields.update(names=total, observations=sum(len(g["ids"]) for g in groups), skipped=skipped)
+        job.log_fields.update(names=total, observations=sum(len(g["ids"]) for g in groups), skipped=skipped,
+                              web_search=web_search)
         done = 0
         try:
             with ThreadPoolExecutor(min(self.settings.notes_concurrency, len(batches)),

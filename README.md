@@ -424,6 +424,13 @@ name (`Psilocybe sp.`) gets notes about the genus. Where notes come from:
   fills observations that have no notes; ticking "also rewrite" replaces the
   rest too. Notes are written once per name, so every observation of
   *Amanita muscaria* gets the same text, and progress shows per name.
+- **Selected slides**: tick the box in the corner of Preview slides (it selects
+  the whole observation), then **Write notes for N selected observations…**.
+- **Search the web** (a checkbox in both dialogs, remembered in the browser):
+  Claude checks the describer, year, original name, type locality and the
+  name's meaning on the web first, preferring Index Fungorum, MycoBank, the
+  original description and Wikipedia. It is slower (4 names per call, up to
+  10 minutes per call) and uses more of the subscription.
 
 Notes are plain text in the project file, editable afterwards. A refresh never
 changes them. If an observation's name changes, its card and its Notes button
@@ -433,7 +440,9 @@ are flagged, and its notes stay until they are rewritten.
 (`claude -p`) as a subprocess, up to 8 names per call and 2 calls at a time,
 with a 240 s limit per call:
 
-- every tool is turned off (`--tools ""`, no MCP servers), so whatever a name
+- every tool is turned off (`--tools ""`, no MCP servers), or with "Search the
+  web" only Claude Code's WebSearch, which runs at Anthropic. WebFetch, which
+  would download pages from this server, is never allowed. So whatever a name
   says, it can only change the text that comes back; the answer is structured
   JSON (`--json-schema`) and is cleaned before it is kept;
 - our own system prompt replaces Claude Code's; it asks for well-established
@@ -461,6 +470,7 @@ was written.
 | `PRESENTATIONS_NOTES_EFFORT` | `medium` |
 | `PRESENTATIONS_NOTES_DAILY_BUDGET` | `1500` names per UTC day |
 | `PRESENTATIONS_NOTES_MAX_PER_JOB` | `1000` names |
+| `PRESENTATIONS_NOTES_WEB_SEARCH` | `1` (`0` hides "Search the web") |
 
 **Setting it up**: the install script copies the code owner's Claude Code CLI
 to `/usr/local/lib/presentations/claude` and creates

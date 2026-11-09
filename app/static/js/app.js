@@ -1891,12 +1891,14 @@
     $('#preview-warnings').replaceChildren(...plan.warnings.map((w) => el('div', { class: 'warning', text: w })));
     if (previewRenderer) previewRenderer.disconnect();
     $('#btn-notes-all').hidden = !Notes.claudeOn || c.images === 0;
+    Notes.updatePicks(); // a selection made earlier stays
     previewRenderer = chunkRender(grid, $('#preview-sentinel'), plan.slides, (spec, i) => {
       const wrap = el('div', { class: 'pslide' + (spec.kind === 'image' ? ' draggable' : ''), dataset: spec.kind === 'image' ? { obs: String(spec.observation_id) } : {} },
         el('span', { class: 'num', text: String(i + 1) }), slideNode(spec, plan.background));
       if (spec.kind === 'image') {
         wrap.draggable = true;
         wrap.append(Notes.button(spec.observation_id));
+        if (Notes.claudeOn) wrap.append(Notes.pick(spec.observation_id));
       }
       return wrap;
     }, min, 60);
@@ -2193,7 +2195,14 @@
   // observations with notes are skipped unless replacing).
   const Notes = (() => {
     const claudeOn = document.body.dataset.notesEnabled === '1';
+    const webOn = claudeOn && document.body.dataset.notesWeb === '1';
     $$('[data-notes-claude]').forEach((x) => { x.hidden = !claudeOn; });
+    $$('[data-notes-web]').forEach((x) => { x.hidden = !webOn; });
+    const WEB_KEY = 'dp-notes-web';
+    const picked = new Set(); // observations selected on Preview for "Write notes for selected"
+    // The "Search the web" choice is remembered in this browser.
+    const webChoice = () => { try { return webOn && localStorage.getItem(WEB_KEY) === '1'; } catch (e) { return false; } };
+    const setWebChoice = (on) => { try { localStorage.setItem(WEB_KEY, on ? '1' : '0'); } catch (e) { /* storage blocked */ } };
     const CODE_KEY = 'dp-notes-code';
     const modal = $('#notes-modal');
     const allModal = $('#notes-all-modal');
@@ -2224,13 +2233,13 @@
     }
 
     // Start a notes job, asking for the access code when needed. null: no code given.
-    async function start(ids, replace) {
+    async function start(ids, replace, web) {
       let code = storedCode() || await askCode();
       while (code) {
         try {
           const job = await api('/api/notes', {
             method: 'POST', headers: { 'X-Notes-Code': code },
-            body: { project: S.project, workspace_id: S.workspaceId, observation_ids: ids, replace },
+            body: { project: S.project, workspace_id: S.workspaceId, observation_ids: ids, replace, web_search: !!web },
           });
           storeCode(code);
           return job;
@@ -2246,9 +2255,9 @@
     // Write notes with Claude and put them in the project. Returns the
     // finished job (with .applied), or null if it never started or another
     // project was opened meanwhile.
-    async function run(ids, replace, onProgress) {
+    async function run(ids, replace, web, onProgress) {
       const gen = projectGen;
-      const job = await start(ids, replace);
+      const job = await start(ids, replace, web);
       if (!job) return null;
       jobId = job.id;
       try {
@@ -2327,6 +2336,7 @@
       text.value = st.notes || '';
       setStatus('');
       showState();
+      $('#notes-web').checked = webChoice();
       modalOnClose.set(modal, () => updateViews(id));
       openModal(modal);
       text.focus();
@@ -2369,7 +2379,9 @@
       writeBtn.textContent = 'Stop';
       setStatus('Claude is writing notes. This takes 10 to 30 seconds…');
       try {
-        const final = await run([id], true, (j) => {
+        const web = webOn && $('#notes-web').checked;
+        if (web) setStatus('Claude is searching the web and writing notes. This takes up to a minute or two…');
+        const final = await run([id], true, web, (j) => {
           if (j.state === 'queued') setStatus('Waiting for other notes to finish…');
         });
         if (!final) setStatus('');
@@ -2391,10 +2403,12 @@
     });
 
     // ---- every slide
+    // target: the selected observation ids, or null for every slide.
+    let target = null;
     function counts() {
       const slides = (S.plan && S.plan.slides) || [];
       const ids = [...new Set(slides.filter((sp) => sp.kind === 'image').map((sp) => sp.observation_id))]
-        .filter((id) => S.states.has(id) && effectiveName(id).trim());
+        .filter((id) => S.states.has(id) && effectiveName(id).trim() && (!target || target.has(id)));
       const without = ids.filter((id) => !S.states.get(id).notes);
       const names = (list) => new Set(list.map((id) => effectiveName(id).trim().toLowerCase())).size;
       return { all: ids, without, withNotes: ids.length - without.length, names };
@@ -2408,11 +2422,15 @@
       btn.textContent = list.length ? `Write notes for ${plural(c.names(list), 'name')}` : 'Write notes';
     }
 
-    function openAll() {
+    function openAll(selected = false) {
+      target = selected ? new Set(picked) : null;
       const c = counts();
+      const where = target ? `of the ${plural(c.all.length, 'selected observation')}` : 'in this presentation';
+      $('#notes-all-title').textContent = target ? 'Write notes for the selected slides' : 'Write notes for all slides';
       $('#notes-all-summary').textContent = c.without.length
-        ? `${plural(c.without.length, 'observation')} in this presentation (${plural(c.names(c.without), 'name')}) ${c.without.length === 1 ? 'has' : 'have'} no notes yet.`
-        : 'Every observation in this presentation has notes.';
+        ? `${plural(c.without.length, 'observation')} ${where} (${plural(c.names(c.without), 'name')}) ${c.without.length === 1 ? 'has' : 'have'} no notes yet.`
+        : (target ? 'Every selected observation has notes.' : 'Every observation in this presentation has notes.');
+      $('#notes-all-web').checked = webChoice();
       $('#notes-all-replace').checked = false;
       $('#notes-all-replace-row').hidden = c.withNotes === 0;
       $('#notes-all-replace-label').textContent = `Also rewrite the ${plural(c.withNotes, 'observation')} that already ${c.withNotes === 1 ? 'has' : 'have'} notes`;
@@ -2422,7 +2440,11 @@
       openModal(allModal);
     }
 
-    $('#btn-notes-all').addEventListener('click', openAll);
+    $('#btn-notes-all').addEventListener('click', () => openAll(false));
+    $('#btn-notes-selected').addEventListener('click', () => openAll(true));
+    $('#btn-notes-clear').addEventListener('click', () => { picked.clear(); updatePicks(); });
+    $('#notes-all-web').addEventListener('change', (e) => setWebChoice(e.target.checked));
+    $('#notes-web').addEventListener('change', (e) => setWebChoice(e.target.checked));
     $('#notes-all-replace').addEventListener('change', updateStart);
     $('#btn-notes-all-cancel').addEventListener('click', () => { if (allModal.dataset.busy) stop(); else closeModal(allModal); });
     $('#btn-notes-all-start').addEventListener('click', async () => {
@@ -2436,11 +2458,13 @@
       $('#notes-all-message').textContent = 'Starting…';
       setBar($('#notes-all-bar'), 0, 0);
       try {
-        const final = await run(null, replace, (j) => {
+        const web = webOn && $('#notes-all-web').checked;
+        const final = await run(target ? [...target] : null, replace, web, (j) => {
           $('#notes-all-message').textContent = j.message || (j.state === 'queued' ? 'Waiting for other notes to finish…' : 'Working…');
           setBar($('#notes-all-bar'), j.done, j.total);
         });
         if (!final) { $('#notes-all-progress').hidden = true; return; }
+        if (target && final.state === 'done') { picked.clear(); updatePicks(); }
         const done = `Notes written for ${plural(final.applied, 'observation')}.`;
         const failed = (final.result && final.result.failed) || [];
         let message = final.state === 'done' ? done
@@ -2460,7 +2484,29 @@
       }
     });
 
-    return { claudeOn, button, open, stale };
+    // ---- selecting slides on Preview (per observation: all its slides at once)
+    function pick(id) {
+      return el('input', {
+        type: 'checkbox', class: 'notes-pick', checked: picked.has(id),
+        title: 'Select for "Write notes for selected"', 'aria-label': 'Select this observation for Claude notes',
+        onclick: (e) => e.stopPropagation(),
+        onchange: (e) => {
+          if (e.target.checked) picked.add(id); else picked.delete(id);
+          updatePicks();
+        },
+      });
+    }
+    function updatePicks() {
+      $$('.pslide[data-obs]').forEach((w) => {
+        const box = $('.notes-pick', w);
+        if (box) box.checked = picked.has(Number(w.dataset.obs));
+      });
+      $('#btn-notes-selected').hidden = !claudeOn || picked.size === 0;
+      $('#btn-notes-clear').hidden = !claudeOn || picked.size === 0;
+      $('#btn-notes-selected').textContent = `Write notes for ${plural(picked.size, 'selected observation')}…`;
+    }
+
+    return { claudeOn, button, open, stale, pick, updatePicks };
   })();
   const notesStale = (id) => Notes.stale(id);
 

@@ -103,6 +103,11 @@ class Settings:
     notes_batch_size: int = 8       # names per Claude call
     notes_concurrency: int = 2      # Claude calls at once, in one job
     notes_call_timeout: float = 240.0
+    # "Search the web" lets Claude use Claude Code's WebSearch tool (run by
+    # Anthropic; WebFetch, which would fetch pages from this server, stays off).
+    notes_web_search: bool = field(default_factory=lambda: _env_int("PRESENTATIONS_NOTES_WEB_SEARCH", 1) == 1)
+    notes_web_batch_size: int = 4   # names per call when searching the web
+    notes_web_call_timeout: float = 600.0
     notes_timeout_seconds: int = 2 * 3600
     max_queued_notes: int = 3       # running plus waiting notes jobs, from all clients
 

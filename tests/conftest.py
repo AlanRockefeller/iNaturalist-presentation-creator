@@ -247,15 +247,17 @@ class FakeNotesWriter:
 
     def __init__(self):
         self.calls: list[dict] = []
+        self.web_search: list[bool] = []  # the web_search flag of each call
         self.fail_names: set[str] = set()
         self.error = None   # a NotesError to raise from every call
         self.block = None   # a threading.Event every call waits for
         self.ignore_cancel = False  # finish even after a cancel, like a call that ends just then
 
-    def write_batch(self, subjects, cancelled):
+    def write_batch(self, subjects, cancelled, web_search=False):
         from app.notes import NotesCancelled
 
         self.calls.append(subjects)
+        self.web_search.append(web_search)
         if self.block is not None:
             while not self.block.wait(0.02):
                 if cancelled() and not self.ignore_cancel:

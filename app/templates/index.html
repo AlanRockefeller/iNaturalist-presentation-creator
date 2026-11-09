@@ -9,7 +9,7 @@
   <link rel="stylesheet" href="/static/css/app.css?v={{ version }}">
   <script src="/static/js/theme.js?v={{ version }}"></script>
 </head>
-<body data-max-sources="{{ limits.max_sources }}" data-max-observations="{{ limits.max_observations }}" data-max-image-slides="{{ limits.max_image_slides }}" data-max-related-taxa="{{ limits.max_related_taxa }}" data-notes-enabled="{{ '1' if notes_enabled else '0' }}">
+<body data-max-sources="{{ limits.max_sources }}" data-max-observations="{{ limits.max_observations }}" data-max-image-slides="{{ limits.max_image_slides }}" data-max-related-taxa="{{ limits.max_related_taxa }}" data-notes-enabled="{{ '1' if notes_enabled else '0' }}" data-notes-web="{{ '1' if notes_web_search else '0' }}">
 
 <nav class="topnav">
   <div class="topnav-inner">
@@ -223,7 +223,11 @@
     <div class="statusline">
       <span id="preview-stats"></span>
       <span class="muted small">This is the actual slide sequence. Drag a photo slide to move its whole observation.</span>
-      <button type="button" class="btn btn-small" id="btn-notes-all" data-notes-claude hidden>Write notes for all slides…</button>
+      <span class="notes-tools">
+        <button type="button" class="btn btn-small" id="btn-notes-all" data-notes-claude hidden>Write notes for all slides…</button>
+        <button type="button" class="btn btn-small" id="btn-notes-selected" hidden></button>
+        <button type="button" class="btn btn-small" id="btn-notes-clear" hidden>Clear selection</button>
+      </span>
     </div>
     <div id="preview-warnings" class="warnings"></div>
     <div id="preview-grid" class="preview-grid"></div>
@@ -415,6 +419,7 @@
     <textarea id="notes-text" class="notes-text" rows="9" maxlength="4000" aria-label="Presenter notes"
               placeholder="Type notes here, or let Claude write them."></textarea>
     <p class="muted small">Shown in PowerPoint's presenter view on every slide of this observation. Saved in the project file.</p>
+    <label class="check small" data-notes-web hidden><input type="checkbox" id="notes-web"> Search the web first (slower, checks the dates, people and places)</label>
     <p class="small" id="notes-status" role="status" hidden></p>
     <div class="modal-foot">
       <button type="button" class="btn" id="btn-notes-claude" data-notes-claude hidden>Write with Claude</button>
@@ -434,6 +439,7 @@
     </div>
     <p id="notes-all-summary"></p>
     <label class="check" id="notes-all-replace-row"><input type="checkbox" id="notes-all-replace"> <span id="notes-all-replace-label"></span></label>
+    <label class="check" data-notes-web hidden><input type="checkbox" id="notes-all-web"> Search the web first (slower: about a minute for every few names, but the dates, people and places are checked)</label>
     <p class="muted small">Claude writes up to 8 short points about each name: who described it, when and where, the describer, what the name means, edibility and toxicity, ecology, range and its story. Observations with the same name get the same notes. You can edit them afterwards.</p>
     <div id="notes-all-progress" class="progress-block" hidden>
       <div class="progress"><div class="bar" id="notes-all-bar"></div></div>

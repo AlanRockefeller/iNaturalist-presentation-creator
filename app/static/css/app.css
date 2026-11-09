@@ -395,5 +395,7 @@ kbd { font-size: .7rem; border: 1px solid #555; border-radius: 4px; padding: 0 4
 .notes-text { width: 100%; min-height: 180px; resize: vertical; font: inherit; font-size: .92rem; line-height: 1.45; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel-2); color: var(--text); margin-top: 8px; }
 .notes-text:focus-visible { outline: 2px solid var(--journal-gold); outline-offset: 1px; }
 #notes-status.error { color: #8a2e1e; }
+.pslide .notes-pick { position: absolute; top: 6px; right: 6px; z-index: 2; width: 18px; height: 18px; margin: 0; cursor: pointer; accent-color: var(--journal-gold); }
+.notes-tools { display: inline-flex; gap: 8px; flex-wrap: wrap; }
 html.dark #notes-status.error { color: #ffb4a4; }
 #notes-code-input { width: 100%; font: inherit; font-weight: 400; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; min-height: 38px; }

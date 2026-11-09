@@ -280,3 +280,5 @@ class NotesRequest(ProjectRequest):
     observation_ids: Optional[list[int]] = Field(default=None, max_length=_LIMITS["observations"])
     # False: skip observations that already have notes.
     replace: bool = False
+    # Let Claude search the web to check its facts (slower).
+    web_search: bool = False
