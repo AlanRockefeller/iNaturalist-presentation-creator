@@ -24,6 +24,7 @@ small JSON project file; the server holds only short-lived temporary data.
 - [How refresh works](#how-refresh-works)
 - [PowerPoint generation rules](#powerpoint-generation-rules)
 - [Presenter notes](#presenter-notes)
+- [Rare finds](#rare-finds)
 - [Security and limits](#security-and-limits)
 - [Development](#development)
 - [Production layout](#production-layout)
@@ -38,7 +39,8 @@ small JSON project file; the server holds only short-lived temporary data.
    optionally with your iNaturalist username. Several sources can be combined,
    labeled and disabled. Each is marked **Mine** (your own photos) or **Search**
    (may include other people's); a search limited to one user can be switched
-   between the two.
+   between the two. **Find the rarest species…** adds a search as
+   [Rare finds](#rare-finds) instead.
 2. **Select & Organize**: one card per observation with its name, common name,
    date, place, observer, a visible favorite count (♥ 17) and a checkbox for every
    photo. Only the first photo of each observation starts checked; tick others to
@@ -76,6 +78,7 @@ browser (vanilla JS, no framework)          FastAPI (single Uvicorn worker)
                                                      ├─ related.py      "more photos" searches of a project's species
                                                      ├─ jobs.py         background load/generate/notes jobs
                                                      ├─ notes.py        presenter notes via the Claude Code CLI
+                                                     ├─ rare.py         Rare finds: a search's rarest species worldwide
                                                      ├─ ratelimit.py    1 req/s limiter, daily/hourly budgets
                                                      └─ diagnostics.py  request and job logging
 ```
@@ -93,6 +96,7 @@ browser (vanilla JS, no framework)          FastAPI (single Uvicorn worker)
 | `app/related.py` | "More photos of the same species": search parameters, licenses, and the request plan (top N per species, most favorited first). |
 | `app/jobs.py` | Thread-pool jobs with progress, cancellation, timeouts, per-client and global limits, cleanup. |
 | `app/notes.py` | Presenter notes: what Claude is told, the `claude -p` subprocess, cleaning its answer, the access code. |
+| `app/rare.py` | Rare finds: the species scan, live worldwide counts, picking observations, counts on later loads. |
 | `app/diagnostics.py` | Request IDs, one log line per request and per job, client addresses (IPv6 grouped by /64). |
 
 **Workspaces.** Sorting, previewing and generating need metadata for up to
@@ -224,7 +228,7 @@ kB. Photos and full iNaturalist metadata are **not** embedded.
 ```json
 {
   "format": "dikarya-presentation",
-  "schema_version": 7,
+  "schema_version": 8,
   "saved_at": "2026-10-06T03:40:00Z",
   "app_version": "1.0.0",
   "sources": [
@@ -303,13 +307,19 @@ kB. Photos and full iNaturalist metadata are **not** embedded.
   point per line, at most 4,000 characters. `notes_name` is the name they were
   written for, so the app can point out notes about an old name.
   `settings.presenter_notes` puts them in the deck. Added in schema 7.
+- A `rare` source (Rare finds) is a search plus `rare`: `top` (how many species,
+  1 to 100), `per_taxon` (observations per species, 1 to 20),
+  `described_only` and `commercial_only`. The counts are not saved: they are
+  fetched again on each load. `annotations.rarity`, `overrides.rarity`,
+  `show_lines.rarity`, the `rarity` sort and `settings.about_slide` go with it.
+  Added in schema 8.
 - **Validation** (`project.load_project`): wrong `format`, missing or non-integer
   `schema_version`, a newer schema than the server supports, out-of-range values,
   oversized lists, duplicate source ids, and source URLs that fail the same
   parser as new input are all rejected with a readable message. Unknown keys are
   ignored. Inconsistent `order`/duplicate observations are normalized.
 - **Schema versions**: `_migrate()` in `app/project.py` upgrades older files one
-  version at a time (currently 1 to 7). Bump `SCHEMA_VERSION` in `app/models.py`
+  version at a time (currently 1 to 8). Bump `SCHEMA_VERSION` in `app/models.py`
   and add a step there when the format or its meaning changes.
 - **Limits that keep a file loadable**: at most 200 photos are remembered per
   observation (iNaturalist photos past that are not offered) and the newest
@@ -360,7 +370,8 @@ first photo of each selected, in default taxonomic order.
 - **Annotation** (lower-left, small margin, no backing box): the scientific/taxon
   name in *italic* ~28 pt. Optional lines below it at 18 pt: English common name,
   date (`November 14, 2026`), iNaturalist place description, observer
-  (`Photo: <display name or login>`). Only the scientific name is italic. On black
+  (`Photo: <display name or login>`) and, for [Rare finds](#rare-finds),
+  `12 observations worldwide · #3 rarest`. Only the scientific name is italic. On black
   slides the text is white with a subtle dark shadow; on white slides it is
   near-black with a light halo, so it stays readable over the white letterbox.
 - **Names**: the current iNaturalist identification at whatever rank
@@ -394,6 +405,11 @@ first photo of each selected, in default taxonomic order.
   license attribution (setting `speaker_notes`), and the observation's
   presenter notes between them, set off by blank lines (setting
   `presenter_notes`). Every photo slide of an observation has the same notes.
+  Rare finds add `12 observations on iNaturalist worldwide as of <date>; 1 of
+  them in this search.`
+- **About these numbers** (Rare finds only, setting `about_slide`): a last slide
+  saying when the counts were taken, that only species and finer ranks are
+  counted, why provisional names have low counts, and which searches were used.
 - Text stays editable; photos stay picture objects; nothing is rasterized.
 - **Memory**: image parts are streamed from disk when the file is written, and
   media are stored without zip deflate. A 400-photo, 1 GB deck was built with a
@@ -477,6 +493,46 @@ to `/usr/local/lib/presentations/claude` and creates
 `/etc/presentations/notes.env` (root:presentations, 0640) once, empty. Run
 `claude setup-token` as the code owner, put the token and an access code in
 that file, and restart. Re-run the install script to update the CLI copy.
+
+## Rare finds
+
+**Find the rarest species…** (next to Add source) adds a search as a Rare
+finds source. It replaces the old dikarya.us/rare-finds page. It ranks the
+species in the search by how many observations iNaturalist has of each
+worldwide, keeps the rarest (15 by default, up to 100), and offers their best
+observations *from the search itself* for review: research grade first, then
+the most favorites, 1 per species by default. Options: described species only
+(no provisional names such as `Inocybe sp. 'PNW77'`), and only photos licensed
+for commercial use.
+
+Their slides get the line `12 observations worldwide · #3 rarest` (it says
+"tied for" when another species has the same count, which is common: many
+species have a single observation worldwide). The speaker notes get the count
+with its date and how many of them are in the search, and the deck gets an
+**About these numbers** slide at the end. "Rarest first" sorts by the count,
+and a deck of only Rare finds starts sorted that way. The rank is the place
+among that source's species in the deck. The line can be hidden or reworded
+per observation (Slide text) or turned off in Presentation Settings.
+
+How it searches (`app/rare.py`, every request through `INatClient`):
+
+1. `/v2/observations/species_counts` for the search, rarest in the search
+   first, 500 a page (that endpoint's most; fewer requests than 200), at most
+   20 pages, so at most 10,000 taxa. This works on searches far larger than a
+   normal source's 10,000 observations. Only species and finer ranks count.
+2. Live worldwide counts (any quality grade) for the likely rarest, re-counted
+   until the top N are all live. A taxon's cached count can be badly stale,
+   for example 0 for a renamed taxon, so it only decides what to re-count. A
+   species with observed varieties has no row of its own and is counted on
+   its own.
+3. The chosen species' observations within the search.
+
+It runs when the source is first loaded and again only with **Search again**,
+never on a refresh. Each later load re-counts the project's rare species, two
+requests per 200 species, so the line stays current; the counts are never
+written to the project file. A search costs about 10 to 30 requests, at most
+`estimate_requests(top)` (60 for 15 species), and it is refused when the
+client's daily share has fewer left.
 
 ## Security and limits
 

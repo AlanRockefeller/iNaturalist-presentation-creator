@@ -83,6 +83,11 @@ def _inner_key(key: str, obs: dict, state: ObservationState | None, original_ind
         return _text_key(effective_name(state, obs))
     if key == "original":
         return original_index.get(obs["id"], (10**9, 10**9))
+    if key == "rarity":
+        # Fewest observations worldwide first (Rare finds counts, see rare.py);
+        # observations without a count after them.
+        info = obs.get("rare")
+        return (0, int(info.get("world") or 0)) if info else (1, 0)
     return (0,)
 
 

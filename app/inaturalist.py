@@ -38,6 +38,10 @@ log = get_logger(__name__)
 
 LIFE_TAXON_ID = 48460
 PER_PAGE = 200
+SPECIES_PER_PAGE = 500  # species_counts allows 500 a page: fewer requests than 200
+SPECIES_COUNT_FIELDS = (
+    "(count:!t,taxon:(id:!t,name:!t,rank:!t,rank_level:!t,preferred_common_name:!t,observations_count:!t))"
+)
 ID_BATCH = 200
 GROUP_RANKS = ("kingdom", "phylum", "class", "order", "family", "genus")
 
@@ -725,6 +729,27 @@ class INatClient:
         query["page"] = str(page)
         data = self._get("/v2/observations", query)
         return list(data.get("results") or []), int(data.get("total_results") or 0)
+
+    def species_counts(self, params: dict[str, str], page: int = 1,
+                       per_page: int = SPECIES_PER_PAGE) -> tuple[list[dict], int]:
+        """One page of /v2/observations/species_counts for a search: rows of
+        {count, taxon}, and how many taxa there are. Only leaf taxa get a row (a
+        species with observed varieties has none; see rare.py). Never past
+        iNaturalist's 10,000 results."""
+        per_page = max(1, min(SPECIES_PER_PAGE, int(per_page)))
+        if page < 1 or page * per_page > 10_000:
+            raise INatError("That search goes past the 10,000 results iNaturalist allows.")
+        query = dict(params)
+        query.update(locale="en", per_page=str(per_page), page=str(page), fields=SPECIES_COUNT_FIELDS)
+        data = self._get("/v2/observations/species_counts", query)
+        return list(data.get("results") or []), int(data.get("total_results") or 0)
+
+    def count_observations(self, params: dict[str, str]) -> int:
+        """How many observations match ``params`` (no results are fetched)."""
+        query = dict(params)
+        query["per_page"] = "0"
+        data = self._get("/v2/observations", query)
+        return int(data.get("total_results") or 0)
 
     def fetch_by_ids(self, ids: Iterable[int], progress: ProgressFn | None = None) -> list[dict]:
         """Observations by id, batched; ids that no longer exist are absent."""

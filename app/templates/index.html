@@ -71,6 +71,7 @@
           <input type="text" id="source-username" maxlength="40" placeholder="your_username" autocapitalize="off" spellcheck="false">
         </label>
         <button type="submit" class="btn btn-primary" id="btn-add-source">Add source</button>
+        <button type="button" class="btn btn-gold" id="btn-add-rare" title="Rank the species in this search by how rarely iNaturalist has them worldwide">Find the rarest species…</button>
       </form>
       <p class="form-error" id="source-error" role="alert"></p>
       <ul class="source-list" id="source-list"></ul>
@@ -86,6 +87,7 @@
         <li>Any filter the iNaturalist observations page supports works here, for example <code>taxon_id</code>, <code>place_id</code>, <code>project_id</code>, <code>d1</code>/<code>d2</code> dates and <code>quality_grade</code>.</li>
         <li>Each source can match at most {{ "{:,}".format(limits.max_observations_per_source) }} observations, the most iNaturalist allows in one search. Add filters to narrow a larger one.</li>
         <li>A source with your username, or a link limited to one iNaturalist user, counts as your own photos (<strong>Mine</strong>), so photo credits start off. Other sources (<strong>Search</strong>) may include other people's photos, so credits start on. Click Mine or Search on a source limited to one user to change it.</li>
+        <li><strong>Find the rarest species…</strong> ranks the species in a search by how many observations iNaturalist has of each worldwide, and offers the rarest for review. Their slides then say, for example, “12 observations worldwide · #3 rarest”.</li>
         <li>Thumbnails load directly from iNaturalist. Full-resolution photos are downloaded only when you generate the PowerPoint.</li>
       </ul>
     </div>
@@ -105,6 +107,7 @@
             <option value="name">Scientific name</option>
             <option value="original">iNaturalist result order</option>
             <option value="random">Random</option>
+            <option value="rarity">Rarest first (Rare finds)</option>
             <option value="custom" disabled>Custom (dragged)</option>
           </select>
           <button type="button" class="btn btn-small" id="sort-dir" title="Toggle ascending/descending" aria-label="Sort direction">↑ Asc</button>
@@ -201,6 +204,7 @@
           <label class="check"><input type="checkbox" id="ann-date"> Observation date</label>
           <label class="check"><input type="checkbox" id="ann-location"> Location (iNaturalist place description)</label>
           <label class="check"><input type="checkbox" id="ann-observer"> Observer credit on other people's photos <span class="muted small" id="observer-note"></span></label>
+          <label class="check"><input type="checkbox" id="ann-rarity" checked> Rare finds: worldwide count and rank <span class="muted small">(“12 observations worldwide · #3 rarest”)</span></label>
         </div>
         <div class="field">
           <span>Groups</span>
@@ -210,6 +214,7 @@
           <span>Speaker notes <span class="muted small">(only you see these, in PowerPoint's presenter view)</span></span>
           <label class="check"><input type="checkbox" id="set-notes" checked> Name, iNaturalist link and photo credit</label>
           <label class="check"><input type="checkbox" id="set-presenter-notes" checked> Presenter notes (typed by you, or written by Claude on the Preview step)</label>
+          <label class="check"><input type="checkbox" id="set-about-slide" checked> An “About these numbers” slide at the end, when the deck has rare finds</label>
         </div>
       </div>
     </div>
@@ -404,6 +409,37 @@
       <input type="search" id="picker-find" placeholder="Filter by name…" maxlength="100">
     </div>
     <div class="picker-scroll"><div id="picker-grid" class="picker-grid"></div><div id="picker-sentinel" class="sentinel"></div></div>
+  </div>
+</div>
+
+<!-- Rare finds -->
+<div class="modal" id="rare-modal" hidden>
+  <div class="modal-box narrow" role="dialog" aria-modal="true" aria-labelledby="rare-title">
+    <div class="modal-head">
+      <h2 id="rare-title">Find the rarest species</h2>
+      <button type="button" class="icon-btn close" data-close aria-label="Close">×</button>
+    </div>
+    <form id="rare-form">
+      <p class="small">Ranks the species in this search by how many observations iNaturalist has of each worldwide, and offers the rarest for review, with photos from the search itself.</p>
+      <p class="muted small rare-search" id="rare-search"></p>
+      <div class="rare-numbers">
+        <label class="field">How many species
+          <input type="number" id="rare-top" min="1" max="100" step="1" value="15" required>
+        </label>
+        <label class="field">Observations per species
+          <input type="number" id="rare-per" min="1" max="20" step="1" value="1" required>
+        </label>
+      </div>
+      <label class="check"><input type="checkbox" id="rare-described"> Described species only (leave out provisional names)</label>
+      <label class="check"><input type="checkbox" id="rare-commercial"> Only photos licensed for commercial use</label>
+      <p class="muted small">The search runs when you load it, and again only when you press Search again: about 30 to 60 requests to iNaturalist. The counts are updated on every refresh.</p>
+      <p class="form-error" id="rare-error" role="alert"></p>
+      <div class="modal-foot">
+        <span class="grow"></span>
+        <button type="button" class="btn" data-close>Cancel</button>
+        <button type="submit" class="btn btn-primary" id="btn-rare-add">Add Rare finds</button>
+      </div>
+    </form>
   </div>
 </div>
 

@@ -67,7 +67,7 @@ def test_plan_multiple_photos_selection_and_life():
     assert imgs[0]["observation_id"] == imgs[1]["observation_id"] == 1
     assert imgs[2]["lines"] == []  # "Life" -> no taxon annotation
     assert imgs[0]["lines"][0] == {"field": "scientific", "text": "Hygrocybe conica", "italic": True, "size": 28}
-    assert plan["counts"] == {"total": 5, "title": 1, "dividers": 0, "images": 4, "observations": 3}
+    assert plan["counts"] == {"total": 5, "title": 1, "dividers": 0, "images": 4, "observations": 3, "about": 0}
 
 
 def test_plan_min_faves_dividers_and_order():

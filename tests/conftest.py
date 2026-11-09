@@ -41,6 +41,7 @@ TAXA = {
     47700: ("Strophariaceae", "family", 47167),
     47701: ("Psilocybe", "genus", 47700),
     47702: ("Psilocybe cyanescens", "species", 47701),
+    47695: ("Hygrocybe 'PNW05'", "species", 47691),  # a provisional name
 }
 COMMON = {47692: "Witch's Hat", 47602: "Fly Agaric", 47702: "Wavy Cap"}
 
@@ -105,6 +106,10 @@ class FakeINat:
         self.photo_dims: dict[int, tuple[int, int]] = {}
         self.fail_429_times = 0
         self.deleted_photos: set[int] = set()
+        # Rare finds: observations iNaturalist has elsewhere (added to worldwide
+        # counts), and taxa's cached observations_count (stale on purpose).
+        self.world_extra: dict[int, int] = {}
+        self.cached_counts: dict[int, int] = {}
 
     def add(self, *obs):
         for o in obs:
@@ -131,6 +136,8 @@ class FakeINat:
                 return httpx.Response(429, headers={"Retry-After": "0"})
             if request.url.path == "/v2/observations":
                 return self._observations(request)
+            if request.url.path == "/v2/observations/species_counts":
+                return self._species_counts(request)
             if request.url.path == "/v2/taxa":
                 return self._taxa(request)
             return httpx.Response(404)
@@ -155,6 +162,52 @@ class FakeINat:
             ids = {int(i) for i in q["id"].split(",")}
             res = [self._public(o) for o in self.observations if o["id"] in ids]
             return httpx.Response(200, json={"total_results": len(res), "page": 1, "per_page": per_page, "results": res})
+        res = self._filtered(q)
+        if q.get("order_by") == "votes":  # favorites, most first (stable, like id order)
+            res.sort(key=lambda o: o["faves_count"], reverse=q.get("order") != "asc")
+        total = len(res)
+        if per_page == 0 and self._worldwide(q):  # a count of one taxon, everywhere
+            total += sum(self.world_extra.get(int(t), 0) for t in q["taxon_id"].split(","))
+        page = int(q.get("page", 1))
+        chunk = res[(page - 1) * per_page: page * per_page]
+        return httpx.Response(200, json={
+            "total_results": total, "page": page, "per_page": per_page,
+            "results": [self._public(o) for o in chunk],
+        })
+
+    @staticmethod
+    def _worldwide(q) -> bool:
+        """A query limited by taxon only."""
+        return "taxon_id" in q and not set(q.keys()) - {"taxon_id", "per_page", "page", "fields", "locale", "order"}
+
+    def _species_counts(self, request):
+        """Leaf taxa only, like iNaturalist: a taxon with an observed descendant
+        in the results gets no row of its own."""
+        q = request.url.params
+        res = self._filtered(q)
+        present = {o["taxon"]["id"]: o["taxon"] for o in res if o["taxon"]}
+        below = {a for t in present.values() for a in t["ancestor_ids"] if a != t["id"]}
+        counts: dict[int, int] = {}
+        for o in res:
+            t = o["taxon"]
+            if t and t["id"] not in below:
+                counts[t["id"]] = counts.get(t["id"], 0) + 1
+        world = self._worldwide(q)
+        rows = []
+        for tid, n in counts.items():
+            n += self.world_extra.get(tid, 0) if world else 0
+            t = present[tid]
+            rows.append({"count": n, "taxon": {
+                "id": tid, "name": t["name"], "rank": t["rank"], "rank_level": t["rank_level"],
+                "preferred_common_name": t.get("preferred_common_name"),
+                "observations_count": self.cached_counts.get(tid, n),
+            }})
+        rows.sort(key=lambda r: (r["count"], r["taxon"]["id"]), reverse=q.get("order") != "asc")
+        per_page, page = int(q.get("per_page", 500)), int(q.get("page", 1))
+        return httpx.Response(200, json={"total_results": len(rows), "page": page, "per_page": per_page,
+                                         "results": rows[(page - 1) * per_page: page * per_page]})
+
+    def _filtered(self, q) -> list[dict]:
         res = list(self.observations)
         if "user_id" in q:
             res = [o for o in res if o["user"]["login"] == q["user_id"]]
@@ -172,14 +225,7 @@ class FakeINat:
             res = [o for o in res if o["taxon"] and want & set(o["taxon"]["ancestor_ids"])]
         if "place_id" in q:
             res = [o for o in res if str(o["_place_id"]) == q["place_id"]]
-        if q.get("order_by") == "votes":  # favorites, most first (stable, like id order)
-            res.sort(key=lambda o: o["faves_count"], reverse=q.get("order") != "asc")
-        page = int(q.get("page", 1))
-        chunk = res[(page - 1) * per_page: page * per_page]
-        return httpx.Response(200, json={
-            "total_results": len(res), "page": page, "per_page": per_page,
-            "results": [self._public(o) for o in chunk],
-        })
+        return res
 
     def _taxa(self, request):
         ids = [int(i) for i in request.url.params["id"].split(",")]

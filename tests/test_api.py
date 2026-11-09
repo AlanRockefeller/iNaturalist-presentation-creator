@@ -92,7 +92,7 @@ def test_saved_project_refresh_finds_new_and_unavailable(app_client, fake):
     project = _new_project(tc, _source(tc, "https://www.inaturalist.org/observations?taxon_id=47170", "a", username="alice"), _source(tc, URL_B, "b"))
     first = _load(tc, project)
     saved = tc.post("/api/project/export", json={"project": first["project"]}).json()
-    assert saved["format"] == "dikarya-presentation" and saved["schema_version"] == 7
+    assert saved["format"] == "dikarya-presentation" and saved["schema_version"] == 8
     text = json.dumps(saved)
     assert "square.jpg" not in text and "faves_count" not in text
 
@@ -167,7 +167,7 @@ def test_parse_endpoint_rejects_bad_sources(app_client):
 
 def test_invalid_project_file(app_client):
     assert app_client.post("/api/project/validate", content=b"{not json").status_code == 422
-    r = app_client.post("/api/project/validate", content=json.dumps({"format": "dikarya-presentation", "schema_version": 8}))
+    r = app_client.post("/api/project/validate", content=json.dumps({"format": "dikarya-presentation", "schema_version": 9}))
     assert r.status_code == 422 and "newer" in r.json()["detail"]
 
 
