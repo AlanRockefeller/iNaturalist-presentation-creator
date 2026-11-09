@@ -795,10 +795,10 @@ class JobManager:
                 return {}, 0
             subjects = {f"n{i}": g["subject"] for i, g in enumerate(batch[:funded])}
             try:
-                return self.notes_writer.write_batch(
-                    subjects, lambda: job.cancel_event.is_set() or stop.is_set()), funded
+                written = self.notes_writer.write_batch(subjects, lambda: job.cancel_event.is_set() or stop.is_set())
             except NotesCancelled:
                 raise JobCancelled() from None
+            return written, funded
 
         publish()
         job.progress("notes", 0, total, f"Writing notes: 0 / {total}")
@@ -817,6 +817,10 @@ class JobManager:
                             if exc.fatal:
                                 raise
                             written, funded = {}, len(batch)
+                        if job.cancel_event.is_set():
+                            # Stopped while Claude wrote: what it wrote now is not
+                            # kept; batches finished before the stop are.
+                            raise JobCancelled()
                         for i, g in enumerate(batch):
                             text = written.get(f"n{i}")
                             if i >= funded:

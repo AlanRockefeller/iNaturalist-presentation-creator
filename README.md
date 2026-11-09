@@ -224,7 +224,7 @@ kB. Photos and full iNaturalist metadata are **not** embedded.
 ```json
 {
   "format": "dikarya-presentation",
-  "schema_version": 6,
+  "schema_version": 7,
   "saved_at": "2026-10-06T03:40:00Z",
   "app_version": "1.0.0",
   "sources": [

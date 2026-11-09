@@ -230,7 +230,32 @@ log "5b. Claude Code CLI for presenter notes (optional)"
 owner_home=$(getent passwd "$CODE_OWNER" | cut -d: -f6)
 CLAUDE_SRC=${CLAUDE_SRC:-$owner_home/.local/bin/claude}
 claude_real=$(readlink -f -- "$CLAUDE_SRC" 2>/dev/null || true)
-if [[ -n $claude_real && -f $claude_real && -x $claude_real ]]; then
+# trusted_path <path>: the path and every directory above it belong to root or
+# $CODE_OWNER and no one else can write to them (group write only for a group
+# with no other members). Then no other user can swap the file, before or while
+# it is copied. ($CODE_OWNER already owns the app code.)
+group_trusted() {
+  local g=$1 gid u
+  gid=$(getent group "$g" | cut -d: -f3) || return 1
+  for u in $(getent group "$g" | cut -d: -f4 | tr ',' ' ') $(getent passwd | awk -F: -v gid="$gid" '$4 == gid {print $1}'); do
+    [[ $u == root || $u == "$CODE_OWNER" ]] || return 1
+  done
+}
+trusted_path() {
+  local p=$1 owner mode
+  while :; do
+    owner=$(stat -c %U -- "$p" 2>/dev/null) || return 1
+    mode=$(stat -c %a -- "$p" 2>/dev/null) || return 1
+    [[ $owner == root || $owner == "$CODE_OWNER" ]] || return 1
+    (( (8#$mode & 8#002) == 0 )) || return 1
+    if (( 8#$mode & 8#020 )); then group_trusted "$(stat -c %G -- "$p")" || return 1; fi
+    [[ $p == / ]] && return 0
+    p=$(dirname -- "$p")
+  done
+}
+if [[ -n $claude_real && -f $claude_real && -x $claude_real ]] && ! trusted_path "$claude_real"; then
+  warn "$claude_real (or a folder above it) is not owned by root or $CODE_OWNER, or others can write to it; not copied, presenter notes stay off"
+elif [[ -n $claude_real && -f $claude_real && -x $claude_real ]]; then
   install -d -m 0755 -o root -g root "$(dirname "$NOTES_CLI")"
   if [[ -f $NOTES_CLI ]] && cmp -s "$claude_real" "$NOTES_CLI"; then
     info "Claude Code CLI unchanged"

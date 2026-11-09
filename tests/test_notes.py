@@ -5,6 +5,8 @@ run a small fake ``claude`` script.
 """
 
 import json
+import os
+import signal
 import stat
 import sys
 import threading
@@ -100,6 +102,9 @@ def test_access_guard_locks_after_repeated_wrong_codes():
     now[0] = 61
     assert guard.check("a", "secret") == "ok"
     assert AccessGuard("").check("a", "anything") == "denied"
+    long_code = "x" * 200
+    assert AccessGuard(long_code).check("a", long_code + "y") == "denied"
+    assert AccessGuard("y" * 250).check("a", "y" * 250) == "ok"
 
 
 def test_notes_are_off_without_a_writer_and_code(app_client):
@@ -239,6 +244,23 @@ def test_cancel_stops_writing(notes_client, fake, notes_writer):
     assert tc.get("/healthz").json()["jobs"]["notes"] == 0
 
 
+def test_notes_finished_after_stop_are_not_kept(notes_client, fake, notes_writer):
+    tc = notes_client
+    result = _loaded(tc, fake)
+    notes_writer.block = threading.Event()
+    notes_writer.ignore_cancel = True  # Claude finishes its answer after all
+    r = tc.post("/api/notes", headers=CODE, json={
+        "project": result["project"], "workspace_id": result["workspace_id"], "observation_ids": [1], "replace": True})
+    job_id = r.json()["id"]
+    deadline = time.time() + 5
+    while not notes_writer.calls and time.time() < deadline:
+        time.sleep(0.02)
+    assert tc.delete(f"/api/jobs/{job_id}").status_code == 200
+    notes_writer.block.set()
+    job = wait_job(tc, job_id)
+    assert job["state"] == "cancelled" and job["result"]["notes"] == {}
+
+
 # ---------------------------------------------------------------- the CLI wrapper
 
 FAKE_CLI = r'''#!{python}
@@ -266,6 +288,9 @@ elif mode == "garbage":
     print("not json")
     sys.exit(1)
 elif mode == "sleep":
+    import subprocess
+    child = subprocess.Popen(["/bin/sleep", "30"])  # something the CLI started
+    open(os.path.join(home, "pids"), "w").write(f"{{os.getpid()}} {{child.pid}}")
     time.sleep(30)
 '''
 
@@ -319,17 +344,43 @@ def test_cli_errors(cli, mode, message, fatal):
     assert info.value.fatal is fatal
 
 
+def _running(pid: int) -> bool:
+    """A process that exists and is not a zombie waiting to be reaped."""
+    try:
+        with open(f"/proc/{pid}/stat") as fh:
+            return fh.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except (FileNotFoundError, ProcessLookupError, IndexError):
+        return False
+
+
+def _assert_all_stopped(settings):
+    pids = [int(p) for p in (settings.claude_dir / "pids").read_text().split()]
+    try:
+        deadline = time.monotonic() + 5
+        while any(_running(p) for p in pids) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not any(_running(p) for p in pids), "the CLI or a process it started is still running"
+    finally:
+        for p in pids:
+            try:
+                os.kill(p, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+
 def test_cli_timeout_and_cancel_kill_the_process(cli, settings):
     settings.notes_call_timeout = 1.5
     started = time.monotonic()
     with pytest.raises(NotesError, match="too long"):
         cli("sleep")
     assert time.monotonic() - started < 6
+    _assert_all_stopped(settings)  # the CLI and the process it started
 
     started = time.monotonic()
     with pytest.raises(NotesCancelled):
         cli("sleep", cancelled=lambda: time.monotonic() - started > 0.5)
     assert time.monotonic() - started < 5
+    _assert_all_stopped(settings)
 
 
 def test_cli_missing_is_a_clear_error(cli, settings):

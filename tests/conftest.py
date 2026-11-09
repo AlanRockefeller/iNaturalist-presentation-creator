@@ -250,6 +250,7 @@ class FakeNotesWriter:
         self.fail_names: set[str] = set()
         self.error = None   # a NotesError to raise from every call
         self.block = None   # a threading.Event every call waits for
+        self.ignore_cancel = False  # finish even after a cancel, like a call that ends just then
 
     def write_batch(self, subjects, cancelled):
         from app.notes import NotesCancelled
@@ -257,7 +258,7 @@ class FakeNotesWriter:
         self.calls.append(subjects)
         if self.block is not None:
             while not self.block.wait(0.02):
-                if cancelled():
+                if cancelled() and not self.ignore_cancel:
                     raise NotesCancelled()
         if self.error is not None:
             raise self.error

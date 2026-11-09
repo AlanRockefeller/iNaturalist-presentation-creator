@@ -319,7 +319,7 @@ class AccessGuard:
                 return "locked"
             if not supplied:
                 return "missing"
-            if self._code and secrets.compare_digest(supplied.encode()[:200], self._code):
+            if self._code and secrets.compare_digest(supplied.encode(), self._code):
                 return "ok"
             self._failures.setdefault(client, deque()).append(now)
             if len(self._failures) > 10_000:  # forget the oldest clients
