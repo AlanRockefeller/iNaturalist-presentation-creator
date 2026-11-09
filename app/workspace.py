@@ -85,47 +85,55 @@ class WorkspaceStore:
     def get(self, wid: str) -> dict:
         """The workspace, if it was used within the TTL. Each use extends it."""
         path = self._path(wid)
-        with self._lock:
-            ws = self._mem.get(wid)
-        loaded = None
-        if ws is None:
-            try:
-                used = path.stat().st_mtime
-                with gzip.open(path, "rb") as fh:
-                    loaded = self._inflate(json.loads(fh.read()))
-            except (OSError, ValueError, EOFError):
-                raise WorkspaceExpired() from None
-            loaded["used"] = used
-        # Published, checked and extended under the lock, which cleanup() also
-        # takes: a copy another request loaded and renewed meanwhile is kept
-        # (not replaced by this one), two uses at once cannot put the time
-        # back, and cleanup cannot delete the file between check and renewal.
-        with self._lock:
-            ws = self._mem.get(wid)
+        while True:
+            with self._lock:
+                ws = self._mem.get(wid)
+            loaded = None
             if ws is None:
-                if loaded is None:  # dropped from memory meanwhile: read it again
-                    return self.get(wid)
-                ws = self._mem[wid] = loaded
+                # Read outside the lock (it can be megabytes); published below.
+                try:
+                    with gzip.open(path, "rb") as fh:
+                        loaded = self._inflate(json.loads(fh.read()))
+                except (OSError, ValueError, EOFError):
+                    raise WorkspaceExpired() from None
+            # Published, checked and extended under the lock, which cleanup()
+            # also takes: a copy another request loaded and renewed meanwhile is
+            # kept (not replaced by this one), two uses at once cannot put the
+            # time back, and cleanup cannot delete the file between check and
+            # renewal.
+            with self._lock:
+                ws = self._mem.get(wid)
+                if ws is None:
+                    if loaded is None:
+                        continue  # dropped from memory meanwhile: read the file (outside the lock)
+                    try:
+                        # Its last use is the file's time now, which a request
+                        # that renewed it meanwhile may have moved on.
+                        loaded["used"] = path.stat().st_mtime
+                    except OSError:
+                        raise WorkspaceExpired() from None
+                    ws = self._mem[wid] = loaded
+                self._mem.move_to_end(wid)
+                now = time.time()
+                if now - ws["used"] > self.ttl:
+                    raise WorkspaceExpired()
+                try:
+                    # The file's time is the last use, for restarts and for cleanup().
+                    os.utime(path)
+                except FileNotFoundError:
+                    # Its file is gone, so it could not outlive this process:
+                    # treat it as expired rather than alive in memory only.
+                    self._mem.pop(wid, None)
+                    raise WorkspaceExpired() from None
+                except OSError as exc:
+                    # Still in use: keep it alive in memory (cleanup() checks
+                    # that too), and say so, since a restart would lose it sooner.
+                    log.warning("event=workspace.touch_failed error_type=%s", type(exc).__name__)
+                ws["used"] = max(ws["used"], now)
+                # Trim last, so even a store that keeps nothing in memory works.
                 while len(self._mem) > self._mem_items:
                     self._mem.popitem(last=False)
-            self._mem.move_to_end(wid)
-            now = time.time()
-            if now - ws["used"] > self.ttl:
-                raise WorkspaceExpired()
-            try:
-                # The file's time is the last use, for restarts and for cleanup().
-                os.utime(path)
-            except FileNotFoundError:
-                # Its file is gone, so it could not outlive this process: treat
-                # it as expired rather than alive in memory only.
-                self._mem.pop(wid, None)
-                raise WorkspaceExpired() from None
-            except OSError as exc:
-                # Still in use: keep it alive in memory (cleanup() checks that
-                # too), and say so, since a restart would now lose it sooner.
-                log.warning("event=workspace.touch_failed error_type=%s", type(exc).__name__)
-            ws["used"] = max(ws["used"], now)
-        return ws
+                return ws
 
     def cleanup(self) -> None:
         now = time.time()
