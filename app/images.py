@@ -82,12 +82,14 @@ class MediaFetcher:
         return None
 
     def fetch_original(self, photo_id: int, api_url: str, cancelled=None,
-                       reservation: Reservation | None = None) -> Path:
+                       reservation: Reservation | None = None, keep_in: Path | None = None) -> Path:
         """Download (or reuse the cached) original of a photo; returns its path.
 
         ``cancelled`` (optional, returns bool) is checked before the download and
         between chunks and retries; DownloadCancelled is raised when it is true.
         Downloaded bytes are taken from ``reservation`` when one is given.
+        With ``keep_in`` (a job's folder) the photo is linked there while its
+        lock is held, so cleanup cannot remove it first, and the link is returned.
         """
         def stop_if_cancelled():
             if cancelled and cancelled():
@@ -108,9 +110,9 @@ class MediaFetcher:
             if cached:
                 try:
                     os.utime(cached)  # refresh TTL
-                    return cached
+                    return self._keep(cached, keep_in)
                 except FileNotFoundError:
-                    pass  # cleanup trimmed it just now: download it again
+                    pass  # trimmed just now: download it again
             stop_if_cancelled()
             # Refuse once the allowance is spent; past its own reservation a deck
             # may only use what no other deck has reserved.
@@ -122,6 +124,10 @@ class MediaFetcher:
             try:
                 with os.fdopen(fd, "wb") as fh:
                     for attempt in range(3):
+                        if attempt:
+                            # A failed attempt may have used up the reservation:
+                            # ask again, as for a new download.
+                            self.budget.allow_download(reservation)
                         try:
                             with self.http.stream("GET", url, headers={"User-Agent": self.settings.user_agent}) as resp:
                                 if resp.status_code in (403, 404):
@@ -148,9 +154,7 @@ class MediaFetcher:
                                         fh.write(chunk)
                                 finally:
                                     # Count every byte received, even from an aborted attempt.
-                                    self.budget.add(total)
-                                    if reservation is not None:
-                                        reservation.consume(total)
+                                    self.budget.record(total, reservation)
                             break
                         except (httpx.HTTPError,) as exc:
                             if attempt == 2:
@@ -159,7 +163,7 @@ class MediaFetcher:
                             stop_if_cancelled()
                 _verify_image(Path(tmp), photo_id)
                 os.replace(tmp, final)
-                return final
+                return self._keep(final, keep_in)
             except BaseException:
                 try:
                     os.unlink(tmp)
@@ -175,25 +179,36 @@ class MediaFetcher:
         ``dest_dir`` (a job's own folder). Cleanup may trim the cache while a
         deck is being built; the link keeps the file until the job is done."""
         dest_dir.mkdir(parents=True, exist_ok=True)
-        for attempt in range(2):
-            src = self.fetch_original(photo_id, api_url, cancelled, reservation)
-            dest = dest_dir / src.name
-            try:
-                os.link(src, dest)
-                return dest
-            except FileExistsError:
-                return dest
-            except FileNotFoundError:
-                if attempt:  # trimmed twice in a row; give up on this photo
-                    raise ImageFetchError(f"Photo {photo_id} could not be kept for the presentation.") from None
-            except OSError:
-                try:  # a filesystem without hard links
-                    shutil.copyfile(src, dest)
-                    return dest
-                except FileNotFoundError:
-                    if attempt:
-                        raise ImageFetchError(f"Photo {photo_id} could not be kept for the presentation.") from None
-        raise ImageFetchError(f"Photo {photo_id} could not be kept for the presentation.")
+        return self.fetch_original(photo_id, api_url, cancelled, reservation, keep_in=dest_dir)
+
+    @staticmethod
+    def _keep(src: Path, keep_in: Path | None) -> Path:
+        """``src`` itself, or its link (a copy without hard links) in ``keep_in``.
+        The caller holds the photo's lock, which cleanup also takes."""
+        if keep_in is None:
+            return src
+        dest = keep_in / src.name
+        try:
+            os.link(src, dest)
+        except FileExistsError:
+            pass
+        except OSError:  # a filesystem without hard links
+            shutil.copyfile(src, dest)
+        return dest
+
+    def _remove(self, path: Path) -> bool:
+        """Delete a cache file unless a download of that photo holds its lock
+        (it is then left for the next cleanup). Returns whether it is gone."""
+        head = path.name.split(".", 1)[0]
+        lock = self._lock_for(int(head)) if head.isdigit() else None
+        if lock is not None and not lock.acquire(blocking=False):
+            return False
+        try:
+            path.unlink(missing_ok=True)
+            return True
+        finally:
+            if lock is not None:
+                lock.release()
 
     def cleanup(self) -> None:
         """Expire cached originals by age, then trim to the size cap (oldest first)."""
@@ -205,16 +220,15 @@ class MediaFetcher:
             except OSError:
                 continue
             age = now - st.st_mtime
-            if age > self.settings.media_cache_ttl_seconds or (p.suffix == ".part" and age > 3600):
-                p.unlink(missing_ok=True)
-            else:
-                entries.append((st.st_mtime, st.st_size, p))
+            expired = age > self.settings.media_cache_ttl_seconds or (p.suffix == ".part" and age > 3600)
+            if not (expired and self._remove(p)):
+                entries.append((st.st_mtime, st.st_size, p))  # still there: it counts toward the cap
         total = sum(e[1] for e in entries)
         for _, size, p in sorted(entries):
             if total <= self.settings.media_cache_max_bytes:
                 break
-            p.unlink(missing_ok=True)
-            total -= size
+            if self._remove(p):  # a busy one stays, and the next oldest goes instead
+                total -= size
 
 
 def open_image(path: Path) -> Image.Image:

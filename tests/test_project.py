@@ -374,7 +374,7 @@ def test_v5_file_loads_as_v6_with_default_more_photos_settings():
                        "sources": [{"id": "a", "type": "url", "url": URL_CR}]})
     assert pr.schema_version == 8
     rel = pr.settings.related
-    assert rel.username == "" and rel.buttons is False
+    assert rel.username == "" and rel.buttons is None
     assert (rel.mine.per_taxon, rel.mine.min_faves) == (20, 0)
     assert rel.others.licenses == ["cc0", "cc-by", "cc-by-sa", "cc-by-nd"]
     assert (rel.others.per_taxon, rel.others.min_faves, rel.others.research_only) == (5, 1, True)
@@ -445,3 +445,26 @@ def test_placing_new_observations_right_after_one():
     pr = add_observations(pr, [5, 4], obs, member, placement="after", after_id=2)
     assert pr.order == [1, 2, 5, 4, 3]
     assert pr.settings.sort.key == "custom" and pr.settings.sort.base_key == "taxonomic"
+
+
+
+# ---------------------------------------------------------------- review fixes
+def test_a_schema_4_file_with_a_bad_source_list_is_a_readable_error():
+    with pytest.raises(ProjectError, match="invalid"):
+        load_project({"format": "dikarya-presentation", "schema_version": 4, "sources": 1})
+
+
+def test_ignoring_an_id_again_at_the_cap_keeps_it():
+    from app.models import MAX_IGNORED
+
+    pr = project(source("a", URL_CR)).model_copy(update={"ignored_observation_ids": list(range(1, MAX_IGNORED + 1))})
+    ids = ignore_observations(pr, [1, 10 ** 9]).ignored_observation_ids
+    assert len(ids) == MAX_IGNORED and ids[-2:] == [1, 10 ** 9] and 2 not in ids and 3 in ids
+
+
+def test_selected_photos_past_the_photo_limit_are_kept():
+    from app.inaturalist import normalize_observation
+
+    raw = make_obs(5, 47692, photos=((1, 9, 9), (2, 9, 9), (3, 9, 9)))
+    assert [p["id"] for p in normalize_observation(raw, {}, max_photos=2)["photos"]] == [1, 2]
+    assert [p["id"] for p in normalize_observation(raw, {}, max_photos=2, keep={3})["photos"]] == [1, 2, 3]

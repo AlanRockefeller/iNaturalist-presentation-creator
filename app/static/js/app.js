@@ -70,12 +70,18 @@
     return data;
   }
 
-  // Mirror of related.estimate_requests(): the most requests a search of n species can make.
-  function estimateRequests(count) {
+  // Mirror of related.estimate_requests() and pages_per_species(): the most
+  // requests a search of n species can make. With "All rights reserved" and
+  // only some other licenses ticked, licenses are checked on the server, which
+  // can take up to 3 pages per species.
+  // `licenses`: the ones ticked in the dialog now; else the saved ones.
+  function estimateRequests(count, whose = 'others', licenses = null) {
+    const lic = whose === 'others' ? (licenses || relatedSettings().others.licenses) : [];
+    const pages = lic.includes('arr') && lic.length < LICENSES.length ? 3 : 1;
     let total = 0;
     for (let start = 0; start < count; start += 100) {
       const size = Math.min(100, count - start);
-      total += 1 + (size > 1 ? size : 0);
+      total += size > 1 ? 1 + size * pages : pages;
     }
     return total;
   }
@@ -102,7 +108,7 @@
   const RELATED_LABEL = { mine: 'More of my photos', others: 'Other people\'s photos' };
   function defaultRelated() {
     return {
-      username: '', buttons: false,
+      username: '', buttons: null,
       mine: { per_taxon: 20, min_faves: 0 },
       others: { licenses: ['cc0', 'cc-by', 'cc-by-sa', 'cc-by-nd'], per_taxon: 5, min_faves: 1, research_only: true },
     };
@@ -562,7 +568,7 @@
         type: 'button', class: 'btn btn-small', text: 'Search again', disabled: !species || !src.enabled,
         title: 'Search all of these species again with the current More photos settings',
         onclick: () => {
-          const need = estimateRequests(Math.min(species, LIMITS.relatedTaxa));
+          const need = estimateRequests(Math.min(species, LIMITS.relatedTaxa), src.related.whose);
           if (species > LIMITS.relatedTaxa) { toast(`One search can cover at most ${n(LIMITS.relatedTaxa)} species; this source has ${n(species)}.`, true, 9000); return; }
           if (!confirm(`Search ${plural(species, 'species', 'species')} again for ${what}? That is up to ${plural(need, 'request')} to iNaturalist (${duration(need)}). New observations are offered for review.`)) return;
           startLoad([src.id], null, { whose: src.related.whose, taxa: null, title: src.label || RELATED_LABEL[src.related.whose] });
@@ -690,13 +696,24 @@
   }
 
   // Dialogs: focus moves into one when it opens and back where it was when it
-  // closes. Closing the review dialog refreshes its "Review new" button.
+  // closes. While one is open the page behind it is inert, so Tab stays in the
+  // dialog. Closing the review dialog refreshes its "Review new" button.
   const modalReturn = new Map();
   const modalOnClose = new Map(); // dialog -> function called once when it closes
-  function openModal(m) {
+  const PAGE_PARTS = '.topnav, .hero, .stepper-bar, main, .footer';
+  function syncInert() {
+    const open = $$('.modal').some((m) => !m.hidden);
+    $$(PAGE_PARTS).forEach((part) => { part.inert = open; });
+  }
+  // `fallback()` gives the element to focus on closing when the one focused at
+  // opening is gone (a card the list re-rendered meanwhile, say).
+  const modalFallback = new Map();
+  function openModal(m, fallback = null) {
     if (!m.hidden) return;
     modalReturn.set(m, document.activeElement);
+    if (fallback) modalFallback.set(m, fallback); else modalFallback.delete(m);
     m.hidden = false;
+    syncInert();
     const box = $('.modal-box', m);
     box.setAttribute('tabindex', '-1');
     box.focus();
@@ -704,12 +721,16 @@
   function closeModal(m) {
     if (m.hidden) return;
     m.hidden = true;
+    syncInert();
     if (m.id === 'review-modal') updateStats();
     const onClose = modalOnClose.get(m);
     modalOnClose.delete(m);
     if (onClose) onClose();
-    const back = modalReturn.get(m);
+    let back = modalReturn.get(m);
+    const fallback = modalFallback.get(m);
     modalReturn.delete(m);
+    modalFallback.delete(m);
+    if (!(back && back.isConnected && back !== document.body) && fallback) back = fallback();
     if (back && back.isConnected && typeof back.focus === 'function') back.focus();
   }
 
@@ -723,9 +744,11 @@
     openModal(modal);
     loadCancelled = false;
     try {
+      // A full refresh (no ids) searches every source again; the workspace is
+      // still sent so "more photos" results waiting for review are kept.
       const body = {
         project: S.project,
-        workspace_id: refreshSourceIds ? S.workspaceId : null,
+        workspace_id: S.workspaceId,
         refresh_source_ids: refreshSourceIds,
       };
       if (related && related.taxa) body.related_taxa = related.taxa;
@@ -738,6 +761,9 @@
       if (final.state === 'cancelled' || loadCancelled) { toast('Loading cancelled.'); return; }
       if (final.state !== 'done') throw new Error(final.error || 'Loading failed.');
       if (gen !== projectGen) return; // another project was opened meanwhile
+      // Close this first, so a review dialog that opens next returns focus to
+      // the page, not to this hidden dialog.
+      closeModal(modal);
       applyLoadResult(final.result, resume, related);
     } catch (err) {
       if (gen === projectGen) toast(err.message, true, 9000);
@@ -1133,7 +1159,7 @@
   // "More of mine" / "More from others" on a card, when turned on in More photos.
   function morePhotoButtons(id) {
     const rel = relatedSettings();
-    if (!rel.buttons) return [];
+    if (rel.buttons !== true) return [];
     const o = S.obs.get(id);
     const ok = isSpecies(o);
     const name = effectiveName(id) || (o && o.inat_name) || 'this species';
@@ -1205,7 +1231,8 @@
     $('#rel-others-n').value = rel.others.per_taxon;
     $('#rel-others-faves').value = rel.others.min_faves;
     $('#rel-research').checked = rel.others.research_only;
-    $('#rel-buttons').checked = rel.buttons || (!rel.username && !S.project.sources.some(isRelated)); // on, the first time
+    // Offered ticked until this project's choice is saved (null = not chosen yet).
+    $('#rel-buttons').checked = rel.buttons === null || rel.buttons === undefined ? true : rel.buttons;
     $('#rel-error').textContent = message;
     updateRelatedNote();
     openModal($('#related-modal'));
@@ -1217,7 +1244,8 @@
   }
   function updateRelatedNote() {
     const { taxa, skipped } = listedSpecies();
-    const need = estimateRequests(taxa.length);
+    const ticked = $$('#rel-licenses input').filter((b) => b.checked).map((b) => b.value);
+    const need = estimateRequests(taxa.length, 'others', ticked.length ? ticked : null);
     const bits = [`${plural(taxa.length, 'species', 'species')} in the observations listed now`];
     if (skipped) bits.push(`${n(skipped)} identified only to genus or higher ${skipped === 1 ? 'is' : 'are'} skipped`);
     let text = bits.join('; ') + '. Use Find to list fewer first.';
@@ -1255,6 +1283,7 @@
     return true;
   }
   $('#btn-related').addEventListener('click', () => openRelated());
+  $$('#rel-licenses input').forEach((b) => b.addEventListener('change', updateRelatedNote));
   $('#btn-rel-save').addEventListener('click', () => {
     if (!saveRelated()) return;
     closeModal($('#related-modal'));
@@ -1314,8 +1343,13 @@
       title: 'Include this observation (its first photo). Tick more photos to add them.', 'aria-label': 'Include this observation',
       onchange: (e) => {
         if (e.target.checked) {
-          const first = photos.find((p) => photoAllowed(p, allowed)) || photos[0];
+          // Never a photo outside the licenses chosen for other people's photos.
+          const first = photos.find((p) => photoAllowed(p, allowed));
           if (first) adapter.toggle(first.id, true);
+          else {
+            e.target.checked = false;
+            toast('None of this observation\'s photos has one of the licenses chosen in More photos.', true);
+          }
         } else photos.forEach((p) => adapter.toggle(p.id, false));
         if (review) refreshReviewCard(id);
       },
@@ -2191,7 +2225,13 @@
       reviewRenderer = chunkRender($('#review-list'), $('#review-sentinel'), ids, (id) => obsCard(id, 0, reviewAdapter(id)), 0, 40);
       updateReviewButtons();
     }
-    openModal($('#review-modal'));
+    // After a card's More photos button the list was re-rendered, so focus
+    // goes back to that card's rebuilt button (or More photos… in the toolbar).
+    const after = ctx && ctx.afterId;
+    openModal($('#review-modal'), ctx ? () => {
+      const card = after ? renderedCards.get(after) : null;
+      return (card && card.isConnected && $('.more-photos:not(:disabled)', card)) || $('#btn-related');
+    } : null);
     S.reviewIds = ids;
   }
 

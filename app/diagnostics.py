@@ -29,6 +29,8 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any
 
+from starlette.requests import ClientDisconnect
+
 _context: ContextVar[dict] = ContextVar("presentations_diagnostics", default={})
 log = logging.getLogger("presentations.requests")
 
@@ -232,7 +234,8 @@ class RequestDiagnosticsMiddleware:
         method = scope.get("method", "")
         path = scope.get("path", "/")
         route = getattr(scope.get("route"), "path", None) or path
-        crash = error if isinstance(error, Exception) else None
+        # ClientDisconnect: the client went away while its body was being read.
+        crash = error if isinstance(error, Exception) and not isinstance(error, ClientDisconnect) else None
         cancelled = error is not None and crash is None  # the client went away
         if crash is not None:
             status = 500
