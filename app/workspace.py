@@ -39,6 +39,9 @@ class WorkspaceStore:
         self._mem: OrderedDict[str, dict] = OrderedDict()
         self._mem_items = memory_items
         self._lock = threading.Lock()
+        # Last uses whose file time could not be updated (workspace id ->
+        # time), kept apart from the evictable cache so they still count.
+        self._touched: dict[str, float] = {}
 
     def _path(self, wid: str) -> Path:
         if not isinstance(wid, str) or not WORKSPACE_ID_RE.match(wid):
@@ -109,13 +112,15 @@ class WorkspaceStore:
                     try:
                         # Its last use is the file's time now, which a request
                         # that renewed it meanwhile may have moved on.
-                        loaded["used"] = path.stat().st_mtime
+                        loaded["used"] = max(path.stat().st_mtime, self._touched.get(wid, 0.0))
                     except OSError:
                         raise WorkspaceExpired() from None
                     ws = self._mem[wid] = loaded
                 self._mem.move_to_end(wid)
                 now = time.time()
                 if now - ws["used"] > self.ttl:
+                    self._mem.pop(wid, None)  # its data is not kept for nothing
+                    self._touched.pop(wid, None)
                     raise WorkspaceExpired()
                 try:
                     # The file's time is the last use, for restarts and for cleanup().
@@ -124,11 +129,16 @@ class WorkspaceStore:
                     # Its file is gone, so it could not outlive this process:
                     # treat it as expired rather than alive in memory only.
                     self._mem.pop(wid, None)
+                    self._touched.pop(wid, None)
                     raise WorkspaceExpired() from None
                 except OSError as exc:
-                    # Still in use: keep it alive in memory (cleanup() checks
-                    # that too), and say so, since a restart would lose it sooner.
+                    # Still in use: remember the time apart from the cache (get()
+                    # and cleanup() both check it), and say so, since a restart
+                    # would lose it sooner.
                     log.warning("event=workspace.touch_failed error_type=%s", type(exc).__name__)
+                    self._touched[wid] = now
+                else:
+                    self._touched.pop(wid, None)
                 ws["used"] = max(ws["used"], now)
                 # Trim last, so even a store that keeps nothing in memory works.
                 while len(self._mem) > self._mem_items:
@@ -142,8 +152,8 @@ class WorkspaceStore:
                 try:
                     if now - p.stat().st_mtime <= self.ttl:
                         continue
-                    mem = self._mem.get(p.name.split(".", 1)[0])
-                    if mem is not None and now - mem["used"] <= self.ttl:
+                    wid = p.name.split(".", 1)[0]
+                    if now - self._touched.get(wid, 0.0) <= self.ttl:
                         continue  # in use, though its file's time could not be updated
                     p.unlink(missing_ok=True)
                 except OSError:
@@ -151,3 +161,5 @@ class WorkspaceStore:
         with self._lock:
             for wid in [w for w, ws in self._mem.items() if now - ws["used"] > self.ttl]:
                 self._mem.pop(wid, None)
+            for wid in [w for w, t in self._touched.items() if now - t > self.ttl]:
+                del self._touched[wid]
