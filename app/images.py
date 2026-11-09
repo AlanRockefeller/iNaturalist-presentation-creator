@@ -196,15 +196,16 @@ class MediaFetcher:
             shutil.copyfile(src, dest)
         return dest
 
-    def _remove(self, path: Path) -> None:
+    def _remove(self, path: Path) -> bool:
         """Delete a cache file unless a download of that photo holds its lock
-        (it is then left for the next cleanup)."""
+        (it is then left for the next cleanup). Returns whether it is gone."""
         head = path.name.split(".", 1)[0]
         lock = self._lock_for(int(head)) if head.isdigit() else None
         if lock is not None and not lock.acquire(blocking=False):
-            return
+            return False
         try:
             path.unlink(missing_ok=True)
+            return True
         finally:
             if lock is not None:
                 lock.release()
@@ -219,16 +220,15 @@ class MediaFetcher:
             except OSError:
                 continue
             age = now - st.st_mtime
-            if age > self.settings.media_cache_ttl_seconds or (p.suffix == ".part" and age > 3600):
-                self._remove(p)
-            else:
-                entries.append((st.st_mtime, st.st_size, p))
+            expired = age > self.settings.media_cache_ttl_seconds or (p.suffix == ".part" and age > 3600)
+            if not (expired and self._remove(p)):
+                entries.append((st.st_mtime, st.st_size, p))  # still there: it counts toward the cap
         total = sum(e[1] for e in entries)
         for _, size, p in sorted(entries):
             if total <= self.settings.media_cache_max_bytes:
                 break
-            self._remove(p)
-            total -= size
+            if self._remove(p):  # a busy one stays, and the next oldest goes instead
+                total -= size
 
 
 def open_image(path: Path) -> Image.Image:

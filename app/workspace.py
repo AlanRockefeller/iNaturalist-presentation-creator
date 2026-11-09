@@ -87,21 +87,28 @@ class WorkspaceStore:
         path = self._path(wid)
         with self._lock:
             ws = self._mem.get(wid)
-            if ws is not None:
-                self._mem.move_to_end(wid)
+        loaded = None
         if ws is None:
             try:
                 used = path.stat().st_mtime
                 with gzip.open(path, "rb") as fh:
-                    ws = self._inflate(json.loads(fh.read()))
+                    loaded = self._inflate(json.loads(fh.read()))
             except (OSError, ValueError, EOFError):
                 raise WorkspaceExpired() from None
-            ws["used"] = used
-            self._remember(wid, ws)
-        # Checked and extended under the lock, which cleanup() also takes: two
-        # uses at once cannot put the time back, and cleanup cannot delete the
-        # file between this check and its new time.
+            loaded["used"] = used
+        # Published, checked and extended under the lock, which cleanup() also
+        # takes: a copy another request loaded and renewed meanwhile is kept
+        # (not replaced by this one), two uses at once cannot put the time
+        # back, and cleanup cannot delete the file between check and renewal.
         with self._lock:
+            ws = self._mem.get(wid)
+            if ws is None:
+                if loaded is None:  # dropped from memory meanwhile: read it again
+                    return self.get(wid)
+                ws = self._mem[wid] = loaded
+                while len(self._mem) > self._mem_items:
+                    self._mem.popitem(last=False)
+            self._mem.move_to_end(wid)
             now = time.time()
             if now - ws["used"] > self.ttl:
                 raise WorkspaceExpired()
