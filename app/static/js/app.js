@@ -2230,7 +2230,7 @@
     const after = ctx && ctx.afterId;
     openModal($('#review-modal'), ctx ? () => {
       const card = after ? renderedCards.get(after) : null;
-      return (card && card.isConnected && $('.more-photos', card)) || $('#btn-related');
+      return (card && card.isConnected && $('.more-photos:not(:disabled)', card)) || $('#btn-related');
     } : null);
     S.reviewIds = ids;
   }

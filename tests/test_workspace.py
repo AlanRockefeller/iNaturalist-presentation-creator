@@ -83,3 +83,56 @@ def test_a_copy_loaded_meanwhile_does_not_replace_a_renewed_one(tmp_path, monkey
 
     monkeypatch.setattr(fresh, "_inflate", read_while_another_request_publishes)
     assert fresh.get(wid) is newer and fresh._mem[wid] is newer
+
+
+def test_an_entry_dropped_between_lookup_and_renewal_is_read_again(tmp_path):
+    import threading
+
+    store = WorkspaceStore(tmp_path, ttl_seconds=100)
+    wid = store.create({1: {"id": 1}}, {})
+    real = store._lock
+
+    class DropOnSecondUse:
+        """The store's lock, but another request drops the entry from memory
+        just before get() takes the lock the second time."""
+        uses = 0
+
+        def __enter__(self):
+            DropOnSecondUse.uses += 1
+            if DropOnSecondUse.uses == 2:
+                store._mem.pop(wid, None)
+            return real.__enter__()
+
+        def __exit__(self, *exc):
+            return real.__exit__(*exc)
+
+    store._lock = DropOnSecondUse()
+    got = {}
+    worker = threading.Thread(target=lambda: got.update(ws=store.get(wid)), daemon=True)
+    worker.start()
+    worker.join(5)  # a retry that kept the lock would hang here
+    assert not worker.is_alive() and got["ws"]["observations"][1] == {"id": 1}
+
+
+def test_a_store_that_keeps_nothing_in_memory_still_reads_from_disk(tmp_path):
+    store = WorkspaceStore(tmp_path, ttl_seconds=100, memory_items=0)
+    wid = store.create({1: {"id": 1}}, {})
+    assert not store._mem
+    assert store.get(wid)["observations"][1] == {"id": 1}
+    assert store.get(wid)["observations"][1] == {"id": 1}
+
+
+def test_a_renewal_made_while_the_file_was_read_counts(tmp_path, monkeypatch):
+    wid = WorkspaceStore(tmp_path, ttl_seconds=100).create({1: {"id": 1}}, {})
+    path = tmp_path / f"{wid}.json.gz"
+    old = time.time() - 150
+    os.utime(path, (old, old))  # unused for longer than the TTL...
+    fresh = WorkspaceStore(tmp_path, ttl_seconds=100)
+    real = WorkspaceStore._inflate
+
+    def read_while_another_request_renews(data):
+        os.utime(path)  # ...until another request (since dropped from memory) used it
+        return real(data)
+
+    monkeypatch.setattr(fresh, "_inflate", read_while_another_request_renews)
+    assert fresh.get(wid)["observations"][1] == {"id": 1}
