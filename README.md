@@ -23,6 +23,7 @@ small JSON project file; the server holds only short-lived temporary data.
 - [Project files](#project-files)
 - [How refresh works](#how-refresh-works)
 - [PowerPoint generation rules](#powerpoint-generation-rules)
+- [Presenter notes](#presenter-notes)
 - [Security and limits](#security-and-limits)
 - [Development](#development)
 - [Production layout](#production-layout)
@@ -55,6 +56,8 @@ small JSON project file; the server holds only short-lived temporary data.
    speaker notes.
 4. **Preview**: the actual slide sequence as 16:9 thumbnails, including title,
    dividers and annotations. Dragging a photo slide moves its whole observation.
+   Each photo slide has a **Notes** button for its presenter notes, which Claude
+   can write, for one slide or all of them (see [Presenter notes](#presenter-notes)).
 5. **Generate**: the server downloads the full-quality photos, builds the deck with
    progress (`Downloading photos: 47 / 218`, `Building slides: …`), and offers the
    download, with a button to save the project file next to it.
@@ -71,7 +74,8 @@ browser (vanilla JS, no framework)          FastAPI (single Uvicorn worker)
                                                      ├─ images.py       trusted downloads, cache, Pillow prep
                                                      ├─ workspace.py    temp store of fetched metadata
                                                      ├─ related.py      "more photos" searches of a project's species
-                                                     ├─ jobs.py         background load/generate jobs
+                                                     ├─ jobs.py         background load/generate/notes jobs
+                                                     ├─ notes.py        presenter notes via the Claude Code CLI
                                                      ├─ ratelimit.py    1 req/s limiter, daily/hourly budgets
                                                      └─ diagnostics.py  request and job logging
 ```
@@ -88,6 +92,7 @@ browser (vanilla JS, no framework)          FastAPI (single Uvicorn worker)
 | `app/workspace.py` | Gzipped JSON of the metadata the last load fetched, keyed by an unguessable id, expiring after 24 h. |
 | `app/related.py` | "More photos of the same species": search parameters, licenses, and the request plan (top N per species, most favorited first). |
 | `app/jobs.py` | Thread-pool jobs with progress, cancellation, timeouts, per-client and global limits, cleanup. |
+| `app/notes.py` | Presenter notes: what Claude is told, the `claude -p` subprocess, cleaning its answer, the access code. |
 | `app/diagnostics.py` | Request IDs, one log line per request and per job, client addresses (IPv6 grouped by /64). |
 
 **Workspaces.** Sorting, previewing and generating need metadata for up to
@@ -219,7 +224,7 @@ kB. Photos and full iNaturalist metadata are **not** embedded.
 ```json
 {
   "format": "dikarya-presentation",
-  "schema_version": 6,
+  "schema_version": 7,
   "saved_at": "2026-10-06T03:40:00Z",
   "app_version": "1.0.0",
   "sources": [
@@ -245,7 +250,7 @@ kB. Photos and full iNaturalist metadata are **not** embedded.
     "grouping": "family", "dividers": true, "min_faves": 0,
     "annotations": {"scientific": true, "common_name": false, "date": false,
                     "location": false, "observer": null},
-    "speaker_notes": true,
+    "speaker_notes": true, "presenter_notes": true,
     "related": {"username": "alan_rockefeller", "buttons": true,
                 "mine": {"per_taxon": 20, "min_faves": 0},
                 "others": {"licenses": ["cc0", "cc-by", "cc-by-sa", "cc-by-nd"],
@@ -256,7 +261,9 @@ kB. Photos and full iNaturalist metadata are **not** embedded.
      "rotations": {"457": 90}, "show_lines": {"common_name": true}, "photo_order": [457, 456],
      "overrides": {"scientific": "Psilocybe alimapensis nom. prov."},
      "source_ids": ["s1a2b3c4d5e6", "s0f9e8d7c6b5"],
-     "last_inat_name": "Psilocybe sp.", "added_at": "2026-10-06T03:30:00Z"}
+     "last_inat_name": "Psilocybe sp.", "added_at": "2026-10-06T03:30:00Z",
+     "notes": "• First point ...\n• Second point ...",
+     "notes_name": "Psilocybe alimapensis nom. prov."}
   ],
   "order": [123],
   "ignored_observation_ids": []
@@ -292,13 +299,17 @@ kB. Photos and full iNaturalist metadata are **not** embedded.
   are left out. Added in schema 2; a schema 1 file loads with none.
 - `known_photo_ids` / `last_inat_name` exist only so a refresh can report deleted
   or new photos and changed identifications.
+- `notes`: the observation's presenter notes (typed, or written by Claude), one
+  point per line, at most 4,000 characters. `notes_name` is the name they were
+  written for, so the app can point out notes about an old name.
+  `settings.presenter_notes` puts them in the deck. Added in schema 7.
 - **Validation** (`project.load_project`): wrong `format`, missing or non-integer
   `schema_version`, a newer schema than the server supports, out-of-range values,
   oversized lists, duplicate source ids, and source URLs that fail the same
   parser as new input are all rejected with a readable message. Unknown keys are
   ignored. Inconsistent `order`/duplicate observations are normalized.
 - **Schema versions**: `_migrate()` in `app/project.py` upgrades older files one
-  version at a time (currently 1 to 6). Bump `SCHEMA_VERSION` in `app/models.py`
+  version at a time (currently 1 to 7). Bump `SCHEMA_VERSION` in `app/models.py`
   and add a step there when the format or its meaning changes.
 - **Limits that keep a file loadable**: at most 200 photos are remembered per
   observation (iNaturalist photos past that are not offered) and the newest
@@ -379,14 +390,72 @@ first photo of each selected, in default taxonomic order.
   above the group name, which is italic for genera. A new divider starts with
   each new group, even when two groups share a name (a genus name in two
   families, two sources with the same label), as in Select & Organize.
-- **Speaker notes** (optional): name, common name, iNaturalist link and the
-  photo's license attribution.
+- **Speaker notes**: name, common name, iNaturalist link and the photo's
+  license attribution (setting `speaker_notes`), and the observation's
+  presenter notes between them, set off by blank lines (setting
+  `presenter_notes`). Every photo slide of an observation has the same notes.
 - Text stays editable; photos stay picture objects; nothing is rasterized.
 - **Memory**: image parts are streamed from disk when the file is written, and
   media are stored without zip deflate. A 400-photo, 1 GB deck was built with a
   peak RSS increase of under 20 MB.
 - The file is named from the title (`Fungi_of_Costa_Rica.pptx`, ASCII-safe),
   kept for 2 hours and then deleted with all temporary files.
+
+## Presenter notes
+
+Notes the presenter sees in PowerPoint's presenter view: 3 to 5 short points
+per organism about edibility and toxicity, ecology and range, and the stories
+behind its name. They can be typed, or written by Claude:
+
+- **One slide**: the **Notes** button on a Preview slide (or on a card in
+  Select & Organize) opens the notes, with **Write with Claude**.
+- **All slides**: **Write notes for all slides…** on the Preview step. It
+  fills observations that have no notes; ticking "also rewrite" replaces the
+  rest too. Notes are written once per name, so every observation of
+  *Amanita muscaria* gets the same text, and progress shows per name.
+
+Notes are plain text in the project file, editable afterwards. A refresh never
+changes them. If an observation's name changes, its card and its Notes button
+are flagged, and its notes stay until they are rewritten.
+
+**How Claude is run** (`app/notes.py`): the server runs the Claude Code CLI
+(`claude -p`) as a subprocess, up to 8 names per call and 2 calls at a time,
+with a 240 s limit per call:
+
+- every tool is turned off (`--tools ""`, no MCP servers), so whatever a name
+  says, it can only change the text that comes back; the answer is structured
+  JSON (`--json-schema`) and is cleaned before it is kept;
+- our own system prompt replaces Claude Code's; it asks for well-established
+  facts only, and fewer points about the genus or family when a name is obscure
+  or provisional;
+- the prompt holds names, ranks and common names only. Favorite counts,
+  observers, places and dates are never sent;
+- the subprocess gets a minimal environment of its own (its home and config
+  in `/var/lib/presentations/claude/`, the token, no other variables), an empty
+  working directory, and is killed on cancel or time-out.
+
+**Access and limits.** Notes are on only when the CLI, a token and an access
+code are all set. The browser asks for the code once and keeps it in local
+storage; 10 wrong codes from one client lock it out for an hour. At most 1,500
+names per UTC day across the site and 1,000 per job; one notes job runs at a
+time (3 may wait). A usage-limit or sign-in error stops the job, keeping what
+was written.
+
+| Variable | Default |
+|---|---|
+| `CLAUDE_CODE_OAUTH_TOKEN` | none (from `claude setup-token`; notes stay off without it) |
+| `PRESENTATIONS_NOTES_ACCESS_CODE` | none (notes stay off without it) |
+| `PRESENTATIONS_NOTES_CLI` | `/usr/local/lib/presentations/claude` |
+| `PRESENTATIONS_NOTES_MODEL` | `claude-opus-5-5` |
+| `PRESENTATIONS_NOTES_EFFORT` | `medium` |
+| `PRESENTATIONS_NOTES_DAILY_BUDGET` | `1500` names per UTC day |
+| `PRESENTATIONS_NOTES_MAX_PER_JOB` | `1000` names |
+
+**Setting it up**: the install script copies the code owner's Claude Code CLI
+to `/usr/local/lib/presentations/claude` and creates
+`/etc/presentations/notes.env` (root:presentations, 0640) once, empty. Run
+`claude setup-token` as the code owner, put the token and an access code in
+that file, and restart. Re-run the install script to update the CLI copy.
 
 ## Security and limits
 
@@ -434,6 +503,9 @@ first photo of each selected, in default taxonomic order.
   Every line carries `request_id` (also sent as the `X-Request-ID` response
   header), `client_ip` and, for jobs, `job_id`. Submitted values are quoted, so
   they cannot fake extra lines.
+- **Claude**: presenter notes run the Claude Code CLI with every tool off and a
+  minimal environment, behind an access code and daily limits; see
+  [Presenter notes](#presenter-notes).
 - **Headers**: strict CSP (`script-src 'self'`; images only from self and the two
   iNaturalist photo hosts), `X-Frame-Options: DENY`, `nosniff`, HSTS via nginx.
 - **nginx**: per-IP rate limit on `/api/` (10 r/s, burst 60) and the shared
@@ -474,11 +546,14 @@ no favorite counts), plus end-to-end API flows.
   .venv/                         virtualenv created by the install script
 /var/lib/presentations/          temporary data (service user only)
   workspaces/  media-cache/  jobs/  state/   (budgets, taxa cache)
+  claude/                        home of the Claude Code CLI (presenter notes)
 /etc/systemd/system/presentations.service
 /etc/nginx/sites-available/presentations.dikarya.us.conf  (+ symlink in sites-enabled)
 /etc/letsencrypt/live/presentations.dikarya.us/            (both hostnames)
 /usr/local/sbin/restart-presentations                       (root-owned restart wrapper)
 /etc/sudoers.d/presentations                                (lets tree run only that wrapper)
+/usr/local/lib/presentations/claude                         (copy of tree's Claude Code CLI, for notes)
+/etc/presentations/notes.env                                (notes token and access code, 0640)
 ```
 
 The service listens only on `127.0.0.1:8031` (Dikarya uses 5000/8000, the image

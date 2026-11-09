@@ -439,3 +439,32 @@ def test_adjacent_groups_with_the_same_key_but_another_label_get_a_divider():
     pr = add_observations(pr, [1, 2], obs, {1: ["a"], 2: ["a"]}, placement="append")
     dividers = [s["text"] for s in build_slide_plan(pr, obs)["slides"] if s["kind"] == "divider"]
     assert dividers == ["Hygrocybe", "hygrocybe"]
+
+
+def _with_notes(pr, oid, text):
+    return pr.model_copy(update={"observations": [
+        st.model_copy(update={"notes": text, "notes_name": "x"}) if st.id == oid else st for st in pr.observations]})
+
+
+def test_presenter_notes_in_the_speaker_notes(tmp_path):
+    pr, obs = _deck()
+    pr = _with_notes(pr, 1, "• Edible when young\n\n• Grows in grass")
+    plan = build_slide_plan(pr, obs)
+    first = next(s for s in plan["slides"] if s["kind"] == "image")
+    lines = first["notes"].split("\n")
+    assert lines[:2] == ["Hygrocybe conica", "Witch's Hat"]
+    assert lines[2:6] == ["", "• Edible when young", "• Grows in grass", ""]
+    assert lines[6] == "https://www.inaturalist.org/observations/1"
+    # every photo slide of the observation has them; other observations do not
+    assert all("• Grows in grass" in s["notes"] for s in plan["slides"] if s.get("observation_id") == 1)
+    other = next(s for s in plan["slides"] if s.get("observation_id") == 3)
+    assert "•" not in other["notes"] and "\n\n" not in other["notes"]
+
+    only = build_slide_plan(pr.model_copy(update={"settings": pr.settings.model_copy(update={"speaker_notes": False})}), obs)
+    assert next(s for s in only["slides"] if s["kind"] == "image")["notes"] == "• Edible when young\n• Grows in grass"
+    off = build_slide_plan(pr.model_copy(update={"settings": pr.settings.model_copy(update={"presenter_notes": False})}), obs)
+    assert "•" not in next(s for s in off["slides"] if s["kind"] == "image")["notes"]
+
+    prs, _, _ = _build(tmp_path, pr, obs)
+    text = prs.slides[1].notes_slide.notes_text_frame.text
+    assert "• Edible when young" in text and "17" not in text

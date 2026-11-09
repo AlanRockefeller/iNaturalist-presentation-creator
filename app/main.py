@@ -28,8 +28,9 @@ from .images import MediaFetcher
 from .inaturalist import INatClient, SourceError, TaxaCache, build_source
 from .jobs import JobManager, JobRejected
 from .models import (
-    AddObservationsRequest, LoadRequest, ParseSourceRequest, ProjectRequest, SortRequest,
+    AddObservationsRequest, LoadRequest, NotesRequest, ParseSourceRequest, ProjectRequest, SortRequest,
 )
+from .notes import NOTES_BUDGET_MESSAGE, AccessGuard, ClaudeCliWriter
 from .presentation import build_slide_plan
 from .project import (
     ProjectError, add_observations, ignore_observations, load_project, normalize_project,
@@ -127,7 +128,8 @@ def client_key(request: Request) -> str:
 
 
 class Services:
-    def __init__(self, settings: Settings, client: INatClient | None = None, media: MediaFetcher | None = None):
+    def __init__(self, settings: Settings, client: INatClient | None = None, media: MediaFetcher | None = None,
+                 notes_writer=None):
         settings.ensure_dirs()
         self.settings = settings
         self.api_budget = DailyBudget(settings.api_daily_budget, settings.state_dir / "api-budget.json")
@@ -141,7 +143,16 @@ class Services:
         )
         self.media = media or MediaFetcher(settings, self.media_budget)
         self.workspaces = WorkspaceStore(settings.workspace_dir, settings.workspace_ttl_seconds)
-        self.jobs = JobManager(settings, self.client, self.media, self.workspaces)
+        # Presenter notes need a writer (the Claude Code CLI, or a test fake)
+        # and an access code; without both they are off.
+        self.notes_budget = DailyBudget(settings.notes_daily_budget, settings.state_dir / "notes-budget.json",
+                                        message=NOTES_BUDGET_MESSAGE)
+        if notes_writer is None and settings.notes_configured():
+            notes_writer = ClaudeCliWriter(settings)
+        self.notes_writer = notes_writer if settings.notes_access_code else None
+        self.notes_guard = AccessGuard(settings.notes_access_code)
+        self.jobs = JobManager(settings, self.client, self.media, self.workspaces,
+                               notes_writer=self.notes_writer, notes_budget=self.notes_budget)
         self._stop = threading.Event()
 
     def cleanup(self) -> None:
@@ -165,6 +176,7 @@ class Services:
         cancelled = self.jobs.shutdown()
         self.api_budget.flush()
         self.media_budget.flush()
+        self.notes_budget.flush()
         log_event(log, logging.INFO, "app.stopping", jobs_cancelled=cancelled)
 
 
@@ -243,6 +255,7 @@ def create_app(settings: Settings | None = None, services: Services | None = Non
                 "max_image_slides": settings.max_image_slides,
                 "max_related_taxa": settings.max_related_taxa,
             },
+            "notes_enabled": svc.notes_writer is not None,
         })
 
     @app.get("/healthz")
@@ -319,6 +332,29 @@ def create_app(settings: Settings | None = None, services: Services | None = Non
         annotate(observations=len(project.observations), title=project.settings.title or None)
         try:
             job = svc.jobs.start_generate(client_key(request), project, body.workspace_id)
+        except WorkspaceExpired:
+            raise HTTPException(410, "Your session data expired. Reload the sources to continue.") from None
+        except JobRejected as exc:
+            raise HTTPException(429, str(exc)) from None
+        annotate(job_id=job.id)
+        return job.public()
+
+    @app.post("/api/notes")
+    def start_notes(body: NotesRequest, request: Request):
+        if svc.notes_writer is None:
+            raise HTTPException(503, "Presenter notes are not set up on this server.")
+        verdict = svc.notes_guard.check(client_key(request), request.headers.get("x-notes-code"))
+        annotate(access=verdict)
+        if verdict == "locked":
+            raise HTTPException(429, "Too many wrong access codes. Please try again in an hour.")
+        if verdict != "ok":
+            raise HTTPException(403, "An access code is needed to write notes with Claude." if verdict == "missing"
+                                else "That access code is not right.")
+        project = checked(body.project)
+        annotate(requested="all" if body.observation_ids is None else len(body.observation_ids), replace=body.replace)
+        try:
+            job = svc.jobs.start_notes(client_key(request), project, body.workspace_id, body.observation_ids,
+                                       body.replace)
         except WorkspaceExpired:
             raise HTTPException(410, "Your session data expired. Reload the sources to continue.") from None
         except JobRejected as exc:

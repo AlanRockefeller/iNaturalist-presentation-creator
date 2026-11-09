@@ -92,7 +92,7 @@ def test_saved_project_refresh_finds_new_and_unavailable(app_client, fake):
     project = _new_project(tc, _source(tc, "https://www.inaturalist.org/observations?taxon_id=47170", "a", username="alice"), _source(tc, URL_B, "b"))
     first = _load(tc, project)
     saved = tc.post("/api/project/export", json={"project": first["project"]}).json()
-    assert saved["format"] == "dikarya-presentation" and saved["schema_version"] == 6
+    assert saved["format"] == "dikarya-presentation" and saved["schema_version"] == 7
     text = json.dumps(saved)
     assert "square.jpg" not in text and "faves_count" not in text
 
@@ -167,7 +167,7 @@ def test_parse_endpoint_rejects_bad_sources(app_client):
 
 def test_invalid_project_file(app_client):
     assert app_client.post("/api/project/validate", content=b"{not json").status_code == 422
-    r = app_client.post("/api/project/validate", content=json.dumps({"format": "dikarya-presentation", "schema_version": 7}))
+    r = app_client.post("/api/project/validate", content=json.dumps({"format": "dikarya-presentation", "schema_version": 8}))
     assert r.status_code == 422 and "newer" in r.json()["detail"]
 
 
@@ -229,7 +229,7 @@ def test_user_url_with_any_values_loads_only_matching(app_client, fake):
 
 def test_healthz_reports_active_job_counts(app_client, fake):
     data = app_client.get("/healthz").json()
-    assert data["ok"] is True and data["jobs"] == {"loading": 0, "generating": 0}
+    assert data["ok"] is True and data["jobs"] == {"loading": 0, "generating": 0, "notes": 0}
 
 
 def test_add_skips_observations_only_a_removed_source_matched(app_client, fake):

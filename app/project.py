@@ -54,6 +54,10 @@ def _migrate(data: dict) -> dict:
         # v6 added "more photos" (related) sources and settings.related; a v5
         # file simply has none, and the defaults fill in the settings.
         data["schema_version"] = version = 6
+    if version == 6:
+        # v7 added per-observation presenter notes (notes, notes_name) and
+        # settings.presenter_notes; a v6 file simply has none.
+        data["schema_version"] = version = 7
     if version == SCHEMA_VERSION:
         return data
     raise ProjectError(f"Unsupported project schema version {version!r}.")

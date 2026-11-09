@@ -87,6 +87,28 @@ class Settings:
     workspace_ttl_seconds: int = 24 * 3600
     min_free_disk_bytes: int = 3 * GIB
 
+    # Presenter notes written by the Claude Code CLI (app/notes.py). On only
+    # when the CLI, a token (from `claude setup-token`) and an access code are
+    # all set; the deploy script keeps the last two in /etc/presentations/notes.env.
+    notes_cli: str = field(default_factory=lambda: os.environ.get(
+        "PRESENTATIONS_NOTES_CLI", "/usr/local/lib/presentations/claude"))
+    notes_token: str = field(default_factory=lambda: os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip(), repr=False)
+    notes_access_code: str = field(
+        default_factory=lambda: os.environ.get("PRESENTATIONS_NOTES_ACCESS_CODE", "").strip(), repr=False)
+    notes_model: str = field(default_factory=lambda: os.environ.get("PRESENTATIONS_NOTES_MODEL", "claude-opus-5-5"))
+    notes_effort: str = field(default_factory=lambda: os.environ.get("PRESENTATIONS_NOTES_EFFORT", "medium"))
+    # Names (species or other taxa) Claude may write notes for per UTC day, and per job.
+    notes_daily_budget: int = field(default_factory=lambda: _env_int("PRESENTATIONS_NOTES_DAILY_BUDGET", 1500))
+    notes_max_per_job: int = field(default_factory=lambda: _env_int("PRESENTATIONS_NOTES_MAX_PER_JOB", 1000))
+    notes_batch_size: int = 8       # names per Claude call
+    notes_concurrency: int = 2      # Claude calls at once, in one job
+    notes_call_timeout: float = 240.0
+    notes_timeout_seconds: int = 2 * 3600
+    max_queued_notes: int = 3       # running plus waiting notes jobs, from all clients
+
+    def notes_configured(self) -> bool:
+        return bool(self.notes_token and self.notes_access_code and os.access(self.notes_cli, os.X_OK))
+
     @property
     def workspace_dir(self) -> Path:
         return self.work_dir / "workspaces"
@@ -102,6 +124,11 @@ class Settings:
     @property
     def state_dir(self) -> Path:
         return self.work_dir / "state"
+
+    @property
+    def claude_dir(self) -> Path:
+        """Home and config directory of the Claude Code CLI (app/notes.py)."""
+        return self.work_dir / "claude"
 
     def ensure_dirs(self) -> None:
         for d in (self.work_dir, self.workspace_dir, self.media_cache_dir, self.jobs_dir, self.state_dir):

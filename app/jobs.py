@@ -1,4 +1,5 @@
-"""Background jobs: loading sources from iNaturalist and generating decks.
+"""Background jobs: loading sources from iNaturalist, generating decks and
+writing presenter notes.
 
 Jobs run in bounded thread pools inside the single Uvicorn process. The browser
 polls ``/api/jobs/<id>`` for progress. Limits: concurrent and queued loads and
@@ -27,10 +28,11 @@ from .diagnostics import bind_context, get_logger, log_event, snapshot
 from .images import DownloadCancelled, ImageFetchError, MediaFetcher, prepare_for_slide, title_background
 from .inaturalist import INatClient, INatError, SourceError, count_requests, source_params
 from .models import Project
+from .notes import NotesCancelled, NotesError, subject_for
 from .presentation import build_slide_plan, write_pptx
 from .project import ProjectError, add_observations, refresh_project, safe_filename
 from .related import LABELS as RELATED_LABELS, estimate_requests, run_related_search
-from .ratelimit import BudgetExceeded
+from .ratelimit import BudgetExceeded, DailyBudget
 from .workspace import WorkspaceExpired, WorkspaceStore
 
 log = get_logger(__name__)
@@ -114,6 +116,9 @@ class Job:
                 data["download_url"] = f"/api/jobs/{self.id}/download"
                 data["filename"] = self.filename
             data["result"] = self.result
+        elif self.kind == "notes" and self.result is not None:
+            # What was written before a cancel, an error or the daily limit.
+            data["result"] = self.result
         return data
 
 
@@ -169,16 +174,21 @@ class _Workers:
 
 
 class JobManager:
-    def __init__(self, settings: Settings, client: INatClient, media: MediaFetcher, workspaces: WorkspaceStore):
+    def __init__(self, settings: Settings, client: INatClient, media: MediaFetcher, workspaces: WorkspaceStore,
+                 notes_writer=None, notes_budget: DailyBudget | None = None):
         self.settings = settings
         self.client = client
         self.media = media
         self.workspaces = workspaces
+        # Writes presenter notes (notes.ClaudeCliWriter); None = notes are off.
+        self.notes_writer = notes_writer
+        self.notes_budget = notes_budget
         self.jobs: dict[str, Job] = {}
         self._lock = threading.Lock()
         self._workers = {
             "load": _Workers(settings.max_concurrent_loads, "load", self._run),
             "generate": _Workers(settings.max_concurrent_generations, "gen", self._run),
+            "notes": _Workers(1, "notes", self._run),
         }
         # iNaturalist requests made by each client today (in memory only).
         self._usage_day = ""
@@ -207,6 +217,7 @@ class JobManager:
         return {
             "loading": sum(1 for j in active if j.kind == "load"),
             "generating": sum(1 for j in active if j.kind == "generate"),
+            "notes": sum(1 for j in active if j.kind == "notes"),
         }
 
     def api_share(self) -> int:
@@ -237,6 +248,8 @@ class JobManager:
                 raise JobRejected("You already have a job running. Wait for it to finish or cancel it.")
             if kind == "generate" and len(self._active("generate")) >= self.settings.max_queued_generations:
                 raise JobRejected("The server is busy generating other presentations. Please try again in a few minutes.")
+            if kind == "notes" and len(self._active("notes")) >= self.settings.max_queued_notes:
+                raise JobRejected("The server is busy writing other notes. Please try again in a few minutes.")
             if kind == "load":
                 if len(self._active("load")) >= self.settings.max_queued_loads:
                     raise JobRejected("The server is busy loading other projects. Please try again in a few minutes.")
@@ -280,7 +293,7 @@ class JobManager:
                 job.state = "done"
             except JobCancelled:
                 job.state, job.error = "cancelled", "Cancelled."
-            except (JobFailed, INatError, SourceError, BudgetExceeded, ImageFetchError) as exc:
+            except (JobFailed, INatError, SourceError, BudgetExceeded, ImageFetchError, NotesError) as exc:
                 error_type = type(exc).__name__
                 job.state, job.error = "error", str(exc)
             except WorkspaceExpired:
@@ -314,6 +327,8 @@ class JobManager:
         fields["api_left"] = self.client.budget.remaining()
         if job.kind == "generate":
             fields["media_hour_left_mb"] = self.media.budget.remaining()[0] // MIB
+        if job.kind == "notes" and self.notes_budget is not None:
+            fields["notes_left"] = self.notes_budget.remaining()
         level = logging.ERROR if crash else logging.WARNING if job.state == "error" else logging.INFO
         log_event(log, level, "job.finished", exc_info=crash, **fields)
 
@@ -694,3 +709,141 @@ class JobManager:
         size = out.stat().st_size
         job.log_fields.update(written_slides=result["slides"], bytes=size)
         return {"slides": result["slides"], "bytes": size, "planned_slides": n_slides}
+
+    # -- presenter notes -----------------------------------------------------
+
+    def start_notes(self, client: str, project: Project, workspace_id: str, ids: list[int] | None,
+                    replace: bool) -> Job:
+        """Write presenter notes for ``ids`` (None: every observation with a
+        slide). Observations that already have notes are skipped unless
+        ``replace``. Notes are written once per name and given to every
+        observation with that name."""
+        if self.notes_writer is None or self.notes_budget is None:
+            raise JobRejected("Presenter notes are not set up on this server.")
+        ws = self.workspaces.get(workspace_id)  # fail fast if expired
+        observations = ws["observations"]
+        if ids is None:
+            plan = build_slide_plan(project, observations)
+            ids = [s["observation_id"] for s in plan["slides"] if s["kind"] == "image"]
+        states = {st.id: st for st in project.observations}
+        groups: dict[str, dict] = {}
+        skipped = 0
+        for oid in dict.fromkeys(ids):
+            st, obs = states.get(oid), observations.get(oid)
+            if st is None or obs is None or st.status != "active":
+                continue
+            if st.notes and not replace:
+                skipped += 1
+                continue
+            subject = subject_for(obs, st)
+            if not subject["name"]:  # identified only as "Life": nothing to write about
+                continue
+            groups.setdefault(subject["name"].casefold(), {"subject": subject, "ids": []})["ids"].append(oid)
+        if not groups:
+            raise JobRejected("Every observation already has notes." if skipped
+                              else "There are no named observations to write notes for.")
+        if len(groups) > self.settings.notes_max_per_job:
+            raise JobRejected(
+                f"These observations have {len(groups):,} different names; notes can be written for at most "
+                f"{self.settings.notes_max_per_job:,} at a time.")
+        if self.notes_budget.remaining() <= 0:
+            raise JobRejected(self.notes_budget.message)
+        work = list(groups.values())
+        return self._submit("notes", client, lambda job: self._notes(job, work, skipped),
+                            self.settings.notes_timeout_seconds)
+
+    def _notes(self, job: Job, groups: list[dict], skipped: int) -> dict:
+        size = max(1, self.settings.notes_batch_size)
+        batches = [groups[i:i + size] for i in range(0, len(groups), size)]
+        total = len(groups)
+        notes: dict[str, dict] = {}
+        failed: list[str] = []
+        unfunded = 0  # names left out because the daily allowance ran out
+        stop = threading.Event()  # set when the job ends early, so running calls stop
+        # Set once the daily allowance is used up: later calls are not started,
+        # but calls already paid for finish and keep their notes.
+        budget_used_up = threading.Event()
+
+        def publish() -> dict:
+            # A new object each time: a poll may be serialising the last one.
+            result = {"notes": dict(notes), "failed": list(failed), "skipped": skipped}
+            with self._lock:
+                job.result = result
+            return result
+
+        def fund(n: int) -> int:
+            """How many of ``n`` names the daily allowance pays for (all or
+            what is left of it), counted against the allowance now."""
+            if budget_used_up.is_set():
+                return 0
+            take = min(n, self.notes_budget.remaining())
+            try:
+                if take:
+                    self.notes_budget.consume(take)
+            except BudgetExceeded:  # another call took the rest meanwhile
+                take = 0
+            if take < n:
+                budget_used_up.set()
+            return take
+
+        def write(batch: list[dict]) -> tuple[dict[str, str], int]:
+            """Claude's notes by key, and how many names of the batch were paid for."""
+            if job.cancel_event.is_set() or stop.is_set():
+                raise JobCancelled()
+            funded = fund(len(batch))
+            if not funded:
+                return {}, 0
+            subjects = {f"n{i}": g["subject"] for i, g in enumerate(batch[:funded])}
+            try:
+                written = self.notes_writer.write_batch(subjects, lambda: job.cancel_event.is_set() or stop.is_set())
+            except NotesCancelled:
+                raise JobCancelled() from None
+            return written, funded
+
+        publish()
+        job.progress("notes", 0, total, f"Writing notes: 0 / {total}")
+        job.log_fields.update(names=total, observations=sum(len(g["ids"]) for g in groups), skipped=skipped)
+        done = 0
+        try:
+            with ThreadPoolExecutor(min(self.settings.notes_concurrency, len(batches)),
+                                    thread_name_prefix="notes") as pool:
+                futures = {pool.submit(copy_context().run, write, b): b for b in batches}
+                try:
+                    for fut in as_completed(futures):
+                        batch = futures[fut]
+                        try:
+                            written, funded = fut.result()
+                        except NotesError as exc:
+                            if exc.fatal:
+                                raise
+                            written, funded = {}, len(batch)
+                        if job.cancel_event.is_set():
+                            # Stopped while Claude wrote: what it wrote now is not
+                            # kept; batches finished before the stop are.
+                            raise JobCancelled()
+                        for i, g in enumerate(batch):
+                            text = written.get(f"n{i}")
+                            if i >= funded:
+                                unfunded += 1
+                            elif text:
+                                for oid in g["ids"]:
+                                    notes[str(oid)] = {"text": text, "name": g["subject"]["name"]}
+                            else:
+                                failed.append(g["subject"]["name"])
+                        done += len(batch)
+                        publish()
+                        job.progress("notes", done, total, f"Writing notes: {done} / {total}")
+                except BaseException:
+                    stop.set()
+                    for f in futures:
+                        f.cancel()
+                    raise
+        finally:
+            job.log_fields.update(written=len(notes), failed=len(failed), unfunded=unfunded)
+        if failed:
+            shown = ", ".join(failed[:10]) + (", ..." if len(failed) > 10 else "")
+            job.warnings.append(f"Claude could not write notes for {len(failed)} name(s): {shown}.")
+        if budget_used_up.is_set():
+            # What was written stays in job.result (see Job.public).
+            raise BudgetExceeded(self.notes_budget.message)
+        return publish()

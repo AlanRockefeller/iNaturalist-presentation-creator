@@ -21,6 +21,10 @@
 #   5. Creates/updates the virtualenv /var/www/presentations/.venv and installs
 #      requirements.txt; byte-compiles; as the service user, imports the app
 #      and builds it with create_app() (the start-up check).
+#  5b. Presenter notes (optional): copies $CODE_OWNER's Claude Code CLI to
+#      /usr/local/lib/presentations/claude when it changed (never runs it as
+#      root), and creates /etc/presentations/notes.env (root:presentations 0640)
+#      once, empty. Fill in its token and access code to turn notes on.
 #   6. Installs /etc/systemd/system/presentations.service (hardened, 127.0.0.1:8031,
 #      one Uvicorn worker, Restart=on-failure), enables and restarts it, waits for
 #      /healthz.
@@ -41,7 +45,7 @@
 #      only that, after code changes: `sudo /usr/local/sbin/restart-presentations`.
 #  10. Prints service status, listening port, nginx test result and hostnames.
 #
-# Tunables (environment): SRC_DIR CODE_OWNER PORT SKIP_APT SKIP_CERTBOT
+# Tunables (environment): SRC_DIR CODE_OWNER PORT SKIP_APT SKIP_CERTBOT CLAUDE_SRC
 # =============================================================================
 set -Eeuo pipefail
 
@@ -66,6 +70,8 @@ if [[ -z ${SRC_DIR:-} ]]; then
 fi
 RESTART_WRAPPER=/usr/local/sbin/restart-presentations
 SUDOERS_FILE=/etc/sudoers.d/presentations
+NOTES_CLI=/usr/local/lib/presentations/claude
+NOTES_ENV=/etc/presentations/notes.env
 SERVICE=presentations
 SERVICE_USER=presentations
 CODE_OWNER=${CODE_OWNER:-tree}
@@ -216,6 +222,79 @@ runuser -u "$SERVICE_USER" -- env PRESENTATIONS_WORK_DIR="$STATE_DIR" \
 info "dependencies installed, start-up check passed"
 
 # ---------------------------------------------------------------------------
+log "5b. Claude Code CLI for presenter notes (optional)"
+# ---------------------------------------------------------------------------
+# The service cannot see $CODE_OWNER's home (ProtectHome), so it runs its own
+# copy of the CLI. The copy is never run as root. The token and the access code
+# are in $NOTES_ENV, which is created once and never overwritten.
+owner_home=$(getent passwd "$CODE_OWNER" | cut -d: -f6)
+CLAUDE_SRC=${CLAUDE_SRC:-$owner_home/.local/bin/claude}
+claude_real=$(readlink -f -- "$CLAUDE_SRC" 2>/dev/null || true)
+# trusted_path <path>: the path and every directory above it belong to root or
+# $CODE_OWNER and no one else can write to them (group write only for a group
+# with no other members). Then no other user can swap the file, before or while
+# it is copied. ($CODE_OWNER already owns the app code.)
+group_trusted() {
+  local g=$1 gid u
+  gid=$(getent group "$g" | cut -d: -f3) || return 1
+  for u in $(getent group "$g" | cut -d: -f4 | tr ',' ' ') $(getent passwd | awk -F: -v gid="$gid" '$4 == gid {print $1}'); do
+    [[ $u == root || $u == "$CODE_OWNER" ]] || return 1
+  done
+}
+trusted_path() {
+  local p=$1 owner mode
+  while :; do
+    owner=$(stat -c %U -- "$p" 2>/dev/null) || return 1
+    mode=$(stat -c %a -- "$p" 2>/dev/null) || return 1
+    [[ $owner == root || $owner == "$CODE_OWNER" ]] || return 1
+    (( (8#$mode & 8#002) == 0 )) || return 1
+    if (( 8#$mode & 8#020 )); then group_trusted "$(stat -c %G -- "$p")" || return 1; fi
+    [[ $p == / ]] && return 0
+    p=$(dirname -- "$p")
+  done
+}
+if [[ -n $claude_real && -f $claude_real && -x $claude_real ]] && ! trusted_path "$claude_real"; then
+  warn "$claude_real (or a folder above it) is not owned by root or $CODE_OWNER, or others can write to it; not copied, presenter notes stay off"
+elif [[ -n $claude_real && -f $claude_real && -x $claude_real ]]; then
+  install -d -m 0755 -o root -g root "$(dirname "$NOTES_CLI")"
+  if [[ -f $NOTES_CLI ]] && cmp -s "$claude_real" "$NOTES_CLI"; then
+    info "Claude Code CLI unchanged"
+  else
+    install -m 0755 -o root -g root "$claude_real" "$NOTES_CLI"
+    info "Claude Code CLI copied from $claude_real"
+  fi
+  install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0750 "$STATE_DIR/claude"
+  if cli_version=$(runuser -u "$SERVICE_USER" -- env -i HOME="$STATE_DIR/claude" PATH=/usr/bin:/bin \
+      DISABLE_AUTOUPDATER=1 "$NOTES_CLI" --version 2>/dev/null); then
+    info "Claude Code CLI runs as $SERVICE_USER: $cli_version"
+  else
+    warn "$NOTES_CLI --version failed as $SERVICE_USER; presenter notes stay off"
+  fi
+else
+  info "no Claude Code CLI at $CLAUDE_SRC; presenter notes stay off"
+fi
+install -d -m 0750 -o root -g "$SERVICE_USER" "$(dirname "$NOTES_ENV")"
+if [[ ! -e $NOTES_ENV ]]; then
+  cat >"$NOTES_ENV" <<'NOTES_ENV_TEMPLATE'
+# Presenter notes written by Claude Code, read by presentations.service.
+# Fill in both values, then: sudo /usr/local/sbin/restart-presentations
+#
+# A long-lived token for your Claude subscription. As the code owner, run
+#   claude setup-token
+# and paste the token it prints after the = sign.
+CLAUDE_CODE_OAUTH_TOKEN=
+# The code the site asks for before Claude writes notes. Keep it private:
+# anyone who has it uses your Claude subscription.
+PRESENTATIONS_NOTES_ACCESS_CODE=
+NOTES_ENV_TEMPLATE
+  info "created $NOTES_ENV (empty, so presenter notes stay off until it is filled in)"
+else
+  info "$NOTES_ENV exists (left as it is)"
+fi
+chown root:"$SERVICE_USER" "$NOTES_ENV"
+chmod 0640 "$NOTES_ENV"
+
+# ---------------------------------------------------------------------------
 log "6. systemd unit"
 # ---------------------------------------------------------------------------
 tmp=$(mktemp)
@@ -234,6 +313,8 @@ WorkingDirectory=${APP_DIR}
 Environment=PRESENTATIONS_WORK_DIR=${STATE_DIR}
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=PYTHONUNBUFFERED=1
+# Presenter notes: CLAUDE_CODE_OAUTH_TOKEN and PRESENTATIONS_NOTES_ACCESS_CODE.
+EnvironmentFile=-${NOTES_ENV}
 # Exactly one worker: the iNaturalist rate limiter, request budgets and job
 # registry are in-process and must be shared by every request.
 ExecStart=${APP_DIR}/.venv/bin/uvicorn --factory app.main:create_app \\
@@ -661,6 +742,8 @@ info "hostnames:      ${DOMAIN} -> app;  ${ALIAS} -> 301 ${DOMAIN}\$request_uri"
 info "code:           ${APP_DIR} (owner ${CODE_OWNER}:${SERVICE_USER})"
 info "temp storage:   ${STATE_DIR} (workspaces, cached originals <=2h, decks <=2h)"
 info "restart:        sudo ${RESTART_WRAPPER}   (allowed for ${CODE_OWNER} via ${SUDOERS_FILE})"
+notes_have() { grep -Eq "^$1=.+" "$NOTES_ENV" 2>/dev/null && echo yes || echo no; }
+info "presenter notes: CLI $( [[ -x $NOTES_CLI ]] && echo yes || echo no ), token $(notes_have CLAUDE_CODE_OAUTH_TOKEN), access code $(notes_have PRESENTATIONS_NOTES_ACCESS_CODE)  (${NOTES_ENV})"
 if [[ -d $APP_DIR/.git ]]; then
   info "git:            $(git -C "$APP_DIR" -c safe.directory="$APP_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null) @ $(git -C "$APP_DIR" -c safe.directory="$APP_DIR" rev-parse --short HEAD 2>/dev/null)"
 fi

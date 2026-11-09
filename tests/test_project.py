@@ -162,7 +162,7 @@ def test_save_load_roundtrip_has_everything_and_no_photos():
     pr = ignore_observations(pr, [99])
     data = project_to_json(pr)
     text = json.dumps(data)
-    assert data["format"] == "dikarya-presentation" and data["schema_version"] == 6
+    assert data["format"] == "dikarya-presentation" and data["schema_version"] == 7
     assert "base64" not in text and "square.jpg" not in text and "faves_count" not in text
     loaded = load_project(json.loads(text))
     assert loaded.order == [3, 1, 2]
@@ -245,7 +245,7 @@ def test_v1_file_migrates_and_single_user_url_source_becomes_username():
                      "url": "https://www.inaturalist.org/observations?taxon_id=47170&user_id=alan_rockefeller"}],
         "observations": [{"id": 1, "selected_photo_ids": [5]}],
     })
-    assert pr.schema_version == 6
+    assert pr.schema_version == 7
     assert pr.sources[0].type == "username" and pr.sources[0].username == "alan_rockefeller"
     assert pr.observations[0].rotations == {} and pr.observations[0].show_lines == {}
 
@@ -289,7 +289,7 @@ USER_URL = "https://www.inaturalist.org/observations?taxon_id=47170&user_id=alan
 def test_v4_file_keeps_its_single_user_url_source_as_the_users_own():
     pr = load_project({"format": "dikarya-presentation", "schema_version": 4,
                        "sources": [{"id": "a", "type": "url", "url": USER_URL}]})
-    assert pr.schema_version == 6
+    assert pr.schema_version == 7
     assert pr.sources[0].type == "username" and pr.sources[0].username == "alan_rockefeller"
 
 
@@ -372,7 +372,7 @@ def _with_related_settings(pr, **update):
 def test_v5_file_loads_as_v6_with_default_more_photos_settings():
     pr = load_project({"format": "dikarya-presentation", "schema_version": 5,
                        "sources": [{"id": "a", "type": "url", "url": URL_CR}]})
-    assert pr.schema_version == 6
+    assert pr.schema_version == 7
     rel = pr.settings.related
     assert rel.username == "" and rel.buttons is False
     assert (rel.mine.per_taxon, rel.mine.min_faves) == (20, 0)
