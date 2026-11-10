@@ -162,7 +162,7 @@ def test_save_load_roundtrip_has_everything_and_no_photos():
     pr = ignore_observations(pr, [99])
     data = project_to_json(pr)
     text = json.dumps(data)
-    assert data["format"] == "dikarya-presentation" and data["schema_version"] == 4
+    assert data["format"] == "dikarya-presentation" and data["schema_version"] == 8
     assert "base64" not in text and "square.jpg" not in text and "faves_count" not in text
     loaded = load_project(json.loads(text))
     assert loaded.order == [3, 1, 2]
@@ -245,7 +245,7 @@ def test_v1_file_migrates_and_single_user_url_source_becomes_username():
                      "url": "https://www.inaturalist.org/observations?taxon_id=47170&user_id=alan_rockefeller"}],
         "observations": [{"id": 1, "selected_photo_ids": [5]}],
     })
-    assert pr.schema_version == 4
+    assert pr.schema_version == 8
     assert pr.sources[0].type == "username" and pr.sources[0].username == "alan_rockefeller"
     assert pr.observations[0].rotations == {} and pr.observations[0].show_lines == {}
 
@@ -279,3 +279,192 @@ def test_add_observations_refuses_to_pass_the_project_limit():
         add_observations(pr, [1, 2, 3], obs, {2: ["a"], 3: ["a"]}, placement="append", max_observations=2)
     assert "1 more can be added, not 2" in str(exc.value)
     assert len(add_observations(pr, [2], obs, {2: ["a"]}, placement="append", max_observations=2).observations) == 2
+
+
+# ---------------------------------------------------------------- schema 5 and limits
+
+USER_URL = "https://www.inaturalist.org/observations?taxon_id=47170&user_id=alan_rockefeller"
+
+
+def test_v4_file_keeps_its_single_user_url_source_as_the_users_own():
+    pr = load_project({"format": "dikarya-presentation", "schema_version": 4,
+                       "sources": [{"id": "a", "type": "url", "url": USER_URL}]})
+    assert pr.schema_version == 8
+    assert pr.sources[0].type == "username" and pr.sources[0].username == "alan_rockefeller"
+
+
+def test_v5_source_type_is_the_users_choice():
+    """A search limited to one user can be marked as not the presenter's photos."""
+    pr = load_project({"format": "dikarya-presentation", "schema_version": 5,
+                       "sources": [{"id": "a", "type": "url", "url": USER_URL}]})
+    assert pr.sources[0].type == "url" and pr.sources[0].username is None
+    assert observer_default(pr) is True
+    again = load_project(json.loads(json.dumps(project_to_json(pr))))
+    assert again.sources[0].type == "url"
+    mine = load_project({"format": "dikarya-presentation", "schema_version": 5,
+                         "sources": [{"id": "a", "type": "username", "username": "alan_rockefeller", "url": USER_URL}]})
+    assert mine.sources[0].type == "username" and observer_default(mine) is False
+
+
+def test_ignored_ids_are_capped_so_the_file_still_opens():
+    from app.models import MAX_IGNORED, Project
+
+    pr = ignore_observations(Project(ignored_observation_ids=list(range(1, MAX_IGNORED - 100))), list(range(10**6, 10**6 + 500)))
+    assert len(pr.ignored_observation_ids) == MAX_IGNORED
+    assert pr.ignored_observation_ids[-1] == 10**6 + 499  # the newest are kept
+    load_project(project_to_json(pr))
+
+
+def test_observation_with_more_photos_than_a_file_holds():
+    from app.models import MAX_PHOTOS
+
+    many = tuple((900_000 + k, 100, 100) for k in range(MAX_PHOTOS + 20))
+    obs = norm(make_obs(5, 47692, photos=many))
+    assert len(obs[5]["photos"]) == MAX_PHOTOS
+    pr = add_observations(base_project(), [5], obs, {5: ["a"]}, placement="append")
+    # A refresh where a selected photo was deleted and the photo list is full.
+    st = pr.observations[0].model_copy(update={"selected_photo_ids": [123], "known_photo_ids": [123]})
+    pr = pr.model_copy(update={"observations": [st]})
+    refreshed, summary = refresh_project(pr, obs, {"a": [5]})
+    known = refreshed.observations[0].known_photo_ids
+    assert len(known) == MAX_PHOTOS and 123 in known and summary["missing_photos"] == {"5": [123]}
+    load_project(project_to_json(refreshed))
+
+
+def test_saved_file_leaves_out_default_observation_fields():
+    pr = base_project()
+    obs = norm(make_obs(1, 47692), make_obs(2, 47602))
+    pr = add_observations(pr, [1, 2], obs, {1: ["a"], 2: ["a"]}, placement="append")
+    st = pr.observations[1].model_copy(update={
+        "overrides": AnnotationOverrides(location=""), "rotations": {obs[2]["photos"][0]["id"]: 90}})
+    pr = pr.model_copy(update={"observations": [pr.observations[0], st]})
+    data = project_to_json(pr)
+    first, second = data["observations"]
+    assert set(first) == {"id", "selected_photo_ids", "known_photo_ids", "source_ids", "last_inat_name", "added_at"}
+    assert second["overrides"] == {"location": ""} and "status" not in second
+    assert data["settings"]["annotations"]["observer"] is None  # settings stay complete
+    again = load_project(json.loads(json.dumps(data)))
+    assert again.observations == pr.observations
+
+
+def test_a_selected_photo_beyond_a_full_known_list_still_saves_and_opens():
+    from app.models import MAX_PHOTOS
+
+    data = {"format": "dikarya-presentation", "schema_version": 5,
+            "observations": [{"id": 1, "known_photo_ids": list(range(1, MAX_PHOTOS + 1)), "selected_photo_ids": [9999]}]}
+    pr = load_project(data)
+    known = pr.observations[0].known_photo_ids
+    assert len(known) == MAX_PHOTOS and 9999 in known
+    again = load_project(json.loads(json.dumps(project_to_json(pr))))
+    assert again.observations[0].selected_photo_ids == [9999]
+
+
+# ---------------------------------------------------------------- more photos (schema 6)
+def _related(sid, whose, taxa, **extra):
+    return {"id": sid, "type": "related", "url": "", "related": {"whose": whose, "taxon_ids": taxa}, **extra}
+
+
+def _with_related_settings(pr, **update):
+    return pr.model_copy(update={"settings": pr.settings.model_copy(
+        update={"related": pr.settings.related.model_copy(update=update)})})
+
+
+def test_v5_file_loads_as_v6_with_default_more_photos_settings():
+    pr = load_project({"format": "dikarya-presentation", "schema_version": 5,
+                       "sources": [{"id": "a", "type": "url", "url": URL_CR}]})
+    assert pr.schema_version == 8
+    rel = pr.settings.related
+    assert rel.username == "" and rel.buttons is None
+    assert (rel.mine.per_taxon, rel.mine.min_faves) == (20, 0)
+    assert rel.others.licenses == ["cc0", "cc-by", "cc-by-sa", "cc-by-nd"]
+    assert (rel.others.per_taxon, rel.others.min_faves, rel.others.research_only) == (5, 1, True)
+
+
+def test_related_sources_are_rebuilt_from_their_species_and_settings():
+    pr = load_project({"format": "dikarya-presentation", "schema_version": 6,
+                       "settings": {"related": {"username": "@Alan_Rockefeller"}},
+                       "sources": [{"id": "a", "type": "url", "url": URL_CR},
+                                   _related("m", "mine", [47692, 47692, 47602], username="someone", url="https://evil.example/"),
+                                   _related("o", "others", [47692], label="Best of the rest")]})
+    mine, others = pr.sources[1], pr.sources[2]
+    assert pr.settings.related.username == "Alan_Rockefeller"
+    assert mine.related.taxon_ids == [47692, 47602] and mine.username is None and mine.label == "More of my photos"
+    assert mine.url.startswith("https://www.inaturalist.org/observations?") and "taxon_id=47692,47602" in mine.url
+    assert "user_id=Alan_Rockefeller" in mine.url
+    assert others.label == "Best of the rest" and "not_user_id=Alan_Rockefeller" in others.url
+    assert "photo_license=cc0,cc-by,cc-by-sa,cc-by-nd" in others.url
+    again = load_project(json.loads(json.dumps(project_to_json(pr))))
+    assert again.sources == pr.sources
+    # A "more from others" source may hold other people's photos: credits start on.
+    own_only = project(source("a", USER))
+    assert observer_default(own_only) is False
+    assert observer_default(own_only.model_copy(update={"sources": own_only.sources + [others]})) is True
+
+
+@pytest.mark.parametrize("data, msg", [
+    ({"sources": [{"id": "m", "type": "related", "url": ""}]}, "no species list"),
+    ({"sources": [_related("m", "sometimes", [1])]}, "invalid"),
+    ({"sources": [_related("m", "mine", [0])]}, "invalid"),
+    ({"settings": {"related": {"username": "not a login"}}}, "invalid"),
+    ({"settings": {"related": {"others": {"licenses": []}}}}, "invalid"),
+    ({"settings": {"related": {"others": {"licenses": ["cc-by-xyz"]}}}}, "invalid"),
+])
+def test_bad_more_photos_settings_are_rejected(data, msg):
+    with pytest.raises(ProjectError, match=msg):
+        load_project({"format": "dikarya-presentation", "schema_version": 6, **data})
+
+
+def test_own_logins_come_from_mine_sources_and_more_photos():
+    from app.project import is_own, own_logins
+    pr = project(source("a", USER), source("b", URL_CR))
+    assert own_logins(pr) == {USER}
+    pr = _with_related_settings(pr, username="Second_Login")
+    assert own_logins(pr) == {USER, "second_login"}
+    assert is_own({"user": {"login": "SECOND_LOGIN"}}, pr) and not is_own({"user": {"login": "bob"}}, pr)
+
+
+def test_added_observation_from_others_starts_with_its_first_allowed_photo():
+    from app.models import Source
+    from app.project import allowed_licenses
+    obs = norm(make_obs(1, 47692, user="bob", licenses=["cc-by-nc", "cc-by"], photos=((11, 9, 9), (12, 9, 9))),
+               make_obs(2, 47692, user="carol", licenses=["cc-by-nc"]))
+    others = Source(id="o", type="related", url="", related={"whose": "others", "taxon_ids": [47692]})
+    pr = project(source("a", URL_CR), others)
+    assert allowed_licenses(pr, ["o"]) == {"cc0", "cc-by", "cc-by-sa", "cc-by-nd"}
+    assert allowed_licenses(pr, ["o", "a"]) is None  # another source found it too: any photo
+    pr = add_observations(pr, [1, 2], obs, {1: ["o"], 2: ["o", "a"]})
+    st = {s.id: s for s in pr.observations}
+    assert st[1].selected_photo_ids == [12] and st[2].selected_photo_ids == [1]
+
+
+def test_placing_new_observations_right_after_one():
+    obs = norm(*[make_obs(i, 47692) for i in range(1, 6)])
+    member = {i: ["a"] for i in range(1, 6)}
+    pr = add_observations(project(source("a", URL_CR)), [1, 2, 3], obs, member, placement="append")
+    assert pr.settings.sort.key == "taxonomic"
+    pr = add_observations(pr, [5, 4], obs, member, placement="after", after_id=2)
+    assert pr.order == [1, 2, 5, 4, 3]
+    assert pr.settings.sort.key == "custom" and pr.settings.sort.base_key == "taxonomic"
+
+
+
+# ---------------------------------------------------------------- review fixes
+def test_a_schema_4_file_with_a_bad_source_list_is_a_readable_error():
+    with pytest.raises(ProjectError, match="invalid"):
+        load_project({"format": "dikarya-presentation", "schema_version": 4, "sources": 1})
+
+
+def test_ignoring_an_id_again_at_the_cap_keeps_it():
+    from app.models import MAX_IGNORED
+
+    pr = project(source("a", URL_CR)).model_copy(update={"ignored_observation_ids": list(range(1, MAX_IGNORED + 1))})
+    ids = ignore_observations(pr, [1, 10 ** 9]).ignored_observation_ids
+    assert len(ids) == MAX_IGNORED and ids[-2:] == [1, 10 ** 9] and 2 not in ids and 3 in ids
+
+
+def test_selected_photos_past_the_photo_limit_are_kept():
+    from app.inaturalist import normalize_observation
+
+    raw = make_obs(5, 47692, photos=((1, 9, 9), (2, 9, 9), (3, 9, 9)))
+    assert [p["id"] for p in normalize_observation(raw, {}, max_photos=2)["photos"]] == [1, 2]
+    assert [p["id"] for p in normalize_observation(raw, {}, max_photos=2, keep={3})["photos"]] == [1, 2, 3]

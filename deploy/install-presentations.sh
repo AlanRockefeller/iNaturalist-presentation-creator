@@ -19,7 +19,12 @@
 #      it in place when run from there. A .git directory is never touched.
 #      (owner $CODE_OWNER, group presentations, read-only for the service).
 #   5. Creates/updates the virtualenv /var/www/presentations/.venv and installs
-#      requirements.txt; byte-compiles; runs an import check as the service user.
+#      requirements.txt; byte-compiles; as the service user, imports the app
+#      and builds it with create_app() (the start-up check).
+#  5b. Presenter notes (optional): copies $CODE_OWNER's Claude Code CLI to
+#      /usr/local/lib/presentations/claude when it changed (never runs it as
+#      root), and creates /etc/presentations/notes.env (root:presentations 0640)
+#      once, empty. Fill in its token and access code to turn notes on.
 #   6. Installs /etc/systemd/system/presentations.service (hardened, 127.0.0.1:8031,
 #      one Uvicorn worker, Restart=on-failure), enables and restarts it, waits for
 #      /healthz.
@@ -40,7 +45,7 @@
 #      only that, after code changes: `sudo /usr/local/sbin/restart-presentations`.
 #  10. Prints service status, listening port, nginx test result and hostnames.
 #
-# Tunables (environment): SRC_DIR CODE_OWNER PORT SKIP_APT SKIP_CERTBOT
+# Tunables (environment): SRC_DIR CODE_OWNER PORT SKIP_APT SKIP_CERTBOT CLAUDE_SRC
 # =============================================================================
 set -Eeuo pipefail
 
@@ -65,6 +70,8 @@ if [[ -z ${SRC_DIR:-} ]]; then
 fi
 RESTART_WRAPPER=/usr/local/sbin/restart-presentations
 SUDOERS_FILE=/etc/sudoers.d/presentations
+NOTES_CLI=/usr/local/lib/presentations/claude
+NOTES_ENV=/etc/presentations/notes.env
 SERVICE=presentations
 SERVICE_USER=presentations
 CODE_OWNER=${CODE_OWNER:-tree}
@@ -119,7 +126,8 @@ id "$CODE_OWNER" &>/dev/null || { warn "user $CODE_OWNER does not exist; code wi
 # which anyone can write to). Refuse if it could have been tampered with.
 src_owner=$(stat -c %U "$SRC_DIR")
 [[ $src_owner == "$CODE_OWNER" || $src_owner == root ]] || die "$SRC_DIR is owned by $src_owner, expected $CODE_OWNER or root"
-bad_owner=$(find "$SRC_DIR" -path "$SRC_DIR/.venv" -prune -o -not -user "$CODE_OWNER" -not -user root -print -quit)
+# .claude/ holds Claude Code worktrees: other checkouts, not code installed here.
+bad_owner=$(find "$SRC_DIR" \( -path "$SRC_DIR/.venv" -o -path "$SRC_DIR/.claude" \) -prune -o -not -user "$CODE_OWNER" -not -user root -print -quit)
 [[ -z $bad_owner ]] || die "$bad_owner in the source tree is owned by an unexpected user"
 if ((IN_PLACE)); then
   info "mode:        in place ($APP_DIR is the source; permissions are normalized in step 4)"
@@ -188,7 +196,9 @@ rsync -a --delete --no-owner --no-group \
   "$SRC_DIR"/ "$APP_DIR"/
 fi
 chown -R "$CODE_OWNER:$SERVICE_USER" "$APP_DIR"
-find "$APP_DIR" \( -path "$APP_DIR/.venv" -o -path "$APP_DIR/.git" \) -prune -o -type d -exec chmod 0755 {} + -o -type f -exec chmod 0644 {} +
+# Not .claude/: its worktrees keep their own file modes (an executable script
+# made 0644 would show up there as a change).
+find "$APP_DIR" \( -path "$APP_DIR/.venv" -o -path "$APP_DIR/.git" -o -path "$APP_DIR/.claude" \) -prune -o -type d -exec chmod 0755 {} + -o -type f -exec chmod 0644 {} +
 chmod 0755 "$APP_DIR/deploy/install-presentations.sh" 2>/dev/null || true
 info "synced ($(find "$APP_DIR/app" -type f | wc -l) app files)"
 
@@ -203,12 +213,86 @@ fi
 "$APP_DIR/.venv/bin/python" -m pip install -q --disable-pip-version-check -r "$APP_DIR/requirements.txt"
 "$APP_DIR/.venv/bin/python" -m compileall -q "$APP_DIR/app" >/dev/null
 chown -R "$CODE_OWNER:$SERVICE_USER" "$APP_DIR"
-find "$APP_DIR" -path "$APP_DIR/.git" -prune -o -exec chmod go-w {} +
-# Import check as the service user, before anything is restarted.
+find "$APP_DIR" \( -path "$APP_DIR/.git" -o -path "$APP_DIR/.claude" \) -prune -o -exec chmod go-w {} +
+# Start-up check as the service user, before anything is restarted: import the
+# app and build it, so an error in create_app() is caught too, not only at import.
 runuser -u "$SERVICE_USER" -- env PRESENTATIONS_WORK_DIR="$STATE_DIR" \
-  "$APP_DIR/.venv/bin/python" -c "import sys; sys.path.insert(0, '$APP_DIR'); import app.main; app.main.create_app" \
-  || die "the application failed to import; service not restarted"
-info "dependencies installed, import check passed"
+  "$APP_DIR/.venv/bin/python" -c "import sys; sys.path.insert(0, '$APP_DIR'); import app.main; app.main.create_app()" \
+  || die "the application failed to start (import or create_app); service not restarted"
+info "dependencies installed, start-up check passed"
+
+# ---------------------------------------------------------------------------
+log "5b. Claude Code CLI for presenter notes (optional)"
+# ---------------------------------------------------------------------------
+# The service cannot see $CODE_OWNER's home (ProtectHome), so it runs its own
+# copy of the CLI. The copy is never run as root. The token and the access code
+# are in $NOTES_ENV, which is created once and never overwritten.
+owner_home=$(getent passwd "$CODE_OWNER" | cut -d: -f6)
+CLAUDE_SRC=${CLAUDE_SRC:-$owner_home/.local/bin/claude}
+claude_real=$(readlink -f -- "$CLAUDE_SRC" 2>/dev/null || true)
+# trusted_path <path>: the path and every directory above it belong to root or
+# $CODE_OWNER and no one else can write to them (group write only for a group
+# with no other members). Then no other user can swap the file, before or while
+# it is copied. ($CODE_OWNER already owns the app code.)
+group_trusted() {
+  local g=$1 gid u
+  gid=$(getent group "$g" | cut -d: -f3) || return 1
+  for u in $(getent group "$g" | cut -d: -f4 | tr ',' ' ') $(getent passwd | awk -F: -v gid="$gid" '$4 == gid {print $1}'); do
+    [[ $u == root || $u == "$CODE_OWNER" ]] || return 1
+  done
+}
+trusted_path() {
+  local p=$1 owner mode
+  while :; do
+    owner=$(stat -c %U -- "$p" 2>/dev/null) || return 1
+    mode=$(stat -c %a -- "$p" 2>/dev/null) || return 1
+    [[ $owner == root || $owner == "$CODE_OWNER" ]] || return 1
+    (( (8#$mode & 8#002) == 0 )) || return 1
+    if (( 8#$mode & 8#020 )); then group_trusted "$(stat -c %G -- "$p")" || return 1; fi
+    [[ $p == / ]] && return 0
+    p=$(dirname -- "$p")
+  done
+}
+if [[ -n $claude_real && -f $claude_real && -x $claude_real ]] && ! trusted_path "$claude_real"; then
+  warn "$claude_real (or a folder above it) is not owned by root or $CODE_OWNER, or others can write to it; not copied, presenter notes stay off"
+elif [[ -n $claude_real && -f $claude_real && -x $claude_real ]]; then
+  install -d -m 0755 -o root -g root "$(dirname "$NOTES_CLI")"
+  if [[ -f $NOTES_CLI ]] && cmp -s "$claude_real" "$NOTES_CLI"; then
+    info "Claude Code CLI unchanged"
+  else
+    install -m 0755 -o root -g root "$claude_real" "$NOTES_CLI"
+    info "Claude Code CLI copied from $claude_real"
+  fi
+  install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0750 "$STATE_DIR/claude"
+  if cli_version=$(runuser -u "$SERVICE_USER" -- env -i HOME="$STATE_DIR/claude" PATH=/usr/bin:/bin \
+      DISABLE_AUTOUPDATER=1 "$NOTES_CLI" --version 2>/dev/null); then
+    info "Claude Code CLI runs as $SERVICE_USER: $cli_version"
+  else
+    warn "$NOTES_CLI --version failed as $SERVICE_USER; presenter notes stay off"
+  fi
+else
+  info "no Claude Code CLI at $CLAUDE_SRC; presenter notes stay off"
+fi
+install -d -m 0750 -o root -g "$SERVICE_USER" "$(dirname "$NOTES_ENV")"
+if [[ ! -e $NOTES_ENV ]]; then
+  cat >"$NOTES_ENV" <<'NOTES_ENV_TEMPLATE'
+# Presenter notes written by Claude Code, read by presentations.service.
+# Fill in both values, then: sudo /usr/local/sbin/restart-presentations
+#
+# A long-lived token for your Claude subscription. As the code owner, run
+#   claude setup-token
+# and paste the token it prints after the = sign.
+CLAUDE_CODE_OAUTH_TOKEN=
+# The code the site asks for before Claude writes notes. Keep it private:
+# anyone who has it uses your Claude subscription.
+PRESENTATIONS_NOTES_ACCESS_CODE=
+NOTES_ENV_TEMPLATE
+  info "created $NOTES_ENV (empty, so presenter notes stay off until it is filled in)"
+else
+  info "$NOTES_ENV exists (left as it is)"
+fi
+chown root:"$SERVICE_USER" "$NOTES_ENV"
+chmod 0640 "$NOTES_ENV"
 
 # ---------------------------------------------------------------------------
 log "6. systemd unit"
@@ -229,6 +313,8 @@ WorkingDirectory=${APP_DIR}
 Environment=PRESENTATIONS_WORK_DIR=${STATE_DIR}
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=PYTHONUNBUFFERED=1
+# Presenter notes: CLAUDE_CODE_OAUTH_TOKEN and PRESENTATIONS_NOTES_ACCESS_CODE.
+EnvironmentFile=-${NOTES_ENV}
 # Exactly one worker: the iNaturalist rate limiter, request budgets and job
 # registry are in-process and must be shared by every request.
 ExecStart=${APP_DIR}/.venv/bin/uvicorn --factory app.main:create_app \\
@@ -542,9 +628,10 @@ cat >"$tmp" <<'WRAPPER'
 #   64  bad arguments (only --force is accepted)
 #   69  restarted but /healthz never answered: THE SITE IS DOWN (journal printed)
 #   70  systemctl restart failed (status printed)
-#   75  refused: a presentation is being generated; wait, or use --force
+#   75  refused: a presentation is being generated, or the service is running
+#       but /healthz did not answer so that is unknown; wait, or use --force
 #   77  not run as root (use sudo)
-#   78  import check failed: NOT restarted, the running site is unaffected
+#   78  start-up check failed: NOT restarted, the running site is unaffected
 set -uo pipefail
 APP_DIR=@APP_DIR@
 SERVICE=@SERVICE@
@@ -560,17 +647,34 @@ case "$#:${1:-}" in
 esac
 [[ $EUID -eq 0 ]] || { echo "run it with sudo" >&2; exit 77; }
 
-# 1. Import check as the unprivileged service user.
+# 1. Start-up check as the unprivileged service user: import the app and build
+#    it with create_app(), as Uvicorn will.
 if ! out=$(cd / && runuser -u "$SERVICE_USER" -- env PYTHONDONTWRITEBYTECODE=1 \
       PRESENTATIONS_WORK_DIR="$STATE_DIR" "$APP_DIR/.venv/bin/python" \
-      -c "import sys; sys.path.insert(0, '$APP_DIR'); import app.main" 2>&1); then
-  echo "Import check FAILED, so the service was NOT restarted (the site is still up on the old code):" >&2
+      -c "import sys; sys.path.insert(0, '$APP_DIR'); import app.main; app.main.create_app()" 2>&1); then
+  echo "Start-up check FAILED, so the service was NOT restarted (the site is still up on the old code):" >&2
   printf '%s\n' "$out" | tail -n 25 >&2
   exit 78
 fi
 
-# 2. Do not cancel a deck that is being built.
-health=$(curl -fsS --max-time 3 "http://127.0.0.1:${PORT}/healthz" 2>/dev/null || true)
+# 2. Do not cancel a deck that is being built. /healthz is asked up to three
+#    times, so one slow answer cannot make it look as if nothing is running.
+health=""
+for _ in 1 2 3; do
+  health=$(curl -fsS --max-time 3 "http://127.0.0.1:${PORT}/healthz" 2>/dev/null) && break
+  health=""
+  sleep 1
+done
+if [[ -z $health ]]; then
+  # Not running: nothing can be generating, and restarting is what a down site
+  # needs. Running but silent: whether a deck is being built is unknown.
+  if systemctl is-active --quiet "$SERVICE" && (( !force )); then
+    echo "Refusing to restart: the service is running but /healthz did not answer, so it is unknown whether a presentation is being generated." >&2
+    echo "Check it (journalctl -u $SERVICE), or re-run with --force if cancelling one is acceptable." >&2
+    exit 75
+  fi
+  echo "note: /healthz did not answer; restarting." >&2
+fi
 read -r loading generating < <(python3 -c '
 import json, sys
 try:
@@ -638,6 +742,8 @@ info "hostnames:      ${DOMAIN} -> app;  ${ALIAS} -> 301 ${DOMAIN}\$request_uri"
 info "code:           ${APP_DIR} (owner ${CODE_OWNER}:${SERVICE_USER})"
 info "temp storage:   ${STATE_DIR} (workspaces, cached originals <=2h, decks <=2h)"
 info "restart:        sudo ${RESTART_WRAPPER}   (allowed for ${CODE_OWNER} via ${SUDOERS_FILE})"
+notes_have() { grep -Eq "^$1=.+" "$NOTES_ENV" 2>/dev/null && echo yes || echo no; }
+info "presenter notes: CLI $( [[ -x $NOTES_CLI ]] && echo yes || echo no ), token $(notes_have CLAUDE_CODE_OAUTH_TOKEN), access code $(notes_have PRESENTATIONS_NOTES_ACCESS_CODE)  (${NOTES_ENV})"
 if [[ -d $APP_DIR/.git ]]; then
   info "git:            $(git -C "$APP_DIR" -c safe.directory="$APP_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null) @ $(git -C "$APP_DIR" -c safe.directory="$APP_DIR" rev-parse --short HEAD 2>/dev/null)"
 fi

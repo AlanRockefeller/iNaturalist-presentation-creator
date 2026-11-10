@@ -20,6 +20,7 @@ Generation rules:
 from __future__ import annotations
 
 import hashlib
+import re
 import zipfile
 from datetime import date
 from pathlib import Path
@@ -37,7 +38,7 @@ from pptx.parts.image import ImagePart
 from pptx.util import Emu, Pt
 
 from .models import ObservationState, Project
-from .project import observer_enabled
+from .project import is_own, observer_enabled, own_logins
 from .sorting import GROUP_LABELS, effective_name, group_of, passes_filters
 
 SLIDE_W = Emu(12192000)  # 13.333 in
@@ -51,6 +52,24 @@ MARGIN_Y = Emu(int(0.22 * EMU_PER_INCH))
 TITLE_FONT = "Georgia"
 BODY_FONT = "Calibri"
 GOLD = RGBColor(0xC9, 0xA9, 0x62)
+
+# Text that XML (so a .pptx) cannot hold, and control characters, which
+# python-pptx would otherwise write as visible "_x000B_" escapes.
+_XML_UNSAFE = re.compile("[\ud800-\udfff\ufffe\uffff]")
+_CONTROL = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
+
+
+def xml_text(text: str) -> str:
+    """One line of slide text, safe to write into the deck."""
+    return _CONTROL.sub(" ", _XML_UNSAFE.sub("", text or ""))
+
+
+def title_size(title: str) -> int:
+    """Title point size: 54 pt, smaller for long titles so they stay on the
+    slide (the title box holds about three lines at 54 pt)."""
+    n = len(title)
+    return 54 if n <= 70 else 44 if n <= 120 else 36
+
 
 MONTHS = ["January", "February", "March", "April", "May", "June", "July",
           "August", "September", "October", "November", "December"]
@@ -72,12 +91,63 @@ def observer_name(obs: dict) -> str:
     return (user.get("name") or user.get("login") or "").strip()
 
 
-def annotation_lines(obs: dict, state: ObservationState, project: Project) -> list[dict]:
+def rare_info(obs: dict | None, project: Project) -> dict | None:
+    """The observation's Rare finds counts (``obs["rare"]``, see rare.py), if
+    the source that counted it is in the project and enabled."""
+    info = (obs or {}).get("rare")
+    if not info:
+        return None
+    if not any(src.id == info.get("source") and src.type == "rare" and src.enabled for src in project.sources):
+        return None
+    return info
+
+
+def rarity_text(info: dict | None, rank: tuple[int, bool] | None = None) -> str:
+    """"12 observations worldwide · #3 rarest", or "tied for #3 rarest" when
+    another species has the same count. Mirrored by rarityText() in app.js."""
+    if not info:
+        return ""
+    world = int(info.get("world") or 0)
+    text = f"{world:,} observation{'' if world == 1 else 's'} worldwide"
+    if not rank:
+        return text
+    place, tied = rank
+    return f"{text} · {'tied for ' if tied else ''}#{place} rarest"
+
+
+def rare_ranks(project: Project, workspace_obs: dict[int, dict]) -> dict[int, tuple[int, bool]]:
+    """Observation id -> (its species' place by worldwide count, 1 = rarest,
+    among the species its Rare finds source has in the deck; whether another
+    species shares that place). Equal counts share a place."""
+    members: list[tuple[int, str, int]] = []
+    taxa: dict[str, dict[int, int]] = {}
+    for st in project.observations:
+        obs = workspace_obs.get(st.id)
+        info = rare_info(obs, project)
+        if info is None or st.status != "active" or not passes_filters(obs, st, project):
+            continue
+        selected = set(st.selected_photo_ids)
+        if not any(ph["id"] in selected for ph in obs.get("photos", [])):
+            continue  # no slide
+        tid = (obs.get("taxon") or {}).get("id")
+        taxa.setdefault(info["source"], {})[tid] = int(info.get("world") or 0)
+        members.append((st.id, info["source"], tid))
+    out = {}
+    for oid, sid, tid in members:
+        world = taxa[sid][tid]
+        place = 1 + sum(1 for w in taxa[sid].values() if w < world)
+        out[oid] = (place, sum(1 for w in taxa[sid].values() if w == world) > 1)
+    return out
+
+
+def annotation_lines(obs: dict, state: ObservationState, project: Project, logins: set[str] | None = None,
+                     rank: tuple[int, bool] | None = None) -> list[dict]:
     """Text lines for an image slide, in display order.
 
     Each line: {"field", "text", "italic", "size"}. Only the scientific name is
     italic. ``state.show_lines`` turns a line on or off for this observation
-    regardless of the settings; an override of "" also hides it.
+    regardless of the settings; an override of "" also hides it. The observer
+    credit is left off the presenter's own photos unless show_lines asks for it.
     """
     ann = project.settings.annotations
     ov = state.overrides
@@ -94,10 +164,13 @@ def annotation_lines(obs: dict, state: ObservationState, project: Project) -> li
 
     add("scientific", ann.scientific, ov.scientific, obs.get("inat_name") or "", True, SCIENTIFIC_PT)
     add("common_name", ann.common_name, ov.common_name, obs.get("common_name") or "", False, DETAIL_PT)
+    add("rarity", ann.rarity, ov.rarity, rarity_text(rare_info(obs, project), rank), False, DETAIL_PT)
     add("date", ann.date, ov.date, format_date(obs.get("observed_on")), False, DETAIL_PT)
     add("location", ann.location, ov.location, obs.get("place_guess") or "", False, DETAIL_PT)
     name = observer_name(obs)
-    add("observer", observer_enabled(project), ov.observer, f"Photo: {name}" if name else "", False, DETAIL_PT)
+    # The presenter's own photos are not credited (``logins``: own_logins()).
+    own = is_own(obs, project, logins)
+    add("observer", observer_enabled(project) and not own, ov.observer, f"Photo: {name}" if name else "", False, DETAIL_PT)
     return lines
 
 
@@ -116,6 +189,7 @@ def build_slide_plan(project: Project, workspace_obs: dict[int, dict], max_image
     """The exact slide sequence, plus warnings and counts."""
     settings = project.settings
     states = {s.id: s for s in project.observations}
+    logins = own_logins(project)
     slides: list[dict] = []
     warnings: list[str] = []
 
@@ -131,15 +205,19 @@ def build_slide_plan(project: Project, workspace_obs: dict[int, dict], max_image
                            "rotation": tp_state.rotations.get(tp.photo_id, 0) if tp_state else 0}
         else:
             warnings.append("The title background photo is no longer available on iNaturalist.")
+    title = settings.title.strip() or "Untitled presentation"
     slides.append({
         "kind": "title",
-        "title": settings.title.strip() or "Untitled presentation",
+        "title": title,
+        "title_size": title_size(title),
         "presenter": settings.presenter.strip(),
         "photo": title_photo,
     })
 
     grouping = settings.grouping
     current_group = None
+    ranks = rare_ranks(project, workspace_obs)
+    rare_sources_used: dict[str, str] = {}  # source id -> when its counts were taken
     image_count = 0
     divider_count = 0
     unavailable_obs = 0
@@ -170,9 +248,12 @@ def build_slide_plan(project: Project, workspace_obs: dict[int, dict], max_image
         photos.sort(key=lambda p: position[p["id"]])
 
         if grouping != "none" and settings.dividers:
-            _, label = group_of(obs, st, grouping, project)
-            if label != current_group:
-                current_group = label
+            # A new divider for each new group, as in Select & Organize: two
+            # groups can share a label (one genus name in two families, two
+            # sources), so the key is compared as well as the label.
+            group_key, label = group_of(obs, st, grouping, project)
+            if (group_key, label) != current_group:
+                current_group = (group_key, label)
                 slides.append({
                     "kind": "divider",
                     "text": label,
@@ -180,7 +261,10 @@ def build_slide_plan(project: Project, workspace_obs: dict[int, dict], max_image
                     "italic": grouping == "genus" and label != "Unclassified",
                 })
                 divider_count += 1
-        lines = annotation_lines(obs, st, project)
+        lines = annotation_lines(obs, st, project, logins, ranks.get(oid))
+        info = rare_info(obs, project)
+        if info:
+            rare_sources_used.setdefault(info["source"], info.get("counted_at") or "")
         observations_used += 1
         for p in photos:
             rotation = st.rotations.get(p["id"], 0)
@@ -196,10 +280,15 @@ def build_slide_plan(project: Project, workspace_obs: dict[int, dict], max_image
                 "width": width,
                 "height": height,
                 "lines": lines,
-                "notes": _speaker_notes(obs, st, p) if settings.speaker_notes else "",
+                "notes": _speaker_notes(obs, st, p, settings, info),
             })
             image_count += 1
 
+    about = 0
+    if settings.about_slide and rare_sources_used:
+        slides.append({"kind": "about", "title": "About these numbers",
+                       "lines": _about_lines(project, rare_sources_used)})
+        about = 1
     if unavailable_obs:
         warnings.append(f"{unavailable_obs} selected observation(s) are no longer available on iNaturalist and are skipped.")
     if unavailable_photos:
@@ -210,21 +299,52 @@ def build_slide_plan(project: Project, workspace_obs: dict[int, dict], max_image
         "slides": slides,
         "counts": {
             "total": len(slides), "title": 1, "dividers": divider_count, "images": image_count,
-            "observations": observations_used,
+            "observations": observations_used, "about": about,
         },
         "warnings": warnings,
         "background": settings.background,
     }
 
 
-def _speaker_notes(obs: dict, st: ObservationState, photo: dict) -> str:
-    bits = [effective_name(st, obs) or "Unidentified"]
-    if obs.get("common_name"):
-        bits.append(obs["common_name"])
-    bits.append(obs.get("uri") or "")
-    if photo.get("attribution"):
-        bits.append(photo["attribution"])
-    return "\n".join(b for b in bits if b)
+def _about_lines(project: Project, used: dict[str, str]) -> list[str]:
+    """The "About these numbers" slide, for the Rare finds sources in the deck."""
+    dates = sorted({format_date(d) for d in used.values() if d})
+    when = (f" on {dates[0]}" if len(dates) == 1 else f" between {dates[0]} and {dates[-1]}") if dates else ""
+    lines = [
+        f"Worldwide counts are every iNaturalist observation of each species, of any quality grade{when}.",
+        "#1 is the rarest of the species each search found that are in this presentation.",
+        "Only species and finer ranks are counted: a count for a whole genus says nothing about rarity.",
+        "Provisional names exist only where collections were sequenced, so their low counts partly "
+        "reflect how little sequencing is done elsewhere.",
+        "The photos belong to their photographers.",
+    ]
+    for src in project.sources:
+        if src.id in used:
+            lines.append(f"Search: {src.label or src.url}")
+    return lines
+
+
+def _speaker_notes(obs: dict, st: ObservationState, photo: dict, settings, rare: dict | None = None) -> str:
+    """The slide's notes: the name and common name, then the presenter notes,
+    then the iNaturalist link and photo credit. ``speaker_notes`` controls the
+    name, link and credit; ``presenter_notes`` the observation's own notes.
+    A blank line separates the presenter notes from the rest."""
+    head, tail = [], []
+    if settings.speaker_notes:
+        head = [effective_name(st, obs) or "Unidentified", obs.get("common_name") or ""]
+        if rare:
+            world, local = int(rare.get("world") or 0), int(rare.get("local") or 0)
+            when = format_date(rare.get("counted_at"))
+            head.append(f"{world:,} observation{'' if world == 1 else 's'} on iNaturalist worldwide"
+                        + (f" as of {when}" if when else "") + f"; {local:,} of them in this search.")
+        tail = [obs.get("uri") or "", photo.get("attribution") or ""]
+    head, tail = [b for b in head if b], [b for b in tail if b]
+    own = [line for line in (st.notes or "").split("\n") if line.strip()] if settings.presenter_notes else []
+    lines = head
+    if own:
+        lines = head + ([""] if head else []) + own + ([""] if tail else [])
+    lines += tail
+    return "\n".join(xml_text(line) for line in lines)  # one paragraph per line
 
 
 # ---------------------------------------------------------------------------
@@ -326,7 +446,7 @@ def _add_para(tf, first: bool, text: str, size: int, italic=False, bold=False, c
     para = tf.paragraphs[0] if first else tf.add_paragraph()
     para.alignment = align
     run = para.add_run()
-    run.text = text
+    run.text = xml_text(text)
     f = run.font
     f.size = Pt(size)
     f.italic = italic
@@ -382,7 +502,7 @@ class DeckWriter:
         if self._on_media_write:
             self._on_media_write(self.media_written)
 
-    def add_title(self, title: str, presenter: str, bg_image=None):
+    def add_title(self, title: str, presenter: str, bg_image=None, size: int | None = None):
         slide = self._new_slide()
         light_text = self.background == "black" or bg_image is not None
         if bg_image is not None:
@@ -392,7 +512,8 @@ class DeckWriter:
         w = int(SLIDE_W * 0.84)
         left = (int(SLIDE_W) - w) // 2
         box, tf = _textbox(slide, left, int(SLIDE_H * 0.16), w, int(SLIDE_H * 0.42), MSO_ANCHOR.BOTTOM)
-        _add_para(tf, True, title, 54, bold=True, color=color, font=TITLE_FONT, align=PP_ALIGN.CENTER, shadow=shadow)
+        _add_para(tf, True, title, size or title_size(title), bold=True, color=color, font=TITLE_FONT,
+                  align=PP_ALIGN.CENTER, shadow=shadow)
         rule_w = int(SLIDE_W * 0.12)
         rule = slide.shapes.add_shape(1, (int(SLIDE_W) - rule_w) // 2, int(SLIDE_H * 0.625), rule_w, Emu(28575))
         rule.fill.solid()
@@ -401,6 +522,20 @@ class DeckWriter:
         if presenter:
             box, tf = _textbox(slide, left, int(SLIDE_H * 0.67), w, int(SLIDE_H * 0.2), MSO_ANCHOR.TOP)
             _add_para(tf, True, presenter, 28, color=color, font=TITLE_FONT, align=PP_ALIGN.CENTER, shadow=shadow)
+        return slide
+
+    def add_about(self, title: str, lines: list[str]):
+        """A text slide: a gold title and one paragraph per line."""
+        slide = self._new_slide()
+        color = RGBColor(0xFF, 0xFF, 0xFF) if self.background == "black" else RGBColor(0x1A, 0x2F, 0x23)
+        left = int(0.8 * EMU_PER_INCH)
+        w = int(SLIDE_W) - 2 * left
+        box, tf = _textbox(slide, left, int(0.6 * EMU_PER_INCH), w, int(0.9 * EMU_PER_INCH), MSO_ANCHOR.TOP)
+        _add_para(tf, True, xml_text(title), 32, bold=True, color=GOLD, font=TITLE_FONT)
+        box, tf = _textbox(slide, left, int(1.7 * EMU_PER_INCH), w, int(SLIDE_H) - int(2.3 * EMU_PER_INCH), MSO_ANCHOR.TOP)
+        for i, line in enumerate(lines):
+            para = _add_para(tf, i == 0, "•  " + xml_text(line), 18, color=color, font=BODY_FONT)
+            para.space_after = Pt(10)
         return slide
 
     def add_divider(self, text: str, rank_label: str, italic: bool):
@@ -444,8 +579,8 @@ class DeckWriter:
 
     def save(self, out_path: Path, title: str = "", author: str = "") -> None:
         props = self.prs.core_properties
-        props.title = title[:200]
-        props.author = author[:200] or "Dikarya Presentations"
+        props.title = xml_text(title)[:200]
+        props.author = xml_text(author)[:200] or "Dikarya Presentations"
         props.comments = "Created with presentations.dikarya.us from iNaturalist observations."
         self.prs.save(str(out_path))
 
@@ -474,9 +609,11 @@ def write_pptx(
         kind = spec["kind"]
         if kind == "title":
             title_text = spec["title"]
-            writer.add_title(spec["title"], spec.get("presenter", ""), title_image)
+            writer.add_title(spec["title"], spec.get("presenter", ""), title_image, spec.get("title_size"))
         elif kind == "divider":
             writer.add_divider(spec["text"], spec.get("rank_label", ""), spec.get("italic", False))
+        elif kind == "about":
+            writer.add_about(spec["title"], spec.get("lines", []))
         elif kind == "image":
             prepared = images.get(spec["photo_id"])
             if prepared is None:

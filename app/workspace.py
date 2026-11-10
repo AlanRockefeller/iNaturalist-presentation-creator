@@ -3,8 +3,9 @@
 A workspace holds what the last load fetched (observations + per-source result
 lists) so sorting, preview and generation work from trusted, server-derived data
 without the browser re-uploading megabytes of metadata. Workspaces are gzipped
-JSON files that expire after ``workspace_ttl_seconds``; they hold no user edits
-and no photographs.
+JSON files that expire ``workspace_ttl_seconds`` after they were last used (the
+file's modification time records the last use); they hold no user edits and
+no photographs.
 """
 
 from __future__ import annotations
@@ -20,6 +21,10 @@ import time
 from collections import OrderedDict
 from pathlib import Path
 
+from .diagnostics import get_logger
+
+log = get_logger(__name__)
+
 WORKSPACE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{20,64}$")
 
 
@@ -34,6 +39,9 @@ class WorkspaceStore:
         self._mem: OrderedDict[str, dict] = OrderedDict()
         self._mem_items = memory_items
         self._lock = threading.Lock()
+        # Last uses whose file time could not be updated (workspace id ->
+        # time), kept apart from the evictable cache so they still count.
+        self._touched: dict[str, float] = {}
 
     def _path(self, wid: str) -> Path:
         if not isinstance(wid, str) or not WORKSPACE_ID_RE.match(wid):
@@ -57,7 +65,9 @@ class WorkspaceStore:
         except BaseException:
             Path(tmp).unlink(missing_ok=True)
             raise
-        self._remember(wid, self._inflate(data))
+        ws = self._inflate(data)
+        ws["used"] = data["created"]
+        self._remember(wid, ws)
         return wid
 
     @staticmethod
@@ -76,34 +86,80 @@ class WorkspaceStore:
                 self._mem.popitem(last=False)
 
     def get(self, wid: str) -> dict:
+        """The workspace, if it was used within the TTL. Each use extends it."""
         path = self._path(wid)
-        with self._lock:
-            ws = self._mem.get(wid)
-            if ws is not None:
+        while True:
+            with self._lock:
+                ws = self._mem.get(wid)
+            loaded = None
+            if ws is None:
+                # Read outside the lock (it can be megabytes); published below.
+                try:
+                    with gzip.open(path, "rb") as fh:
+                        loaded = self._inflate(json.loads(fh.read()))
+                except (OSError, ValueError, EOFError):
+                    raise WorkspaceExpired() from None
+            # Published, checked and extended under the lock, which cleanup()
+            # also takes: a copy another request loaded and renewed meanwhile is
+            # kept (not replaced by this one), two uses at once cannot put the
+            # time back, and cleanup cannot delete the file between check and
+            # renewal.
+            with self._lock:
+                ws = self._mem.get(wid)
+                if ws is None:
+                    if loaded is None:
+                        continue  # dropped from memory meanwhile: read the file (outside the lock)
+                    try:
+                        # Its last use is the file's time now, which a request
+                        # that renewed it meanwhile may have moved on.
+                        loaded["used"] = max(path.stat().st_mtime, self._touched.get(wid, 0.0))
+                    except OSError:
+                        raise WorkspaceExpired() from None
+                    ws = self._mem[wid] = loaded
                 self._mem.move_to_end(wid)
-        if ws is None:
-            try:
-                with gzip.open(path, "rb") as fh:
-                    ws = self._inflate(json.loads(fh.read()))
-            except (OSError, ValueError, EOFError):
-                raise WorkspaceExpired() from None
-            self._remember(wid, ws)
-        if time.time() - ws["created"] > self.ttl:
-            raise WorkspaceExpired()
-        try:
-            os.utime(path)
-        except OSError:
-            pass
-        return ws
+                now = time.time()
+                if now - ws["used"] > self.ttl:
+                    self._mem.pop(wid, None)  # its data is not kept for nothing
+                    self._touched.pop(wid, None)
+                    raise WorkspaceExpired()
+                try:
+                    # The file's time is the last use, for restarts and for cleanup().
+                    os.utime(path)
+                except FileNotFoundError:
+                    # Its file is gone, so it could not outlive this process:
+                    # treat it as expired rather than alive in memory only.
+                    self._mem.pop(wid, None)
+                    self._touched.pop(wid, None)
+                    raise WorkspaceExpired() from None
+                except OSError as exc:
+                    # Still in use: remember the time apart from the cache (get()
+                    # and cleanup() both check it), and say so, since a restart
+                    # would lose it sooner.
+                    log.warning("event=workspace.touch_failed error_type=%s", type(exc).__name__)
+                    self._touched[wid] = now
+                else:
+                    self._touched.pop(wid, None)
+                ws["used"] = max(ws["used"], now)
+                # Trim last, so even a store that keeps nothing in memory works.
+                while len(self._mem) > self._mem_items:
+                    self._mem.popitem(last=False)
+                return ws
 
     def cleanup(self) -> None:
         now = time.time()
         for p in self.directory.glob("*"):
-            try:
-                if now - p.stat().st_mtime > self.ttl:
+            with self._lock:  # see get()
+                try:
+                    if now - p.stat().st_mtime <= self.ttl:
+                        continue
+                    wid = p.name.split(".", 1)[0]
+                    if now - self._touched.get(wid, 0.0) <= self.ttl:
+                        continue  # in use, though its file's time could not be updated
                     p.unlink(missing_ok=True)
-            except OSError:
-                continue
+                except OSError:
+                    continue
         with self._lock:
-            for wid in [w for w, ws in self._mem.items() if now - ws["created"] > self.ttl]:
+            for wid in [w for w, ws in self._mem.items() if now - ws["used"] > self.ttl]:
                 self._mem.pop(wid, None)
+            for wid in [w for w, t in self._touched.items() if now - t > self.ttl]:
+                del self._touched[wid]

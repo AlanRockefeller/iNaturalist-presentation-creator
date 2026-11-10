@@ -41,6 +41,7 @@ TAXA = {
     47700: ("Strophariaceae", "family", 47167),
     47701: ("Psilocybe", "genus", 47700),
     47702: ("Psilocybe cyanescens", "species", 47701),
+    47695: ("Hygrocybe 'PNW05'", "species", 47691),  # a provisional name
 }
 COMMON = {47692: "Witch's Hat", 47602: "Fly Agaric", 47702: "Wavy Cap"}
 
@@ -53,26 +54,42 @@ def ancestors(tid: int) -> list[int]:
     return list(reversed(chain))
 
 
+RANK_LEVELS = {"kingdom": 70, "phylum": 60, "class": 50, "order": 40, "family": 30, "genus": 20,
+               "section": 13, "species": 10, "variety": 5, "subspecies": 5}
+
+
+def _attribution(user, code):
+    """Like iNaturalist's: "(c) alice, some rights reserved (CC BY-NC)"."""
+    if code is None:
+        return f"(c) {user}, all rights reserved"
+    if code == "cc0":
+        return f"{user}, no rights reserved (CC0)"
+    return f"(c) {user}, some rights reserved (CC {code[3:].upper()})"
+
+
 def make_obs(oid, taxon_id, user="alice", faves=0, observed_on="2026-10-01", photos=((1, 1600, 1200),),
-             created_at=None, place="Point Reyes, CA, US", name=None, ofvs=None, place_id=1):
+             created_at=None, place="Point Reyes, CA, US", name=None, ofvs=None, place_id=1,
+             license="cc-by", licenses=None, quality="research"):
+    """``licenses``: one license code (None = all rights reserved) per photo;
+    otherwise every photo has ``license``."""
     taxon = None
     if taxon_id is not None:
         tname, rank, _ = TAXA[taxon_id]
         taxon = {
-            "id": taxon_id, "name": tname, "rank": rank, "rank_level": 10,
+            "id": taxon_id, "name": tname, "rank": rank, "rank_level": RANK_LEVELS.get(rank, 10),
             "preferred_common_name": COMMON.get(taxon_id), "ancestor_ids": ancestors(taxon_id),
         }
     return {
         "id": oid, "uuid": f"u-{oid}", "faves_count": faves, "observed_on": observed_on,
         "created_at": created_at or f"2026-10-{(oid % 28) + 1:02d}T10:00:00-07:00",
-        "place_guess": place, "quality_grade": "research", "obscured": False,
+        "place_guess": place, "quality_grade": quality, "obscured": False,
         "user": {"login": user, "name": name},
         "taxon": taxon,
         "photos": [
             {"id": pid, "url": f"https://{PHOTO_HOST}/photos/{pid}/square.jpg", "hidden": False,
-             "license_code": "cc-by", "attribution": f"(c) {user}, some rights reserved (CC BY)",
+             "license_code": code, "attribution": _attribution(user, code),
              "original_dimensions": {"width": w, "height": h}}
-            for pid, w, h in photos
+            for (pid, w, h), code in zip(photos, licenses if licenses is not None else [license] * len(photos))
         ],
         "ofvs": ofvs or [],
         "_place_id": place_id,
@@ -89,6 +106,10 @@ class FakeINat:
         self.photo_dims: dict[int, tuple[int, int]] = {}
         self.fail_429_times = 0
         self.deleted_photos: set[int] = set()
+        # Rare finds: observations iNaturalist has elsewhere (added to worldwide
+        # counts), and taxa's cached observations_count (stale on purpose).
+        self.world_extra: dict[int, int] = {}
+        self.cached_counts: dict[int, int] = {}
 
     def add(self, *obs):
         for o in obs:
@@ -115,6 +136,8 @@ class FakeINat:
                 return httpx.Response(429, headers={"Retry-After": "0"})
             if request.url.path == "/v2/observations":
                 return self._observations(request)
+            if request.url.path == "/v2/observations/species_counts":
+                return self._species_counts(request)
             if request.url.path == "/v2/taxa":
                 return self._taxa(request)
             return httpx.Response(404)
@@ -139,20 +162,70 @@ class FakeINat:
             ids = {int(i) for i in q["id"].split(",")}
             res = [self._public(o) for o in self.observations if o["id"] in ids]
             return httpx.Response(200, json={"total_results": len(res), "page": 1, "per_page": per_page, "results": res})
+        res = self._filtered(q)
+        if q.get("order_by") == "votes":  # favorites, most first (stable, like id order)
+            res.sort(key=lambda o: o["faves_count"], reverse=q.get("order") != "asc")
+        total = len(res)
+        if per_page == 0 and self._worldwide(q):  # a count of one taxon, everywhere
+            total += sum(self.world_extra.get(int(t), 0) for t in q["taxon_id"].split(","))
+        page = int(q.get("page", 1))
+        chunk = res[(page - 1) * per_page: page * per_page]
+        return httpx.Response(200, json={
+            "total_results": total, "page": page, "per_page": per_page,
+            "results": [self._public(o) for o in chunk],
+        })
+
+    @staticmethod
+    def _worldwide(q) -> bool:
+        """A query limited by taxon only."""
+        return "taxon_id" in q and not set(q.keys()) - {"taxon_id", "per_page", "page", "fields", "locale", "order"}
+
+    def _species_counts(self, request):
+        """Leaf taxa only, like iNaturalist: a taxon with an observed descendant
+        in the results gets no row of its own."""
+        q = request.url.params
+        res = self._filtered(q)
+        present = {o["taxon"]["id"]: o["taxon"] for o in res if o["taxon"]}
+        below = {a for t in present.values() for a in t["ancestor_ids"] if a != t["id"]}
+        counts: dict[int, int] = {}
+        for o in res:
+            t = o["taxon"]
+            if t and t["id"] not in below:
+                counts[t["id"]] = counts.get(t["id"], 0) + 1
+        world = self._worldwide(q)
+        rows = []
+        for tid, n in counts.items():
+            n += self.world_extra.get(tid, 0) if world else 0
+            t = present[tid]
+            rows.append({"count": n, "taxon": {
+                "id": tid, "name": t["name"], "rank": t["rank"], "rank_level": t["rank_level"],
+                "preferred_common_name": t.get("preferred_common_name"),
+                "observations_count": self.cached_counts.get(tid, n),
+            }})
+        rows.sort(key=lambda r: (r["count"], r["taxon"]["id"]), reverse=q.get("order") != "asc")
+        per_page, page = int(q.get("per_page", 500)), int(q.get("page", 1))
+        return httpx.Response(200, json={"total_results": len(rows), "page": page, "per_page": per_page,
+                                         "results": rows[(page - 1) * per_page: page * per_page]})
+
+    def _filtered(self, q) -> list[dict]:
         res = list(self.observations)
         if "user_id" in q:
             res = [o for o in res if o["user"]["login"] == q["user_id"]]
+        if "not_user_id" in q:
+            res = [o for o in res if o["user"]["login"] != q["not_user_id"]]
+        if "quality_grade" in q:
+            res = [o for o in res if o["quality_grade"] in q["quality_grade"].split(",")]
+        if q.get("popular") == "true":
+            res = [o for o in res if o["faves_count"] > 0]
+        if "photo_license" in q:
+            allowed = set(q["photo_license"].split(","))
+            res = [o for o in res if any(p["license_code"] in allowed for p in o["photos"])]
         if "taxon_id" in q:
             want = {int(t) for t in q["taxon_id"].split(",")}
             res = [o for o in res if o["taxon"] and want & set(o["taxon"]["ancestor_ids"])]
         if "place_id" in q:
             res = [o for o in res if str(o["_place_id"]) == q["place_id"]]
-        page = int(q.get("page", 1))
-        chunk = res[(page - 1) * per_page: page * per_page]
-        return httpx.Response(200, json={
-            "total_results": len(res), "page": page, "per_page": per_page,
-            "results": [self._public(o) for o in chunk],
-        })
+        return res
 
     def _taxa(self, request):
         ids = [int(i) for i in request.url.params["id"].split(",")]
@@ -212,3 +285,47 @@ def wait_job(tc, job_id, timeout=30):
             return job
         time.sleep(0.05)
     raise AssertionError("job did not finish")
+
+
+class FakeNotesWriter:
+    """Stands in for the Claude Code CLI (notes.ClaudeCliWriter). Each note
+    says which name it is about."""
+
+    def __init__(self):
+        self.calls: list[dict] = []
+        self.web_search: list[bool] = []  # the web_search flag of each call
+        self.fail_names: set[str] = set()
+        self.error = None   # a NotesError to raise from every call
+        self.block = None   # a threading.Event every call waits for
+        self.ignore_cancel = False  # finish even after a cancel, like a call that ends just then
+
+    def write_batch(self, subjects, cancelled, web_search=False):
+        from app.notes import NotesCancelled
+
+        self.calls.append(subjects)
+        self.web_search.append(web_search)
+        if self.block is not None:
+            while not self.block.wait(0.02):
+                if cancelled() and not self.ignore_cancel:
+                    raise NotesCancelled()
+        if self.error is not None:
+            raise self.error
+        return {key: f"• About {s['name']}" for key, s in subjects.items() if s["name"] not in self.fail_names}
+
+
+@pytest.fixture
+def notes_writer():
+    return FakeNotesWriter()
+
+
+@pytest.fixture
+def notes_client(settings, client, media, notes_writer):
+    """The app with presenter notes on: access code "letmein", fake writer."""
+    from fastapi.testclient import TestClient
+
+    from app.main import Services, create_app
+
+    settings.notes_access_code = "letmein"
+    services = Services(settings, client=client, media=media, notes_writer=notes_writer)
+    with TestClient(create_app(settings, services)) as tc:
+        yield tc

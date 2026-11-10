@@ -18,11 +18,12 @@ API limits (https://www.inaturalist.org/pages/api+recommended+practices):
 from __future__ import annotations
 
 import json
-import logging
 import math
 import re
 import threading
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Callable, Iterable
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit
@@ -30,12 +31,17 @@ from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 import httpx
 
 from .config import Settings
+from .diagnostics import get_logger
 from .ratelimit import BudgetExceeded, DailyBudget, RateLimiter
 
-log = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 LIFE_TAXON_ID = 48460
 PER_PAGE = 200
+SPECIES_PER_PAGE = 500  # species_counts allows 500 a page: fewer requests than 200
+SPECIES_COUNT_FIELDS = (
+    "(count:!t,taxon:(id:!t,name:!t,rank:!t,rank_level:!t,preferred_common_name:!t,observations_count:!t))"
+)
 ID_BATCH = 200
 GROUP_RANKS = ("kingdom", "phylum", "class", "order", "family", "genus")
 
@@ -46,7 +52,7 @@ INAT_NETWORK_HOSTS = {
     "inaturalist.org", "inaturalist.ca", "inaturalist.nz", "naturalista.mx",
     "biodiversity4all.org", "argentinat.org", "inaturalist.ala.org.au",
     "inaturalist.lu", "israelinat.org", "inaturalist.laji.fi", "inaturalist.se",
-    "naturalista.uy", "inaturalist.mma.gob.cl", "inaturalist.ge", "inaturalist.lu",
+    "naturalista.uy", "inaturalist.mma.gob.cl", "inaturalist.ge",
     "naturalista.co", "inaturalist.ie", "inaturalist.co.uk",
 }
 
@@ -299,14 +305,15 @@ def single_user_login(params: dict[str, str]) -> str | None:
     return login
 
 
-def build_source(url: str, username: str | None = None) -> dict:
+def build_source(url: str, username: str | None = None, infer_username: bool = True) -> dict:
     """A source from an observations URL plus an optional iNaturalist username.
 
     The URL is required. A username restricts the search to that person's
     observations and marks the source as the presenter's own photos (type
-    "username"), which turns the observer credit off by default. A URL that
-    already filters to one user by login counts as if that username were
-    given. Returns the same shape as ``parse_source_input``.
+    "username"), which turns the observer credit off by default. With
+    ``infer_username``, a URL that already filters to one user by login counts
+    as if that username were given (used for new sources; a saved source keeps
+    the type the user chose). Returns the same shape as ``parse_source_input``.
     """
     username = (username or "").strip().lstrip("@")
     if username and (not USERNAME_RE.match(username) or username.isdigit()):
@@ -322,10 +329,15 @@ def build_source(url: str, username: str | None = None) -> dict:
             "That looks like a username, not a URL. Put it in the username box, and paste "
             "the link to a filtered iNaturalist observations search in the URL box."
         )
-    if not username:
+    if not username and infer_username:
         username = single_user_login(parsed["params"])
-        if not username:
+    if not username:
+        if parsed["type"] == "url":
             return parsed
+        # /people/<login> without inference: the same search, as a "url" source.
+        params = parsed["params"]
+        return {"type": "url", "input": parsed["input"], "username": None,
+                "url": canonical_url(params), "params": params, "label": default_label(params)}
     params = dict(parsed["params"])
     existing = params.get("user_id") or params.get("user_login")
     if existing and existing.lower() != username.lower():
@@ -429,8 +441,13 @@ def _provisional_name(ofvs) -> str | None:
     return None
 
 
-def normalize_observation(raw: dict, taxa: dict[int, dict]) -> dict | None:
-    """Reduce an API observation to what the app uses. ``taxa`` maps id -> {name, rank}."""
+def normalize_observation(raw: dict, taxa: dict[int, dict], max_photos: int = 200,
+                          keep: set[int] | frozenset[int] = frozenset()) -> dict | None:
+    """Reduce an API observation to what the app uses. ``taxa`` maps id -> {name, rank}.
+
+    Only the first ``max_photos`` photos are kept, the most a project file
+    remembers per observation.
+    """
     try:
         obs_id = int(raw["id"])
     except (KeyError, TypeError, ValueError):
@@ -458,6 +475,10 @@ def normalize_observation(raw: dict, taxa: dict[int, dict]) -> dict | None:
             continue
         url = photo_url(p.get("url") or "", "square")
         if not url or not p.get("id"):
+            continue
+        # Past the limit only photos in ``keep`` (selected in the project) are
+        # kept, so a selected photo that moved down the list is not "deleted".
+        if len(photos) >= max_photos and int(p["id"]) not in keep:
             continue
         dims = p.get("original_dimensions") or {}
         photos.append({
@@ -567,6 +588,34 @@ class TaxaCache:
 
 ProgressFn = Callable[[int, int], None]
 
+class RequestMeter:
+    """Counts a job's API requests, charging each to its client first."""
+
+    def __init__(self, charge: Callable[[], None] | None = None):
+        self.count = 0
+        self._charge = charge
+
+    def add(self) -> None:
+        if self._charge is not None:
+            self._charge()  # raises BudgetExceeded once the client's share is used up
+        self.count += 1
+
+
+# Set by count_requests() for the API requests made inside a job.
+_request_meter: ContextVar[RequestMeter | None] = ContextVar("inat_request_meter", default=None)
+
+
+@contextmanager
+def count_requests(charge: Callable[[], None] | None = None):
+    """Count the API requests (including retries) made inside the block, and
+    call ``charge`` before each one so it can refuse it."""
+    meter = RequestMeter(charge)
+    token = _request_meter.set(meter)
+    try:
+        yield meter
+    finally:
+        _request_meter.reset(token)
+
 
 class INatClient:
     def __init__(
@@ -596,6 +645,9 @@ class INatClient:
         attempt = 0
         while True:
             attempt += 1
+            meter = _request_meter.get()
+            if meter is not None:
+                meter.add()  # the client's share first, then the site's daily budget
             self.budget.consume(1)
             self.limiter.wait()
             try:
@@ -669,6 +721,39 @@ class INatClient:
             ordered.append(r)
         return ordered, total
 
+    def search_page(self, params: dict[str, str], page: int, per_page: int = PER_PAGE) -> tuple[list[dict], int]:
+        """One page of a search: (results, total_results). Callers page on
+        their own (see related.py); never past iNaturalist's 10,000 results."""
+        per_page = max(1, min(PER_PAGE, int(per_page)))
+        if page < 1 or page * per_page > 10_000:
+            raise INatError("That search goes past the 10,000 results iNaturalist allows.")
+        query = api_search_params(params)
+        query["per_page"] = str(per_page)
+        query["page"] = str(page)
+        data = self._get("/v2/observations", query)
+        return list(data.get("results") or []), int(data.get("total_results") or 0)
+
+    def species_counts(self, params: dict[str, str], page: int = 1,
+                       per_page: int = SPECIES_PER_PAGE) -> tuple[list[dict], int]:
+        """One page of /v2/observations/species_counts for a search: rows of
+        {count, taxon}, and how many taxa there are. Only leaf taxa get a row (a
+        species with observed varieties has none; see rare.py). Never past
+        iNaturalist's 10,000 results."""
+        per_page = max(1, min(SPECIES_PER_PAGE, int(per_page)))
+        if page < 1 or page * per_page > 10_000:
+            raise INatError("That search goes past the 10,000 results iNaturalist allows.")
+        query = dict(params)
+        query.update(locale="en", per_page=str(per_page), page=str(page), fields=SPECIES_COUNT_FIELDS)
+        data = self._get("/v2/observations/species_counts", query)
+        return list(data.get("results") or []), int(data.get("total_results") or 0)
+
+    def count_observations(self, params: dict[str, str]) -> int:
+        """How many observations match ``params`` (no results are fetched)."""
+        query = dict(params)
+        query["per_page"] = "0"
+        data = self._get("/v2/observations", query)
+        return int(data.get("total_results") or 0)
+
     def fetch_by_ids(self, ids: Iterable[int], progress: ProgressFn | None = None) -> list[dict]:
         """Observations by id, batched; ids that no longer exist are absent."""
         ids = sorted({int(i) for i in ids})
@@ -709,8 +794,9 @@ class INatClient:
         found.update(fetched)
         return found
 
-    def normalize_all(self, raws: list[dict]) -> dict[int, dict]:
-        """Normalize raw observations, resolving ancestor names in batched lookups."""
+    def normalize_all(self, raws: list[dict], keep: set[int] | frozenset[int] = frozenset()) -> dict[int, dict]:
+        """Normalize raw observations, resolving ancestor names in batched lookups.
+        ``keep``: photo ids kept even past the per-observation limit (selected ones)."""
         anc: set[int] = set()
         for r in raws:
             t = r.get("taxon") or {}
@@ -720,13 +806,14 @@ class INatClient:
         taxa = self.fetch_taxa(anc) if anc else {}
         out: dict[int, dict] = {}
         for r in raws:
-            n = normalize_observation(r, taxa)
+            n = normalize_observation(r, taxa, self.settings.max_photos_per_observation, keep)
             if n:
                 out[n["id"]] = n
         return out
 
 
 __all__ = [
-    "build_source", "source_params", "BudgetExceeded", "INatClient", "INatError", "SourceError", "TaxaCache", "TooManyResults",
+    "build_source", "count_requests", "source_params", "BudgetExceeded", "INatClient", "INatError", "SourceError", "TaxaCache",
+    "TooManyResults",
     "format_taxon_name", "normalize_observation", "parse_source_input", "photo_url", "username_url",
 ]

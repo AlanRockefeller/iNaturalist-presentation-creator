@@ -10,6 +10,8 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import __version__
+
 GIB = 1024 ** 3
 MIB = 1024 ** 2
 
@@ -40,11 +42,14 @@ class Settings:
     work_dir: Path = field(default_factory=lambda: Path(os.environ.get("PRESENTATIONS_WORK_DIR", "var")).resolve())
 
     api_base: str = "https://api.inaturalist.org"
-    user_agent: str = "DikaryaPresentations/1.0 (+https://presentations.dikarya.us; contact via dikarya.us)"
+    user_agent: str = f"DikaryaPresentations/{__version__} (+https://presentations.dikarya.us; contact via dikarya.us)"
 
     # iNaturalist API limits: ~1 request/second process-wide, ~10k/day.
     api_min_interval: float = field(default_factory=lambda: _env_float("PRESENTATIONS_API_MIN_INTERVAL", 1.0))
     api_daily_budget: int = field(default_factory=lambda: _env_int("PRESENTATIONS_API_DAILY_BUDGET", 8500))
+    # The most of that budget one client (an IPv4 address or an IPv6 /64) may
+    # use per UTC day, so a single visitor cannot use up the day for everyone.
+    api_client_daily_share: float = field(default_factory=lambda: _env_float("PRESENTATIONS_API_CLIENT_SHARE", 0.25))
     api_timeout: float = 30.0
     api_max_retries: int = 4
 
@@ -63,12 +68,16 @@ class Settings:
     max_sources: int = 20
     max_observations_per_source: int = 10_000  # iNat's page/per_page ceiling
     max_observations_per_project: int = field(default_factory=lambda: _env_int("PRESENTATIONS_MAX_OBSERVATIONS", 10_000))
-    max_photos_per_observation: int = 200
+    max_photos_per_observation: int = 200  # at most models.MAX_PHOTOS
     max_image_slides: int = field(default_factory=lambda: _env_int("PRESENTATIONS_MAX_IMAGE_SLIDES", 2000))
+    # Species in one "more photos" search (other people's photos cost about one
+    # request per species). At most models.MAX_RELATED_TAXA.
+    max_related_taxa: int = field(default_factory=lambda: _env_int("PRESENTATIONS_MAX_RELATED_TAXA", 500))
     max_body_bytes: int = 8 * MIB
 
     # Jobs.
     max_concurrent_loads: int = 3
+    max_queued_loads: int = 12  # running plus waiting, from all clients
     max_concurrent_generations: int = field(default_factory=lambda: _env_int("PRESENTATIONS_MAX_GENERATIONS", 2))
     max_queued_generations: int = 6
     max_active_jobs_per_client: int = 2
@@ -77,6 +86,33 @@ class Settings:
     job_ttl_seconds: int = 2 * 3600
     workspace_ttl_seconds: int = 24 * 3600
     min_free_disk_bytes: int = 3 * GIB
+
+    # Presenter notes written by the Claude Code CLI (app/notes.py). On only
+    # when the CLI, a token (from `claude setup-token`) and an access code are
+    # all set; the deploy script keeps the last two in /etc/presentations/notes.env.
+    notes_cli: str = field(default_factory=lambda: os.environ.get(
+        "PRESENTATIONS_NOTES_CLI", "/usr/local/lib/presentations/claude"))
+    notes_token: str = field(default_factory=lambda: os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip(), repr=False)
+    notes_access_code: str = field(
+        default_factory=lambda: os.environ.get("PRESENTATIONS_NOTES_ACCESS_CODE", "").strip(), repr=False)
+    notes_model: str = field(default_factory=lambda: os.environ.get("PRESENTATIONS_NOTES_MODEL", "claude-opus-5-5"))
+    notes_effort: str = field(default_factory=lambda: os.environ.get("PRESENTATIONS_NOTES_EFFORT", "medium"))
+    # Names (species or other taxa) Claude may write notes for per UTC day, and per job.
+    notes_daily_budget: int = field(default_factory=lambda: _env_int("PRESENTATIONS_NOTES_DAILY_BUDGET", 1500))
+    notes_max_per_job: int = field(default_factory=lambda: _env_int("PRESENTATIONS_NOTES_MAX_PER_JOB", 1000))
+    notes_batch_size: int = 8       # names per Claude call
+    notes_concurrency: int = 2      # Claude calls at once, in one job
+    notes_call_timeout: float = 240.0
+    # "Search the web" lets Claude use Claude Code's WebSearch tool (run by
+    # Anthropic; WebFetch, which would fetch pages from this server, stays off).
+    notes_web_search: bool = field(default_factory=lambda: _env_int("PRESENTATIONS_NOTES_WEB_SEARCH", 1) == 1)
+    notes_web_batch_size: int = 4   # names per call when searching the web
+    notes_web_call_timeout: float = 600.0
+    notes_timeout_seconds: int = 2 * 3600
+    max_queued_notes: int = 3       # running plus waiting notes jobs, from all clients
+
+    def notes_configured(self) -> bool:
+        return bool(self.notes_token and self.notes_access_code and os.access(self.notes_cli, os.X_OK))
 
     @property
     def workspace_dir(self) -> Path:
@@ -93,6 +129,11 @@ class Settings:
     @property
     def state_dir(self) -> Path:
         return self.work_dir / "state"
+
+    @property
+    def claude_dir(self) -> Path:
+        """Home and config directory of the Claude Code CLI (app/notes.py)."""
+        return self.work_dir / "claude"
 
     def ensure_dirs(self) -> None:
         for d in (self.work_dir, self.workspace_dir, self.media_cache_dir, self.jobs_dir, self.state_dir):

@@ -19,9 +19,12 @@ small JSON project file; the server holds only short-lived temporary data.
 - [Architecture](#architecture)
 - [iNaturalist API limits](#inaturalist-api-limits)
 - [Sources, merging and de-duplication](#sources-merging-and-de-duplication)
+- [More photos of the same species](#more-photos-of-the-same-species)
 - [Project files](#project-files)
 - [How refresh works](#how-refresh-works)
 - [PowerPoint generation rules](#powerpoint-generation-rules)
+- [Presenter notes](#presenter-notes)
+- [Rare finds](#rare-finds)
 - [Security and limits](#security-and-limits)
 - [Development](#development)
 - [Production layout](#production-layout)
@@ -34,7 +37,10 @@ small JSON project file; the server holds only short-lived temporary data.
 1. **Sources**: paste the URL of an iNaturalist observations search (filter on
    iNaturalist first by taxon, place, project, dates, quality grade and so on),
    optionally with your iNaturalist username. Several sources can be combined,
-   labeled and disabled.
+   labeled and disabled. Each is marked **Mine** (your own photos) or **Search**
+   (may include other people's); a search limited to one user can be switched
+   between the two. **Find the rarest species…** adds a search as
+   [Rare finds](#rare-finds) instead.
 2. **Select & Organize**: one card per observation with its name, common name,
    date, place, observer, a visible favorite count (♥ 17) and a checkbox for every
    photo. Only the first photo of each observation starts checked; tick others to
@@ -43,12 +49,17 @@ small JSON project file; the server holds only short-lived temporary data.
    iNaturalist order, random), group (kingdom … genus, or source), filter by minimum
    favorites, drag to reorder, edit the name or any annotation line. Click a photo
    to inspect it at 1024 px, zooming to the full-resolution original only when
-   needed.
+   needed. **More photos…** pulls in more observations of a species already in
+   the project: your own from anywhere (**More of mine** on a card) or other
+   people's under the licenses you choose (**More from others**), most
+   favorited first.
 3. **Presentation settings**: title, presenter, optional title background photo
    (any loaded photo), black or white background, annotation lines, divider slides,
    speaker notes.
 4. **Preview**: the actual slide sequence as 16:9 thumbnails, including title,
    dividers and annotations. Dragging a photo slide moves its whole observation.
+   Each photo slide has a **Notes** button for its presenter notes, which Claude
+   can write, for one slide or all of them (see [Presenter notes](#presenter-notes)).
 5. **Generate**: the server downloads the full-quality photos, builds the deck with
    progress (`Downloading photos: 47 / 218`, `Building slides: …`), and offers the
    download, with a button to save the project file next to it.
@@ -64,8 +75,12 @@ browser (vanilla JS, no framework)          FastAPI (single Uvicorn worker)
                                                      ├─ presentation.py slide plan + python-pptx writer
                                                      ├─ images.py       trusted downloads, cache, Pillow prep
                                                      ├─ workspace.py    temp store of fetched metadata
-                                                     ├─ jobs.py         background load/generate jobs
-                                                     └─ ratelimit.py    1 req/s limiter, daily/hourly budgets
+                                                     ├─ related.py      "more photos" searches of a project's species
+                                                     ├─ jobs.py         background load/generate/notes jobs
+                                                     ├─ notes.py        presenter notes via the Claude Code CLI
+                                                     ├─ rare.py         Rare finds: a search's rarest species worldwide
+                                                     ├─ ratelimit.py    1 req/s limiter, daily/hourly budgets
+                                                     └─ diagnostics.py  request and job logging
 ```
 
 | Module | Responsibility |
@@ -78,12 +93,17 @@ browser (vanilla JS, no framework)          FastAPI (single Uvicorn worker)
 | `app/presentation.py` | `build_slide_plan()` (used by both Preview and Generate, so they always match) and the PPTX writer. |
 | `app/images.py` | Downloads originals from allowlisted hosts with size caps and a byte budget, a 2-hour cache, EXIF/format fixes, title-photo treatment. |
 | `app/workspace.py` | Gzipped JSON of the metadata the last load fetched, keyed by an unguessable id, expiring after 24 h. |
+| `app/related.py` | "More photos of the same species": search parameters, licenses, and the request plan (top N per species, most favorited first). |
 | `app/jobs.py` | Thread-pool jobs with progress, cancellation, timeouts, per-client and global limits, cleanup. |
+| `app/notes.py` | Presenter notes: what Claude is told, the `claude -p` subprocess, cleaning its answer, the access code. |
+| `app/rare.py` | Rare finds: the species scan, live worldwide counts, picking observations, counts on later loads. |
+| `app/diagnostics.py` | Request IDs, one log line per request and per job, client addresses (IPv6 grouped by /64). |
 
 **Workspaces.** Sorting, previewing and generating need metadata for up to
 10,000 observations. To avoid the browser uploading megabytes on every click,
-the server keeps what it fetched (trusted, server-derived data) for 24
-hours. If a workspace expires, the client reloads from iNaturalist automatically.
+the server keeps what it fetched (trusted, server-derived data) until 24 hours
+after it was last used. If a workspace expires, the client reloads from
+iNaturalist automatically.
 
 **One worker.** The iNaturalist rate limiter, daily request budget, media
 byte budget and job registry are in-process. Running more than one Uvicorn
@@ -97,7 +117,8 @@ Implemented as recommended in iNaturalist's
 
 - **~1 request/second** process-wide (`RateLimiter`), shared by every user and job.
 - **Daily request budget** (default 8,500/day, persisted across restarts). When
-  it is exhausted, users get a friendly "try again tomorrow".
+  it is exhausted, users get a friendly "try again tomorrow". One client (an
+  IPv4 address or an IPv6 /64) may use at most a quarter of it per day.
 - **`per_page=200`** for every search, and the v2 `fields=` parameter so responses
   contain only what the app uses.
 - **Batched id lookups**: refreshing saved observations and resolving ancestor
@@ -105,6 +126,12 @@ Implemented as recommended in iNaturalist's
   on disk for 30 days.
 - **No bulk paging**: a source matching more than 10,000 observations is refused
   after a single request, asking the user to add filters.
+- **More photos** searches cost at most one request per species plus one per
+  100 species (three per species when licenses must be checked on the server,
+  see below), are checked against what is left of the day's budgets before
+  they start, and run only when the user asks (never on a refresh). A
+  one-species request asks for just the N it keeps (`per_page=N`) instead of 200:
+  it is one page either way, and fewer bytes for iNaturalist.
 - **429/5xx** are retried with backoff that respects `Retry-After`, slowing the
   shared limiter for everyone.
 - **Media**: thumbnails and the zoom viewer load directly from iNaturalist in the
@@ -112,7 +139,7 @@ Implemented as recommended in iNaturalist's
   under a rolling budget of 4 GB/hour and 20 GB/day (iNaturalist may block above
   5 GB/hour or 24 GB/day). Originals are cached for 2 hours, so regenerating after
   a typo fix re-downloads nothing.
-- **User-Agent**: `DikaryaPresentations/1.0 (+https://presentations.dikarya.us)`.
+- **User-Agent**: `DikaryaPresentations/<version> (+https://presentations.dikarya.us; contact via dikarya.us)`.
 
 All limits are environment variables (see `app/config.py`).
 
@@ -133,9 +160,13 @@ The add-source form has two fields: an **observations URL** (required) and an
   meaning "the presenter's own photos". A URL that already filters by a
   different user is refused. A URL that already filters to exactly one user by
   login (`user_id=<login>`, `user_login=<login>` or `/observations/<login>`) is
-  treated the same as entering that username; a numeric user id or several
-  users leave it a `url` source. A bare username typed into the URL box is refused
-  too, because on its own it would load a whole account.
+  treated the same as entering that username, since it is most likely the
+  presenter's own search; a numeric user id or several users leave it a `url`
+  source. A bare username typed into the URL box is refused too, because on its
+  own it would load a whole account.
+- The source list shows each source as **Mine** (`username`) or **Search**
+  (`url`). For a search limited to one user, clicking the badge switches it, for
+  a talk about someone else's photos. The choice is saved in the project file.
 - Each source records `type` (`username` | `url`), the original `input`, the
   canonical `url` (always `https://www.inaturalist.org/observations?...`, including
   the user filter), the `username` when given, an editable `label`, and `enabled`.
@@ -149,6 +180,53 @@ The add-source form has two fields: an **observations URL** (required) and an
 - Adding a source to a loaded project queries only that source. Its new
   observations go to the review dialog.
 
+## More photos of the same species
+
+On Select & Organize, **More photos…** opens one dialog where the user sets how
+"more photos" searches work, and can search every species listed at once. With
+**Show More of mine and More from others on each observation** ticked, each
+card gets those two buttons, which search that observation's species with the
+saved settings, so they ask nothing.
+
+- **Your iNaturalist username**: needed for your own photos. Your observations
+  are left out of other people's (`not_user_id`), and your photos never get the
+  observer credit.
+- **My photos**: your observations of the species from anywhere, up to N per
+  species (default 20), with an optional minimum of favorites.
+- **Other people's photos**: limited to the ticked photo licenses (default CC0,
+  CC BY, CC BY-SA and CC BY-ND, which allow commercial use), up to N per species
+  (default 5), at least N favorites (default 1), research grade only (default).
+  "All rights reserved" cannot be asked of the API, so with it and only some
+  other licenses ticked the licenses are checked on the server instead, looking
+  through up to three pages of 200 per species. Every login of yours (Mine
+  sources and this username) is left out.
+- Results are sorted by favorites (`order_by=votes`), and each species keeps its
+  own top N, so popular species do not crowd out rare ones. A variety counts
+  under the species that was searched.
+- Only observations identified to species or finer (`rank_level` 10 or lower)
+  can be searched; the dialog says how many listed are skipped. One search
+  covers at most 500 species (`PRESENTATIONS_MAX_RELATED_TAXA`).
+- New observations open in a short review dialog ("More photos of *X*"), with
+  **right after this observation** as the default placement (the order then
+  counts as hand-made). Nothing is added until the user chooses. In "others"
+  results, a photo outside the chosen licenses is dimmed, marked "Other license"
+  and not ticked by default; the first allowed photo is.
+- Behind the scenes a project has at most two `related` sources, "More of my
+  photos" and "Other people's photos". Each lists the species searched so far
+  (up to 1,000); the search settings live in `settings.related`, so a change
+  applies to the next search. On Sources they show a **More photos** badge, the
+  species count and **Search again** (all of their species, with the current
+  settings, after a confirm showing the cost). They can be relabeled, disabled
+  or removed like any source.
+- They are **searched only when asked**. An ordinary refresh (or opening the
+  file) refreshes their observations by id, which is cheap, and never repeats
+  the per-species searches; what they found that still waits for review is
+  kept. Their membership only grows: searching one species never takes the
+  source away from observations it found earlier. **Search again** looks up by
+  id anything it kept but no longer finds, so a deleted one becomes unavailable.
+- What a search finds is always offered for review, even in a project with no
+  observations left (only an ordinary first load adds everything at once).
+
 ## Project files
 
 Saved as `<title>.dikarya-presentation.json`, typically a few kB to a few hundred
@@ -157,7 +235,7 @@ kB. Photos and full iNaturalist metadata are **not** embedded.
 ```json
 {
   "format": "dikarya-presentation",
-  "schema_version": 4,
+  "schema_version": 8,
   "saved_at": "2026-10-06T03:40:00Z",
   "app_version": "1.0.0",
   "sources": [
@@ -169,7 +247,11 @@ kB. Photos and full iNaturalist metadata are **not** embedded.
      "input": "https://www.inaturalist.org/observations?place_id=6924&taxon_id=47170",
      "username": null,
      "url": "https://www.inaturalist.org/observations?place_id=6924&taxon_id=47170",
-     "label": "Costa Rica", "enabled": true}
+     "label": "Costa Rica", "enabled": true},
+    {"id": "s9a8b7c6d5e4", "type": "related", "input": "", "username": null,
+     "url": "https://www.inaturalist.org/observations?not_user_id=alan_rockefeller&order=desc&order_by=votes&photo_license=cc0,cc-by,cc-by-sa,cc-by-nd&popular=true&quality_grade=research&taxon_id=47692,118289",
+     "label": "Other people's photos", "enabled": true,
+     "related": {"whose": "others", "taxon_ids": [47692, 118289]}}
   ],
   "settings": {
     "title": "Fungi of Costa Rica", "presenter": "Alan Rockefeller",
@@ -179,23 +261,41 @@ kB. Photos and full iNaturalist metadata are **not** embedded.
     "grouping": "family", "dividers": true, "min_faves": 0,
     "annotations": {"scientific": true, "common_name": false, "date": false,
                     "location": false, "observer": null},
-    "speaker_notes": true
+    "speaker_notes": true, "presenter_notes": true,
+    "related": {"username": "alan_rockefeller", "buttons": true,
+                "mine": {"per_taxon": 20, "min_faves": 0},
+                "others": {"licenses": ["cc0", "cc-by", "cc-by-sa", "cc-by-nd"],
+                           "per_taxon": 5, "min_faves": 1, "research_only": true}}
   },
   "observations": [
     {"id": 123, "selected_photo_ids": [456, 457], "known_photo_ids": [456, 457, 458],
      "rotations": {"457": 90}, "show_lines": {"common_name": true}, "photo_order": [457, 456],
-     "overrides": {"scientific": "Psilocybe alimapensis nom. prov.", "common_name": null,
-                   "date": null, "location": null, "observer": null},
-     "source_ids": ["s1a2b3c4d5e6", "s0f9e8d7c6b5"], "status": "active",
-     "last_inat_name": "Psilocybe sp.", "added_at": "2026-10-06T03:30:00Z"}
+     "overrides": {"scientific": "Psilocybe alimapensis nom. prov."},
+     "source_ids": ["s1a2b3c4d5e6", "s0f9e8d7c6b5"],
+     "last_inat_name": "Psilocybe sp.", "added_at": "2026-10-06T03:30:00Z",
+     "notes": "• First point ...\n• Second point ...",
+     "notes_name": "Psilocybe alimapensis nom. prov."}
   ],
   "order": [123],
   "ignored_observation_ids": []
 }
 ```
 
-- `overrides`: `null` means "use the live iNaturalist value"; a string replaces
-  it on the slide; `""` hides that line for this observation.
+- Observation fields at their defaults are left out of the file (an override
+  that is not set, no rotations, `"status": "active"`, empty lists); loading
+  fills them back in. Settings and sources are always written in full.
+- `type` of a source: `username` (Mine: the presenter's own photos) or `url`
+  (Search). Since schema 5 it is kept as saved; before, every load re-derived
+  it from the URL, and loading an older file still does that once. Schema 6
+  added `related` sources (see [More photos](#more-photos-of-the-same-species)):
+  `related.whose` (`mine` | `others`) and the `taxon_ids` searched; their `url`
+  and `username` are rebuilt from those and `settings.related` on load.
+- `settings.related`: the More photos settings. `username` is the presenter's
+  iNaturalist login (`""` = not given); `buttons` (`null` until the dialog is
+  first saved, when it is offered ticked) shows the two buttons on each
+  card. Added in schema 6; an older file loads with the defaults.
+- `overrides`: `null` (or left out) means "use the live iNaturalist value"; a
+  string replaces it on the slide; `""` hides that line for this observation.
 - `annotations.observer: null` means automatic (see below); `true`/`false` is the
   user's explicit choice.
 - `sort.key = "custom"` marks a hand-arranged order. `base_key` records the
@@ -211,21 +311,35 @@ kB. Photos and full iNaturalist metadata are **not** embedded.
   are left out. Added in schema 2; a schema 1 file loads with none.
 - `known_photo_ids` / `last_inat_name` exist only so a refresh can report deleted
   or new photos and changed identifications.
+- `notes`: the observation's presenter notes (typed, or written by Claude), one
+  point per line, at most 4,000 characters. `notes_name` is the name they were
+  written for, so the app can point out notes about an old name.
+  `settings.presenter_notes` puts them in the deck. Added in schema 7.
+- A `rare` source (Rare finds) is a search plus `rare`: `top` (how many species,
+  1 to 100), `per_taxon` (observations per species, 1 to 20),
+  `described_only` and `commercial_only`. The counts are not saved: they are
+  fetched again on each load. `annotations.rarity`, `overrides.rarity`,
+  `show_lines.rarity`, the `rarity` sort and `settings.about_slide` go with it.
+  Added in schema 8.
 - **Validation** (`project.load_project`): wrong `format`, missing or non-integer
   `schema_version`, a newer schema than the server supports, out-of-range values,
   oversized lists, duplicate source ids, and source URLs that fail the same
   parser as new input are all rejected with a readable message. Unknown keys are
   ignored. Inconsistent `order`/duplicate observations are normalized.
-- **Schema versions**: `_migrate()` in `app/project.py` is where `v1` to `v2`
-  upgrades go. Bump `SCHEMA_VERSION` in `app/models.py` when the format changes
-  incompatibly.
+- **Schema versions**: `_migrate()` in `app/project.py` upgrades older files one
+  version at a time (currently 1 to 8). Bump `SCHEMA_VERSION` in `app/models.py`
+  and add a step there when the format or its meaning changes.
+- **Limits that keep a file loadable**: at most 200 photos are remembered per
+  observation (iNaturalist photos past that are not offered) and the newest
+  50,000 ignored observation ids are kept.
 
 ## How refresh works
 
 Opening a project file (or pressing *Refresh from iNaturalist*):
 
 1. The file is validated on the server.
-2. Every enabled source's saved URL is searched again.
+2. Every enabled source's saved URL is searched again, except More photos
+   (`related`) sources, which are searched only when the user asks.
 3. Saved observations that no source returned are looked up by id (batched), so
    they are refreshed even if they no longer match a search.
 4. `refresh_project()` compares live data with the project:
@@ -264,7 +378,8 @@ first photo of each selected, in default taxonomic order.
 - **Annotation** (lower-left, small margin, no backing box): the scientific/taxon
   name in *italic* ~28 pt. Optional lines below it at 18 pt: English common name,
   date (`November 14, 2026`), iNaturalist place description, observer
-  (`Photo: <display name or login>`). Only the scientific name is italic. On black
+  (`Photo: <display name or login>`) and, for [Rare finds](#rare-finds),
+  `12 observations worldwide · #3 rarest`. Only the scientific name is italic. On black
   slides the text is white with a subtle dark shadow; on white slides it is
   near-black with a light halo, so it stays readable over the white letterbox.
 - **Names**: the current iNaturalist identification at whatever rank
@@ -273,24 +388,159 @@ first photo of each selected, in default taxonomic order.
   identified only as **Life** gets no taxon annotation. A "Provisional Species
   Name" observation field is offered as a one-click override.
 - **Observer default**: if every enabled source was added with the presenter's
-  username, the observer line defaults **off**. If any source has no username, it
-  defaults **on**, since that search may include other people's photos. An
-  explicit choice is saved and always wins.
+  username, the observer line defaults **off**. If any source has no username
+  (or is a "more from others" search), it defaults **on**, since it may include
+  other people's photos. An explicit choice is saved and always wins.
+- **The presenter's own photos are never credited**, whatever the setting. "The
+  presenter" is every Mine source's username plus the username in More photos;
+  with none given, every photo is credited. Showing the observer line in one
+  observation's Slide text still credits it.
 - **Favorite counts never appear in the deck**, including the notes.
-- **Title slide**: title (54 pt bold) and presenter (28 pt) centred with a gold
+- **Title slide**: title (54 pt bold; 44 pt over 70 characters, 36 pt over 120,
+  so long titles stay on the slide) and presenter (28 pt) centred with a gold
   rule. The optional background photo is the only cropped image: a full-bleed
   16:9 cover crop (focus centre/top/bottom), desaturated, darkened and slightly
-  softened in Pillow, never upscaled past the source.
+  softened in Pillow, never upscaled past the source. If it cannot be read the
+  deck is still made, without it, and the user is told.
+- **Text**: control characters (a line break pasted from PowerPoint or Word,
+  say) become spaces and characters a .pptx cannot hold are dropped, both on
+  input and when the deck is written.
 - **Divider slides** (optional, when grouping): rank label in small gold caps
-  above the group name, which is italic for genera.
-- **Speaker notes** (optional): name, common name, iNaturalist link and the
-  photo's license attribution.
+  above the group name, which is italic for genera. A new divider starts with
+  each new group, even when two groups share a name (a genus name in two
+  families, two sources with the same label), as in Select & Organize.
+- **Speaker notes**: name, common name, iNaturalist link and the photo's
+  license attribution (setting `speaker_notes`), and the observation's
+  presenter notes between them, set off by blank lines (setting
+  `presenter_notes`). Every photo slide of an observation has the same notes.
+  Rare finds add `12 observations on iNaturalist worldwide as of <date>; 1 of
+  them in this search.`
+- **About these numbers** (Rare finds only, setting `about_slide`): a last slide
+  saying when the counts were taken, that only species and finer ranks are
+  counted, why provisional names have low counts, and which searches were used.
 - Text stays editable; photos stay picture objects; nothing is rasterized.
 - **Memory**: image parts are streamed from disk when the file is written, and
   media are stored without zip deflate. A 400-photo, 1 GB deck was built with a
   peak RSS increase of under 20 MB.
 - The file is named from the title (`Fungi_of_Costa_Rica.pptx`, ASCII-safe),
   kept for 2 hours and then deleted with all temporary files.
+
+## Presenter notes
+
+Notes the presenter sees in PowerPoint's presenter view. They can be typed, or
+written by Claude: up to 8 short points per organism, each starting with a label,
+in this order, leaving out any Claude cannot fill reliably:
+
+- **Described**: who described it and when, under what name, and when and by
+  whom it was moved to another genus;
+- **Type locality**: where the type specimen was collected;
+- **Describer**: something noteworthy about the person who described it;
+- **Name**: what the genus name and the species epithet mean;
+- **Edibility**, **Ecology**, **Range** and **Story**.
+
+Years, people and type localities are only given when Claude is sure of them.
+A provisional name gets "not formally described" instead, and a genus-level
+name (`Psilocybe sp.`) gets notes about the genus. Where notes come from:
+
+- **One slide**: the **Notes** button on a Preview slide (or on a card in
+  Select & Organize) opens the notes, with **Write with Claude**.
+- **All slides**: **Write notes for all slides…** on the Preview step. It
+  fills observations that have no notes; ticking "also rewrite" replaces the
+  rest too. Notes are written once per name, so every observation of
+  *Amanita muscaria* gets the same text, and progress shows per name.
+- **Selected slides**: tick the box in the corner of Preview slides (it selects
+  the whole observation), then **Write notes for N selected observations…**.
+- **Search the web** (a checkbox in both dialogs, remembered in the browser):
+  Claude checks the describer, year, original name, type locality and the
+  name's meaning on the web first, preferring Index Fungorum, MycoBank, the
+  original description and Wikipedia. It is slower (4 names per call, up to
+  10 minutes per call) and uses more of the subscription.
+
+Notes are plain text in the project file, editable afterwards. A refresh never
+changes them. If an observation's name changes, its card and its Notes button
+are flagged, and its notes stay until they are rewritten.
+
+**How Claude is run** (`app/notes.py`): the server runs the Claude Code CLI
+(`claude -p`) as a subprocess, up to 8 names per call and 2 calls at a time,
+with a 240 s limit per call:
+
+- every tool is turned off (`--tools ""`, no MCP servers), or with "Search the
+  web" only Claude Code's WebSearch, which runs at Anthropic. WebFetch, which
+  would download pages from this server, is never allowed. So whatever a name
+  says, it can only change the text that comes back; the answer is structured
+  JSON (`--json-schema`) and is cleaned before it is kept;
+- our own system prompt replaces Claude Code's; it asks for well-established
+  facts only, and fewer points about the genus or family when a name is obscure
+  or provisional;
+- the prompt holds names, ranks and common names only. Favorite counts,
+  observers, places and dates are never sent;
+- the subprocess gets a minimal environment of its own (its home and config
+  in `/var/lib/presentations/claude/`, the token, no other variables), an empty
+  working directory, and is killed on cancel or time-out.
+
+**Access and limits.** Notes are on only when the CLI, a token and an access
+code are all set. The browser asks for the code once and keeps it in local
+storage; 10 wrong codes from one client lock it out for an hour. At most 1,500
+names per UTC day across the site and 1,000 per job; one notes job runs at a
+time (3 may wait). A usage-limit or sign-in error stops the job, keeping what
+was written.
+
+| Variable | Default |
+|---|---|
+| `CLAUDE_CODE_OAUTH_TOKEN` | none (from `claude setup-token`; notes stay off without it) |
+| `PRESENTATIONS_NOTES_ACCESS_CODE` | none (notes stay off without it) |
+| `PRESENTATIONS_NOTES_CLI` | `/usr/local/lib/presentations/claude` |
+| `PRESENTATIONS_NOTES_MODEL` | `claude-opus-5-5` |
+| `PRESENTATIONS_NOTES_EFFORT` | `medium` |
+| `PRESENTATIONS_NOTES_DAILY_BUDGET` | `1500` names per UTC day |
+| `PRESENTATIONS_NOTES_MAX_PER_JOB` | `1000` names |
+| `PRESENTATIONS_NOTES_WEB_SEARCH` | `1` (`0` hides "Search the web") |
+
+**Setting it up**: the install script copies the code owner's Claude Code CLI
+to `/usr/local/lib/presentations/claude` and creates
+`/etc/presentations/notes.env` (root:presentations, 0640) once, empty. Run
+`claude setup-token` as the code owner, put the token and an access code in
+that file, and restart. Re-run the install script to update the CLI copy.
+
+## Rare finds
+
+**Find the rarest species…** (next to Add source) adds a search as a Rare
+finds source. It replaces the old dikarya.us/rare-finds page. It ranks the
+species in the search by how many observations iNaturalist has of each
+worldwide, keeps the rarest (15 by default, up to 100), and offers their best
+observations *from the search itself* for review: research grade first, then
+the most favorites, 1 per species by default. Options: described species only
+(no provisional names such as `Inocybe sp. 'PNW77'`), and only photos licensed
+for commercial use.
+
+Their slides get the line `12 observations worldwide · #3 rarest` (it says
+"tied for" when another species has the same count, which is common: many
+species have a single observation worldwide). The speaker notes get the count
+with its date and how many of them are in the search, and the deck gets an
+**About these numbers** slide at the end. "Rarest first" sorts by the count,
+and a deck of only Rare finds starts sorted that way. The rank is the place
+among that source's species in the deck. The line can be hidden or reworded
+per observation (Slide text) or turned off in Presentation Settings.
+
+How it searches (`app/rare.py`, every request through `INatClient`):
+
+1. `/v2/observations/species_counts` for the search, rarest in the search
+   first, 500 a page (that endpoint's most; fewer requests than 200), at most
+   20 pages, so at most 10,000 taxa. This works on searches far larger than a
+   normal source's 10,000 observations. Only species and finer ranks count.
+2. Live worldwide counts (any quality grade) for the likely rarest, re-counted
+   until the top N are all live. A taxon's cached count can be badly stale,
+   for example 0 for a renamed taxon, so it only decides what to re-count. A
+   species with observed varieties has no row of its own and is counted on
+   its own.
+3. The chosen species' observations within the search.
+
+It runs when the source is first loaded and again only with **Search again**,
+never on a refresh. Each later load re-counts the project's rare species, two
+requests per 200 species, so the line stays current; the counts are never
+written to the project file. A search costs about 10 to 30 requests, at most
+`estimate_requests(top)` (60 for 15 species), and it is refused when the
+client's daily share has fewer left.
 
 ## Security and limits
 
@@ -303,16 +553,44 @@ first photo of each selected, in default taxonomic order.
 - **Input validation**: Pydantic models with bounds on every list and string; the
   source parser rejects other hosts, credentials, ports, control characters,
   unknown parameter shapes and filterless searches.
-- **Size limits**: 8 MB request bodies (nginx and app), 20 sources, 10,000
-  observations, 200 photos per observation, 2,000 photo slides, 40 MB per image,
-  120 MP decode limit.
-- **Runaway jobs**: at most 3 concurrent loads and 2 concurrent generations, 6
-  queued generations, 2 active jobs per client, 20/60-minute timeouts, user
-  cancellation, and a free-disk check before generation.
+- **Size limits**: 8 MB request bodies (nginx and app, declared or streamed),
+  20 sources, 10,000 observations, 200 photos per observation, 2,000 photo
+  slides, 40 MB per image, 120 MP decode limit.
+- **Runaway jobs**: at most 3 concurrent loads (12 running or waiting) and 2
+  concurrent generations (6 running or waiting), 2 active jobs per client, a
+  quarter of the daily iNaturalist budget per client, 20/60-minute timeouts
+  counted from when a job starts, user cancellation (a waiting job ends at
+  once), and a free-disk check before generation. Each generation reserves its
+  expected download against the hourly and daily media budgets, so two decks
+  started together cannot both run out halfway. A "client" is an IPv4 address
+  or an IPv6 /64.
+- **Restarts**: stopping the service cancels running jobs, so it exits at once.
+- **Memory**: a finished load's result (every observation's metadata) is
+  dropped two minutes after the browser fetched it, or after 15 minutes.
 - **Paths**: workspace and job ids are random tokens validated by regex before
   touching the filesystem; download filenames are sanitized.
 - **Errors**: no stack traces or filesystem paths are returned; `/docs` and
   `/openapi.json` are disabled.
+- **Logs** (`journalctl -u presentations`), for fixing bugs, tracking use and
+  spotting attacks, and no more:
+  - one `event=request` line per request: method, route, status, time and what
+    it did (the source URL tried, project size, slide counts, job id, ...);
+  - failures are `event=request.failed`, adding the query string, the error the
+    user saw and the User-Agent;
+  - successful static files, `/healthz` and job-status polls are not logged,
+    and neither are httpx's per-request lines or Uvicorn's access log, which
+    would repeat the request line;
+  - one `job.started` and one `job.finished` line per job, with its results
+    (observations loaded, slides, bytes, iNaturalist requests used and left),
+    plus `load.source` per source searched;
+  - a crash is logged once, with its traceback.
+
+  Every line carries `request_id` (also sent as the `X-Request-ID` response
+  header), `client_ip` and, for jobs, `job_id`. Submitted values are quoted, so
+  they cannot fake extra lines.
+- **Claude**: presenter notes run the Claude Code CLI with every tool off and a
+  minimal environment, behind an access code and daily limits; see
+  [Presenter notes](#presenter-notes).
 - **Headers**: strict CSP (`script-src 'self'`; images only from self and the two
   iNaturalist photo hosts), `X-Frame-Options: DENY`, `nosniff`, HSTS via nginx.
 - **nginx**: per-IP rate limit on `/api/` (10 r/s, burst 60) and the shared
@@ -330,9 +608,10 @@ python3 -m venv .venv
 # tests (iNaturalist is mocked; no network needed)
 .venv/bin/python -m pytest
 
-# run locally (temporary data goes to ./var)
-.venv/bin/uvicorn --factory app.main:create_app --reload --port 8031
-# -> http://127.0.0.1:8031/
+# run locally (temporary data goes to ./var). On the production server use
+# another port: the live service listens on 8031 and another service on 8040.
+.venv/bin/uvicorn --factory app.main:create_app --reload --port 8041
+# -> http://127.0.0.1:8041/
 ```
 
 Tests cover source parsing and malicious-input rejection, pagination and batching
@@ -352,20 +631,24 @@ no favorite counts), plus end-to-end API flows.
   .venv/                         virtualenv created by the install script
 /var/lib/presentations/          temporary data (service user only)
   workspaces/  media-cache/  jobs/  state/   (budgets, taxa cache)
+  claude/                        home of the Claude Code CLI (presenter notes)
 /etc/systemd/system/presentations.service
 /etc/nginx/sites-available/presentations.dikarya.us.conf  (+ symlink in sites-enabled)
 /etc/letsencrypt/live/presentations.dikarya.us/            (both hostnames)
 /usr/local/sbin/restart-presentations                       (root-owned restart wrapper)
 /etc/sudoers.d/presentations                                (lets tree run only that wrapper)
+/usr/local/lib/presentations/claude                         (copy of tree's Claude Code CLI, for notes)
+/etc/presentations/notes.env                                (notes token and access code, 0640)
 ```
 
 The service listens only on `127.0.0.1:8031` (Dikarya uses 5000/8000, the image
 service 8017, others 9000).
 
-Logs: `journalctl -u presentations`. Restart after a code change:
-`sudo /usr/local/sbin/restart-presentations`, which import-checks the code as the
-service user first and refuses while a presentation is being generated (see
-CLAUDE.md for its exit codes).
+Logs: `journalctl -u presentations` (see [Security and limits](#security-and-limits)
+for what is logged). Restart after a code change:
+`sudo /usr/local/sbin/restart-presentations`, which first imports the code and
+builds the app as the service user, and refuses while a presentation is being
+generated (see CLAUDE.md for its exit codes).
 
 ## Deployment
 
@@ -399,7 +682,7 @@ The script's header lists every step. It:
 - installs `python3-venv`/`rsync`/`certbot` only if missing;
 - creates the `presentations` system user;
 - syncs code to `/var/www/presentations` and builds `.venv`;
-- runs an import check;
+- imports the code and builds the app (`create_app()`) as the service user;
 - installs and restarts the hardened systemd unit and waits for `/healthz`;
 - writes the dedicated nginx vhost, running `nginx -t` before every reload and
   restoring the previous file if the test fails;

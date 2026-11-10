@@ -220,3 +220,151 @@ def test_cancelled_download_stops_before_and_during_streaming(settings, fake):
     with pytest.raises(DownloadCancelled):  # cancelled after the request started
         media.fetch_original(12, base.format(12), cancelled=lambda: calls.append(1) or len(calls) > 1)
     assert media.cached_path(12) is None and not list(settings.media_cache_dir.glob("*.part"))
+
+
+def test_byte_reservations_are_used_up_by_downloads():
+    bb = ByteBudget(hourly=100, daily=1000)
+    first = bb.reserve(60)
+    with pytest.raises(BudgetExceeded):
+        bb.reserve(50)  # 100 - 60 reserved
+    bb.add(30)
+    first.consume(30)  # 30 downloaded, 30 still reserved
+    bb.reserve(40).release()
+    first.release()
+    assert bb.remaining() == (70, 970)
+
+
+def test_fetch_into_keeps_the_photo_when_the_cache_is_trimmed(settings, fake, media, tmp_path):
+    fake.add(make_obs(1, 47692, photos=((11, 64, 48),)))
+    url = f"https://{PHOTO_HOST}/photos/11/square.jpg"
+    linked = media.fetch_into(11, url, tmp_path / "job")
+    settings.media_cache_max_bytes = 0
+    media.cleanup()
+    assert media.cached_path(11) is None
+    assert linked.read_bytes()[:2] == b"\xff\xd8"
+    again = media.fetch_into(11, url, tmp_path / "job2")  # downloads it once more
+    assert again.read_bytes()[:2] == b"\xff\xd8" and len(fake.photo_requests) == 2
+
+
+def test_images_over_120_megapixels_are_never_decoded(tmp_path):
+    from PIL import Image
+
+    from app.images import MAX_DECODE_PIXELS, open_image
+
+    assert Image.MAX_IMAGE_PIXELS * 2 == MAX_DECODE_PIXELS == 120_000_000
+    path = tmp_path / "big.png"
+    Image.new("1", (11_000, 11_000)).save(path)  # 121 MP, tiny on disk
+    with pytest.raises(Image.DecompressionBombError):
+        open_image(path)
+
+
+def test_requests_are_counted_per_job(client, fake):
+    from app.inaturalist import count_requests
+
+    fake.add(make_obs(1, 47692))
+    fake.fail_429_times = 1
+    with count_requests() as used:
+        client.search({"user_id": "alice"}, 10_000)
+    assert used.count == 2  # the retry counts too
+
+
+def test_a_deck_with_every_photo_cached_needs_no_allowance():
+    bb = ByteBudget(hourly=100, daily=1000)
+    bb.add(150)  # downloads overshot the hour
+    bb.reserve(0).release()
+    with pytest.raises(BudgetExceeded):
+        bb.reserve(1)
+
+
+def test_a_cached_photo_trimmed_just_after_lookup_is_downloaded_again(settings, fake, media, tmp_path):
+    fake.add(make_obs(1, 47692, photos=((11, 64, 48),)))
+    gone = settings.media_cache_dir / "11.jpg"   # found, then deleted by cleanup
+    media.cached_path = lambda photo_id: gone
+    path = media.fetch_original(11, f"https://{PHOTO_HOST}/photos/11/square.jpg")
+    assert path == gone and path.read_bytes()[:2] == b"\xff\xd8" and len(fake.photo_requests) == 1
+
+
+def test_waiting_for_a_busy_photo_lock_notices_a_cancel(media):
+    import time
+
+    from app.images import LOCK_STRIPES, DownloadCancelled
+
+    lock = media._lock_for(11)
+    lock.acquire()  # another download holds the stripe that photo 11 + LOCK_STRIPES shares
+    try:
+        started = time.monotonic()
+        with pytest.raises(DownloadCancelled):
+            media.fetch_original(11 + LOCK_STRIPES, f"https://{PHOTO_HOST}/photos/{11 + LOCK_STRIPES}/square.jpg",
+                                 cancelled=lambda: True)
+        assert time.monotonic() - started < 2
+    finally:
+        lock.release()
+
+
+# ---------------------------------------------------------------- review fixes: downloads
+def test_a_reservation_does_not_allow_downloads_past_the_real_allowance():
+    bb = ByteBudget(hourly=100, daily=1000)
+    reserved = bb.reserve(50)
+    bb.add(120)  # another download overshot the hour
+    with pytest.raises(BudgetExceeded):
+        bb.allow_download(reserved)
+
+
+def test_downloaded_bytes_and_their_reservation_are_counted_together():
+    bb = ByteBudget(hourly=100, daily=1000)
+    reserved = bb.reserve(60)
+    bb.record(40, reserved)
+    assert reserved.left == 20 and bb.remaining() == (60, 960)
+    bb.reserve(40).release()  # 100 - 40 downloaded - 20 still reserved
+    with pytest.raises(BudgetExceeded):
+        bb.reserve(41)
+
+
+def test_a_retry_asks_the_byte_budget_again(media, monkeypatch):
+    import io
+
+    from PIL import Image
+
+    asked = []
+    real = media.budget.allow_download
+    monkeypatch.setattr(media.budget, "allow_download", lambda reservation=None: (asked.append(1), real(reservation)))
+    monkeypatch.setattr("app.images.time.sleep", lambda seconds: None)
+    attempts = []
+
+    def photos(request):
+        attempts.append(1)
+        if len(attempts) == 1:
+            return httpx.Response(503)
+        buf = io.BytesIO()
+        Image.new("RGB", (8, 8)).save(buf, "JPEG")
+        return httpx.Response(200, content=buf.getvalue())
+
+    media.http = httpx.Client(transport=httpx.MockTransport(photos))
+    media.fetch_original(11, f"https://{PHOTO_HOST}/photos/11/square.jpg")
+    assert len(attempts) == 2 and len(asked) == 2
+
+
+def test_cleanup_leaves_a_photo_that_is_being_handed_to_a_deck(settings, fake, media):
+    fake.add(make_obs(1, 47692, photos=((11, 64, 48),)))
+    media.fetch_original(11, f"https://{PHOTO_HOST}/photos/11/square.jpg")
+    settings.media_cache_max_bytes = 0
+    with media._lock_for(11):  # a deck is linking it right now
+        media.cleanup()
+        assert media.cached_path(11) is not None
+    media.cleanup()  # the next cleanup trims it
+    assert media.cached_path(11) is None
+
+
+def test_cleanup_counts_a_busy_photo_toward_the_cap(settings, fake, media):
+    import os
+    import time
+
+    fake.add(make_obs(1, 47692, photos=((11, 64, 48), (12, 64, 48))))
+    for pid in (11, 12):
+        media.fetch_original(pid, f"https://{PHOTO_HOST}/photos/{pid}/square.jpg")
+    old = time.time() - 50
+    os.utime(media.cached_path(11), (old, old))  # 11 is the oldest
+    settings.media_cache_max_bytes = media.cached_path(12).stat().st_size  # room for one
+    with media._lock_for(11):  # 11 is busy, so it stays and still counts
+        media.cleanup()
+    assert media.cached_path(11) is not None and media.cached_path(12) is None

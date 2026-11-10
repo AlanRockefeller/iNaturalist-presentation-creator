@@ -67,7 +67,7 @@ def test_plan_multiple_photos_selection_and_life():
     assert imgs[0]["observation_id"] == imgs[1]["observation_id"] == 1
     assert imgs[2]["lines"] == []  # "Life" -> no taxon annotation
     assert imgs[0]["lines"][0] == {"field": "scientific", "text": "Hygrocybe conica", "italic": True, "size": 28}
-    assert plan["counts"] == {"total": 5, "title": 1, "dividers": 0, "images": 4, "observations": 3}
+    assert plan["counts"] == {"total": 5, "title": 1, "dividers": 0, "images": 4, "observations": 3, "about": 0}
 
 
 def test_plan_min_faves_dividers_and_order():
@@ -99,17 +99,35 @@ def test_annotation_fields_overrides_and_observer_rules():
     lines = annotation_lines(obs[1], st[1], pr)
     assert [l["text"] for l in lines] == ["Hygrocybe conica", "Witch's Hat", "November 14, 2026", "Point Reyes, CA, US"]
     assert [l["italic"] for l in lines] == [True, False, False, False]
-    # username-only project: no observer line unless asked for
+    # username-only project (alice's): no observer line unless asked for, and
+    # even then not on alice's own photos, only on other people's
     pr_obs = pr.model_copy(update={"settings": pr.settings.model_copy(update={"annotations": on.model_copy(update={"observer": True})})})
-    assert annotation_lines(obs[1], st[1], pr_obs)[-1]["text"] == "Photo: Alice Smith"
+    assert annotation_lines(obs[1], st[1], pr_obs)[-1]["text"] == "Point Reyes, CA, US"
     assert annotation_lines(obs[3], st[3], pr_obs)[-1]["text"] == "Photo: carol"  # login fallback
-    # URL project: observer on by default
+    # URL project with no username: who the presenter is is unknown, so everyone is credited
     url_pr, _ = _deck(sources=[source("a", URL)])
     assert annotation_lines(obs[1], st[1], url_pr)[-1]["text"] == "Photo: Alice Smith"
     # user edits win; "" hides a line
     edited = st[1].model_copy(update={"overrides": AnnotationOverrides(scientific="Hygrocybe sp. nov.", location="", date="Fall 2026")})
     texts = [l["text"] for l in annotation_lines(obs[1], edited, pr)]
     assert texts == ["Hygrocybe sp. nov.", "Witch's Hat", "Fall 2026"]
+
+
+def test_observer_credit_skips_the_presenters_own_photos():
+    # A place search (credits on) plus "More photos" knowing the presenter is alice.
+    pr, obs = _deck(sources=[source("a", URL)])
+    pr = pr.model_copy(update={"settings": pr.settings.model_copy(
+        update={"related": pr.settings.related.model_copy(update={"username": "Alice"})})})
+    st = {s.id: s for s in pr.observations}
+    assert "Photo: Alice Smith" not in [l["text"] for l in annotation_lines(obs[1], st[1], pr)]
+    assert annotation_lines(obs[3], st[3], pr)[-1]["text"] == "Photo: carol"
+    # The per-observation choice still wins: credit one of your own by hand.
+    forced = st[1].model_copy(update={"show_lines": {"observer": True}})
+    assert annotation_lines(obs[1], forced, pr)[-1]["text"] == "Photo: Alice Smith"
+    # The plan uses the same rule.
+    plan = build_slide_plan(pr, obs)
+    texts = {s["observation_id"]: [l["text"] for l in s["lines"]] for s in plan["slides"] if s["kind"] == "image"}
+    assert not any(t.startswith("Photo:") for t in texts[1]) and "Photo: carol" in texts[3]
 
 
 def test_per_observation_lines_override_the_settings():
@@ -369,3 +387,84 @@ def test_only_expected_image_formats_are_parsed(tmp_path):
             _verify_image(bad, 7)
         with pytest.raises(Exception):
             prepare_for_slide(bad, tmp_path / "work")
+
+
+# ---------------------------------------------------------------- text safety, title size, groups
+
+def test_pasted_control_characters_and_unencodable_text_cannot_break_the_deck(tmp_path):
+    from app.models import PresentationSettings
+
+    settings = PresentationSettings(title="Fungi\x0bof Oregon", presenter="Alan\ud800 R")
+    assert settings.title == "Fungi of Oregon" and settings.presenter == "Alan R"
+    pr, obs = _deck()
+    # iNaturalist text and older files go through the writer's own check too.
+    obs[3]["place_guess"] = "Marin\x0b County￾"
+    pr = pr.model_copy(update={"settings": pr.settings.model_copy(update={
+        "annotations": AnnotationSettings(location=True)})})
+    plan = build_slide_plan(pr, obs)
+    plan["slides"][0]["title"] = "Bad\x0bTitle\ud800"
+    out = tmp_path / "deck.pptx"
+    write_pptx(plan, _images(tmp_path, obs), None, out, author="Pre\x01senter")
+    prs = Presentation(str(out))
+    texts = [sh.text_frame.text for s in prs.slides for sh in s.shapes if sh.has_text_frame]
+    assert "Bad Title" in texts and any("Marin  County" in t for t in texts)
+    assert not any("_x000B_" in t for t in texts)
+    assert prs.core_properties.title == "Bad Title" and prs.core_properties.author == "Pre senter"
+
+
+@pytest.mark.parametrize("length,size", [(20, 54), (70, 54), (71, 44), (120, 44), (121, 36), (200, 36)])
+def test_long_titles_get_a_smaller_font(tmp_path, length, size):
+    pr, obs = _deck({"title": "T" * length})
+    plan = build_slide_plan(pr, obs)
+    assert plan["slides"][0]["title_size"] == size
+    out = tmp_path / "deck.pptx"
+    write_pptx(plan, _images(tmp_path, obs), None, out)
+    run = Presentation(str(out)).slides[0].shapes[0].text_frame.paragraphs[0].runs[0]
+    assert run.font.size.pt == size
+
+
+def test_groups_sharing_a_label_get_their_own_divider():
+    a, b = source("a", URL, label="Same label"), source("b", URL.replace("place_id=1", "place_id=2"), label="Same label")
+    obs = norm(make_obs(1, 47692, photos=((11, 800, 600),)), make_obs(2, 47602, photos=((21, 800, 600),)))
+    pr = project(a, b, grouping="source", dividers=True)
+    pr = add_observations(pr, [1, 2], obs, {1: ["a"], 2: ["b"]}, placement="append")
+    kinds = [s["kind"] for s in build_slide_plan(pr, obs)["slides"]]
+    assert kinds == ["title", "divider", "image", "divider", "image"]
+
+
+def test_adjacent_groups_with_the_same_key_but_another_label_get_a_divider():
+    obs = norm(make_obs(1, 47692, photos=((11, 800, 600),)), make_obs(2, 47693, photos=((21, 800, 600),)))
+    obs[2]["ranks"] = {**obs[2]["ranks"], "genus": "hygrocybe"}  # same genus key, differently written
+    pr = project(source("a", "alice"), grouping="genus", dividers=True)
+    pr = add_observations(pr, [1, 2], obs, {1: ["a"], 2: ["a"]}, placement="append")
+    dividers = [s["text"] for s in build_slide_plan(pr, obs)["slides"] if s["kind"] == "divider"]
+    assert dividers == ["Hygrocybe", "hygrocybe"]
+
+
+def _with_notes(pr, oid, text):
+    return pr.model_copy(update={"observations": [
+        st.model_copy(update={"notes": text, "notes_name": "x"}) if st.id == oid else st for st in pr.observations]})
+
+
+def test_presenter_notes_in_the_speaker_notes(tmp_path):
+    pr, obs = _deck()
+    pr = _with_notes(pr, 1, "• Edible when young\n\n• Grows in grass")
+    plan = build_slide_plan(pr, obs)
+    first = next(s for s in plan["slides"] if s["kind"] == "image")
+    lines = first["notes"].split("\n")
+    assert lines[:2] == ["Hygrocybe conica", "Witch's Hat"]
+    assert lines[2:6] == ["", "• Edible when young", "• Grows in grass", ""]
+    assert lines[6] == "https://www.inaturalist.org/observations/1"
+    # every photo slide of the observation has them; other observations do not
+    assert all("• Grows in grass" in s["notes"] for s in plan["slides"] if s.get("observation_id") == 1)
+    other = next(s for s in plan["slides"] if s.get("observation_id") == 3)
+    assert "•" not in other["notes"] and "\n\n" not in other["notes"]
+
+    only = build_slide_plan(pr.model_copy(update={"settings": pr.settings.model_copy(update={"speaker_notes": False})}), obs)
+    assert next(s for s in only["slides"] if s["kind"] == "image")["notes"] == "• Edible when young\n• Grows in grass"
+    off = build_slide_plan(pr.model_copy(update={"settings": pr.settings.model_copy(update={"presenter_notes": False})}), obs)
+    assert "•" not in next(s for s in off["slides"] if s["kind"] == "image")["notes"]
+
+    prs, _, _ = _build(tmp_path, pr, obs)
+    text = prs.slides[1].notes_slide.notes_text_frame.text
+    assert "• Edible when young" in text and "17" not in text

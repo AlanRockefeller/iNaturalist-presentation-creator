@@ -9,7 +9,7 @@
   <link rel="stylesheet" href="/static/css/app.css?v={{ version }}">
   <script src="/static/js/theme.js?v={{ version }}"></script>
 </head>
-<body data-max-sources="{{ limits.max_sources }}" data-max-observations="{{ limits.max_observations }}" data-max-image-slides="{{ limits.max_image_slides }}">
+<body data-max-sources="{{ limits.max_sources }}" data-max-observations="{{ limits.max_observations }}" data-max-image-slides="{{ limits.max_image_slides }}" data-max-related-taxa="{{ limits.max_related_taxa }}" data-notes-enabled="{{ '1' if notes_enabled else '0' }}" data-notes-web="{{ '1' if notes_web_search else '0' }}">
 
 <nav class="topnav">
   <div class="topnav-inner">
@@ -71,6 +71,7 @@
           <input type="text" id="source-username" maxlength="40" placeholder="your_username" autocapitalize="off" spellcheck="false">
         </label>
         <button type="submit" class="btn btn-primary" id="btn-add-source">Add source</button>
+        <button type="button" class="btn btn-gold" id="btn-add-rare" title="Rank the species in this search by how rarely iNaturalist has them worldwide">Find the rarest species…</button>
       </form>
       <p class="form-error" id="source-error" role="alert"></p>
       <ul class="source-list" id="source-list"></ul>
@@ -84,7 +85,9 @@
       <h3>Tips</h3>
       <ul class="tips">
         <li>Any filter the iNaturalist observations page supports works here, for example <code>taxon_id</code>, <code>place_id</code>, <code>project_id</code>, <code>d1</code>/<code>d2</code> dates and <code>quality_grade</code>.</li>
-        <li>Each source can match at most {{ "{:,}".format(limits.max_observations) }} observations, the most iNaturalist allows in one search. Add filters to narrow a larger one.</li>
+        <li>Each source can match at most {{ "{:,}".format(limits.max_observations_per_source) }} observations, the most iNaturalist allows in one search. Add filters to narrow a larger one.</li>
+        <li>A source with your username, or a link limited to one iNaturalist user, counts as your own photos (<strong>Mine</strong>), so photo credits start off. Other sources (<strong>Search</strong>) may include other people's photos, so credits start on. Click Mine or Search on a source limited to one user to change it.</li>
+        <li><strong>Find the rarest species…</strong> ranks the species in a search by how many observations iNaturalist has of each worldwide, and offers the rarest for review. Their slides then say, for example, “12 observations worldwide · #3 rarest”.</li>
         <li>Thumbnails load directly from iNaturalist. Full-resolution photos are downloaded only when you generate the PowerPoint.</li>
       </ul>
     </div>
@@ -104,6 +107,7 @@
             <option value="name">Scientific name</option>
             <option value="original">iNaturalist result order</option>
             <option value="random">Random</option>
+            <option value="rarity">Rarest first (Rare finds)</option>
             <option value="custom" disabled>Custom (dragged)</option>
           </select>
           <button type="button" class="btn btn-small" id="sort-dir" title="Toggle ascending/descending" aria-label="Sort direction">↑ Asc</button>
@@ -125,7 +129,7 @@
       </div>
       <div class="tool">
         <label for="min-faves">Minimum favorites</label>
-        <input type="number" id="min-faves" min="0" max="100000" step="1" value="0">
+        <input type="number" id="min-faves" min="0" max="1000000" step="1" value="0">
       </div>
       <div class="tool grow">
         <label for="find">Find</label>
@@ -138,12 +142,17 @@
           <button type="button" class="btn btn-small" id="btn-select-none" title="Deselect every photo of the observations shown">Select none</button>
         </div>
       </div>
+      <div class="tool">
+        <label>&nbsp;</label>
+        <button type="button" class="btn btn-small btn-gold" id="btn-related" title="Pull in more photos of the species in this project: your own from anywhere, or other people's">More photos…</button>
+      </div>
     </div>
     <div class="statusline">
       <span id="org-stats"></span>
       <span class="muted small">Drag ⠿ to reorder. Click a photo to inspect it. Drag a photo to change its slide order. Keys: <kbd>↑</kbd> <kbd>↓</kbd> observations, <kbd>←</kbd> <kbd>→</kbd> photos, <kbd>Shift</kbd>+<kbd>←</kbd> <kbd>→</kbd> move a photo, <kbd>Space</kbd> include, <kbd>Enter</kbd> enlarge.</span>
     </div>
-    <div id="obs-list" class="obs-list" aria-live="polite"></div>
+    <p id="org-announce" class="visually-hidden" role="status"></p>
+    <div id="obs-list" class="obs-list"></div>
     <div id="obs-sentinel" class="sentinel"></div>
     <div class="row-end sticky-actions">
       <button type="button" class="btn btn-primary btn-lg" data-goto="settings">Next: Presentation settings</button>
@@ -194,14 +203,18 @@
           <label class="check"><input type="checkbox" id="ann-common"> English common name</label>
           <label class="check"><input type="checkbox" id="ann-date"> Observation date</label>
           <label class="check"><input type="checkbox" id="ann-location"> Location (iNaturalist place description)</label>
-          <label class="check"><input type="checkbox" id="ann-observer"> Observer credit <span class="muted small" id="observer-note"></span></label>
+          <label class="check"><input type="checkbox" id="ann-observer"> Observer credit on other people's photos <span class="muted small" id="observer-note"></span></label>
+          <label class="check"><input type="checkbox" id="ann-rarity" checked> Rare finds: worldwide count and rank <span class="muted small">(“12 observations worldwide · #3 rarest”)</span></label>
         </div>
         <div class="field">
           <span>Groups</span>
           <label class="check"><input type="checkbox" id="set-dividers"> Divider slide before each group <span class="muted small" id="divider-note"></span></label>
         </div>
         <div class="field">
-          <label class="check"><input type="checkbox" id="set-notes" checked> Speaker notes with the iNaturalist link and photo credit</label>
+          <span>Speaker notes <span class="muted small">(only you see these, in PowerPoint's presenter view)</span></span>
+          <label class="check"><input type="checkbox" id="set-notes" checked> Name, iNaturalist link and photo credit</label>
+          <label class="check"><input type="checkbox" id="set-presenter-notes" checked> Presenter notes (typed by you, or written by Claude on the Preview step)</label>
+          <label class="check"><input type="checkbox" id="set-about-slide" checked> An “About these numbers” slide at the end, when the deck has rare finds</label>
         </div>
       </div>
     </div>
@@ -215,6 +228,11 @@
     <div class="statusline">
       <span id="preview-stats"></span>
       <span class="muted small">This is the actual slide sequence. Drag a photo slide to move its whole observation.</span>
+      <span class="notes-tools">
+        <button type="button" class="btn btn-small" id="btn-notes-all" data-notes-claude hidden>Write notes for all slides…</button>
+        <button type="button" class="btn btn-small" id="btn-notes-selected" hidden></button>
+        <button type="button" class="btn btn-small" id="btn-notes-clear" hidden>Clear selection</button>
+      </span>
     </div>
     <div id="preview-warnings" class="warnings"></div>
     <div id="preview-grid" class="preview-grid"></div>
@@ -295,6 +313,64 @@
   </div>
 </div>
 
+<!-- More photos of the same species -->
+<div class="modal" id="related-modal" hidden>
+  <div class="modal-box medium" role="dialog" aria-modal="true" aria-labelledby="related-title">
+    <div class="modal-head">
+      <h2 id="related-title">More photos of the same species</h2>
+      <button type="button" class="icon-btn close" data-close aria-label="Close">×</button>
+    </div>
+    <div class="related-body">
+      <p class="muted small">Pull in more observations of species already in this project: your own from anywhere, or other people's. Set how it works here once; then use <strong>More of mine</strong> or <strong>More from others</strong> on any observation. New observations are offered for review and are not added until you choose.</p>
+      <label class="field">Your iNaturalist username
+        <input type="text" id="rel-username" maxlength="40" placeholder="your_username" autocapitalize="off" spellcheck="false">
+      </label>
+      <p class="muted small">Needed for your own photos. Your observations are left out of other people's, and your photos never get the observer credit.</p>
+      <fieldset class="rel-group">
+        <legend>My photos</legend>
+        <div class="rel-row">
+          <label class="small">Up to <input type="number" id="rel-mine-n" min="1" max="200" step="1"> per species</label>
+          <label class="small">Minimum favorites <input type="number" id="rel-mine-faves" min="0" max="1000000" step="1"></label>
+        </div>
+      </fieldset>
+      <fieldset class="rel-group">
+        <legend>Other people's photos</legend>
+        <div class="rel-licenses" id="rel-licenses" role="group" aria-label="Photo licenses">
+          <label class="check small"><input type="checkbox" value="cc0"> CC0</label>
+          <label class="check small"><input type="checkbox" value="cc-by"> CC BY</label>
+          <label class="check small"><input type="checkbox" value="cc-by-sa"> CC BY-SA</label>
+          <label class="check small"><input type="checkbox" value="cc-by-nd"> CC BY-ND</label>
+          <label class="check small"><input type="checkbox" value="cc-by-nc"> CC BY-NC</label>
+          <label class="check small"><input type="checkbox" value="cc-by-nc-sa"> CC BY-NC-SA</label>
+          <label class="check small"><input type="checkbox" value="cc-by-nc-nd"> CC BY-NC-ND</label>
+          <label class="check small"><input type="checkbox" value="arr"> All rights reserved</label>
+        </div>
+        <p class="muted small">CC0, CC BY, CC BY-SA and CC BY-ND allow commercial use. The most favorited come first.</p>
+        <div class="rel-row">
+          <label class="small">Up to <input type="number" id="rel-others-n" min="1" max="200" step="1"> per species</label>
+          <label class="small">Minimum favorites <input type="number" id="rel-others-faves" min="0" max="1000000" step="1"></label>
+          <label class="check small"><input type="checkbox" id="rel-research"> Research grade only</label>
+        </div>
+      </fieldset>
+      <label class="check"><input type="checkbox" id="rel-buttons"> Show <strong>More of mine</strong> and <strong>More from others</strong> on each observation</label>
+      <div class="rel-all">
+        <h3>Search every species listed now</h3>
+        <p class="small" id="rel-species-note"></p>
+        <div class="row-start">
+          <button type="button" class="btn btn-small" id="btn-rel-all-mine">My photos</button>
+          <button type="button" class="btn btn-small" id="btn-rel-all-others">Other people's photos</button>
+        </div>
+      </div>
+      <p class="form-error" id="rel-error" role="alert"></p>
+    </div>
+    <div class="modal-foot">
+      <span class="grow"></span>
+      <button type="button" class="btn" data-close>Cancel</button>
+      <button type="button" class="btn btn-primary" id="btn-rel-save">Save</button>
+    </div>
+  </div>
+</div>
+
 <!-- Photo viewer -->
 <div class="viewer" id="viewer" hidden>
   <div class="viewer-top">
@@ -333,6 +409,104 @@
       <input type="search" id="picker-find" placeholder="Filter by name…" maxlength="100">
     </div>
     <div class="picker-scroll"><div id="picker-grid" class="picker-grid"></div><div id="picker-sentinel" class="sentinel"></div></div>
+  </div>
+</div>
+
+<!-- Rare finds -->
+<div class="modal" id="rare-modal" hidden>
+  <div class="modal-box narrow" role="dialog" aria-modal="true" aria-labelledby="rare-title">
+    <div class="modal-head">
+      <h2 id="rare-title">Find the rarest species</h2>
+      <button type="button" class="icon-btn close" data-close aria-label="Close">×</button>
+    </div>
+    <form id="rare-form">
+      <p class="small">Ranks the species in this search by how many observations iNaturalist has of each worldwide, and offers the rarest for review, with photos from the search itself.</p>
+      <p class="muted small rare-search" id="rare-search"></p>
+      <div class="rare-numbers">
+        <label class="field">How many species
+          <input type="number" id="rare-top" min="1" max="100" step="1" value="15" required>
+        </label>
+        <label class="field">Observations per species
+          <input type="number" id="rare-per" min="1" max="20" step="1" value="1" required>
+        </label>
+      </div>
+      <label class="check"><input type="checkbox" id="rare-described"> Described species only (leave out provisional names)</label>
+      <label class="check"><input type="checkbox" id="rare-commercial"> Only photos licensed for commercial use</label>
+      <p class="muted small">The search runs when you load it, and again only when you press Search again: about 30 to 60 requests to iNaturalist. The counts are updated on every refresh.</p>
+      <p class="form-error" id="rare-error" role="alert"></p>
+      <div class="modal-foot">
+        <span class="grow"></span>
+        <button type="button" class="btn" data-close>Cancel</button>
+        <button type="submit" class="btn btn-primary" id="btn-rare-add">Add Rare finds</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- Presenter notes for one observation -->
+<div class="modal" id="notes-modal" hidden>
+  <div class="modal-box narrow" role="dialog" aria-modal="true" aria-labelledby="notes-title">
+    <div class="modal-head">
+      <h2 id="notes-title">Presenter notes</h2>
+      <button type="button" class="icon-btn close" data-close aria-label="Close">×</button>
+    </div>
+    <p class="notes-for" id="notes-for"></p>
+    <div class="warning" id="notes-stale" hidden></div>
+    <textarea id="notes-text" class="notes-text" rows="9" maxlength="4000" aria-label="Presenter notes"
+              placeholder="Type notes here, or let Claude write them."></textarea>
+    <p class="muted small">Shown in PowerPoint's presenter view on every slide of this observation. Saved in the project file.</p>
+    <label class="check small" data-notes-web hidden><input type="checkbox" id="notes-web"> Search the web first (slower, checks the dates, people and places)</label>
+    <p class="small" id="notes-status" role="status" hidden></p>
+    <div class="modal-foot">
+      <button type="button" class="btn" id="btn-notes-claude" data-notes-claude hidden>Write with Claude</button>
+      <button type="button" class="btn" id="btn-notes-remove">Remove notes</button>
+      <span class="grow"></span>
+      <button type="button" class="btn btn-primary" data-close>Done</button>
+    </div>
+  </div>
+</div>
+
+<!-- Presenter notes for every slide -->
+<div class="modal" id="notes-all-modal" hidden>
+  <div class="modal-box narrow" role="dialog" aria-modal="true" aria-labelledby="notes-all-title">
+    <div class="modal-head">
+      <h2 id="notes-all-title">Write notes for all slides</h2>
+      <button type="button" class="icon-btn close" data-close aria-label="Close">×</button>
+    </div>
+    <p id="notes-all-summary"></p>
+    <label class="check" id="notes-all-replace-row"><input type="checkbox" id="notes-all-replace"> <span id="notes-all-replace-label"></span></label>
+    <label class="check" data-notes-web hidden><input type="checkbox" id="notes-all-web"> Search the web first (slower: about a minute for every few names, but the dates, people and places are checked)</label>
+    <p class="muted small">Claude writes up to 8 short points about each name: who described it, when and where, the describer, what the name means, edibility and toxicity, ecology, range and its story. Observations with the same name get the same notes. You can edit them afterwards.</p>
+    <div id="notes-all-progress" class="progress-block" hidden>
+      <div class="progress"><div class="bar" id="notes-all-bar"></div></div>
+      <p id="notes-all-message" class="small"></p>
+    </div>
+    <div class="modal-foot">
+      <span class="grow"></span>
+      <button type="button" class="btn" id="btn-notes-all-cancel">Cancel</button>
+      <button type="button" class="btn btn-primary" id="btn-notes-all-start">Write notes</button>
+    </div>
+  </div>
+</div>
+
+<!-- Access code for writing notes with Claude -->
+<div class="modal" id="notes-code-modal" hidden>
+  <div class="modal-box narrow" role="dialog" aria-modal="true" aria-labelledby="notes-code-title">
+    <div class="modal-head">
+      <h2 id="notes-code-title">Access code</h2>
+      <button type="button" class="icon-btn close" data-close aria-label="Close">×</button>
+    </div>
+    <form id="notes-code-form">
+      <p class="small" id="notes-code-message">Writing notes with Claude needs the access code for this site.</p>
+      <label class="field">Access code
+        <input type="password" id="notes-code-input" maxlength="200" autocomplete="current-password" required>
+      </label>
+      <div class="modal-foot">
+        <span class="grow"></span>
+        <button type="button" class="btn" data-close>Cancel</button>
+        <button type="submit" class="btn btn-primary">Continue</button>
+      </div>
+    </form>
   </div>
 </div>
 

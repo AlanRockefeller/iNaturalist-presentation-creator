@@ -1,0 +1,14 @@
+# yaml-language-server: $schema=https://www.coderabbit.ai/integrations/schema.v2.json
+# CodeRabbit settings for this repository. Anything not set here comes from
+# the organization's settings in the CodeRabbit app.
+inheritance: true
+
+reviews:
+  # Docstrings are written where code is not clear on its own; docstring
+  # coverage is not a goal here, so CodeRabbit does not report or add them.
+  pre_merge_checks:
+    docstrings:
+      mode: "off"
+  finishing_touches:
+    docstrings:
+      enabled: false
