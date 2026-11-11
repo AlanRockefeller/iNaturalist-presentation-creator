@@ -70,6 +70,10 @@ def group_of(obs: dict | None, state: ObservationState | None, grouping: str, pr
     return (path, label)
 
 
+# Keys whose _inner_key() starts with 1 when the observation has no value.
+_MISSING_LAST = {"observed_on", "created_at", "month", "rarity"}
+
+
 def _inner_key(key: str, obs: dict, state: ObservationState | None, original_index: dict[int, tuple]):
     if key == "taxonomic":
         return taxonomic_key(obs, state)
@@ -144,11 +148,19 @@ def sort_ids(
         else:
             # Ties fall back to taxonomic order; reverse=True keeps the sort stable.
             members.sort(key=lambda i: taxonomic_key(obs_map[i], states.get(i)))
+            no_value: list[int] = []
+            if key in _MISSING_LAST:
+                # Observations without the value go last in either direction,
+                # in taxonomic order; reversing the key would put them first.
+                missing_value = {i for i in members if _inner_key(key, obs_map[i], states.get(i), original_index)[0]}
+                no_value = [i for i in members if i in missing_value]
+                members = [i for i in members if i not in missing_value]
             if key != "taxonomic" or direction == "desc":
                 members.sort(
                     key=lambda i: _inner_key(key, obs_map[i], states.get(i), original_index),
                     reverse=direction == "desc",
                 )
+            members += no_value
         out.extend(members)
     return out + missing
 

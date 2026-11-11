@@ -1625,7 +1625,9 @@
   }
 
   let sortSeq = 0;
-  async function applySort(key, direction) {
+  // `grouping`, if given, is sent with the request and kept only when the sort
+  // succeeds, so a failed sort leaves the project as it was.
+  async function applySort(key, direction, grouping = null) {
     const sort = S.project.settings.sort;
     if (key === 'custom') { key = sort.base_key; direction = sort.base_direction; }
     const gen = projectGen;
@@ -1633,7 +1635,10 @@
     try {
       const res = await api('/api/sort', {
         method: 'POST',
-        body: { project: S.project, workspace_id: S.workspaceId, key, direction, seed: Math.floor(Math.random() * 1e9) },
+        body: {
+          project: grouping === null ? S.project : { ...S.project, settings: { ...S.project.settings, grouping } },
+          workspace_id: S.workspaceId, key, direction, seed: Math.floor(Math.random() * 1e9),
+        },
       });
       // Drop it if the project was replaced or a newer sort was asked for.
       if (gen !== projectGen || seq !== sortSeq) return;
@@ -1644,12 +1649,20 @@
       sort.key = key;
       sort.direction = direction;
       if (key !== 'random') { sort.base_key = key; sort.base_direction = direction; }
+      if (grouping !== null) {
+        S.project.settings.grouping = grouping;
+        $('#grouping').value = grouping;
+      }
       markDirty();
       const shown = renderOrganize();
       const option = $(`#sort-key option[value="${key}"]`);
       const how = key === 'random' ? '' : `, ${direction === 'desc' ? 'descending' : 'ascending'}`;
       announce(`Sorted by ${option ? option.textContent : key}${how}. ${groupingText()} ${shownText(shown)}`);
-    } catch (err) { if (gen === projectGen && seq === sortSeq) handleApiError(err); }
+    } catch (err) {
+      if (gen !== projectGen || seq !== sortSeq) return;
+      syncToolbar(); // the menus back to the sort and grouping still in effect
+      handleApiError(err);
+    }
   }
 
   $('#sort-key').addEventListener('change', (e) => {
@@ -1662,12 +1675,8 @@
     // Sorting applies inside each group, so with grouping on the months would
     // start over in every group. Choosing the month sort turns grouping off to
     // give one January to December run; Group by can be turned on again after.
-    if (key === 'month' && S.project.settings.grouping !== 'none') {
-      S.project.settings.grouping = 'none';
-      $('#grouping').value = 'none';
-      markDirty();
-    }
-    applySort(key, dir);
+    const ungroup = key === 'month' && S.project.settings.grouping !== 'none';
+    applySort(key, dir, ungroup ? 'none' : null);
   });
   $('#sort-dir').addEventListener('click', () => {
     const s = S.project.settings.sort;
