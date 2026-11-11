@@ -50,6 +50,18 @@ def test_date_sorts_and_missing_dates_last():
     assert sort_ids(pr.order, OBS, pr, "created_at", "asc") == [3, 1, 2, 4, 5, 6]
 
 
+def test_month_sort_ignores_the_year():
+    pr = proj()
+    # January, February, March, May 2024, November 2025, then no date.
+    assert sort_ids(pr.order, OBS, pr, "month", "asc") == [1, 6, 3, 5, 2, 4]
+    obs = norm(
+        make_obs(1, 47702, observed_on="2026-10-20"),
+        make_obs(2, 47692, observed_on="2024-10-03"),
+        make_obs(3, 47602, observed_on="2025-10-03"),
+    )
+    assert sort_ids([1, 2, 3], obs, pr, "month") == [2, 3, 1]
+
+
 def test_original_order_and_random():
     pr = proj()
     ws = {"source_results": {"a": [5, 3, 1], "b": [6, 2, 4, 3]}}

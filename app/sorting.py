@@ -77,6 +77,14 @@ def _inner_key(key: str, obs: dict, state: ObservationState | None, original_ind
         return (int(obs.get("faves_count") or 0),)
     if key == "observed_on":
         return _text_key(obs.get("observed_on"))
+    if key == "month":
+        # Month of the year, whatever the year (January first), then day and
+        # year; observations without a date after them.
+        date = obs.get("observed_on")
+        if not date:
+            return (1, 0, 0, 0)
+        year, month, day = (int(part) for part in date.split("-"))
+        return (0, month, day, year)
     if key == "created_at":
         return _text_key(obs.get("created_at"))
     if key == "name":

@@ -1659,6 +1659,14 @@
       return;
     }
     const dir = ['favorites', 'observed_on', 'created_at'].includes(key) ? 'desc' : 'asc';
+    // Sorting applies inside each group, so with grouping on the months would
+    // start over in every group. Choosing the month sort turns grouping off to
+    // give one January to December run; Group by can be turned on again after.
+    if (key === 'month' && S.project.settings.grouping !== 'none') {
+      S.project.settings.grouping = 'none';
+      $('#grouping').value = 'none';
+      markDirty();
+    }
     applySort(key, dir);
   });
   $('#sort-dir').addEventListener('click', () => {

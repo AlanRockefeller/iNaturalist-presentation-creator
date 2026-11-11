@@ -45,7 +45,7 @@ small JSON project file; the server holds only short-lived temporary data.
    date, place, observer, a visible favorite count (♥ 17) and a checkbox for every
    photo. Only the first photo of each observation starts checked; tick others to
    add more slides. ↺ / ↻ on a photo (or R / Shift+R in the viewer) rotates it on
-   its slide. Sort (taxonomic, favorites, observation date, date added, name,
+   its slide. Sort (taxonomic, favorites, observation date, month of the year (which turns grouping off), date added, name,
    iNaturalist order, random), group (kingdom … genus, or source), filter by minimum
    favorites, drag to reorder, edit the name or any annotation line. Click a photo
    to inspect it at 1024 px, zooming to the full-resolution original only when
