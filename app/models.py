@@ -18,7 +18,7 @@ SCHEMA_VERSION = 8
 PROJECT_EXTENSION = ".dikarya-presentation.json"
 
 SortKey = Literal["taxonomic", "favorites", "observed_on", "created_at", "name", "original", "random", "custom",
-                  "rarity"]
+                  "rarity", "month"]
 Grouping = Literal["none", "kingdom", "phylum", "class", "order", "family", "genus", "source"]
 SOURCE_ID_PATTERN = r"^[A-Za-z0-9_-]{1,40}$"
 Rotation = Literal[0, 90, 180, 270]

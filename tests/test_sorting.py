@@ -48,6 +48,32 @@ def test_date_sorts_and_missing_dates_last():
     pr = proj()
     assert sort_ids(pr.order, OBS, pr, "observed_on", "asc") == [5, 2, 1, 6, 3, 4]
     assert sort_ids(pr.order, OBS, pr, "created_at", "asc") == [3, 1, 2, 4, 5, 6]
+    # Descending too: no date is still last, not first.
+    assert sort_ids(pr.order, OBS, pr, "observed_on", "desc") == [3, 6, 1, 2, 5, 4]
+
+
+def test_rarity_without_counts_last_in_both_directions():
+    obs = norm(make_obs(1, 47702), make_obs(2, 47692), make_obs(3, 47602))
+    obs[1]["rare"] = {"world": 40}
+    obs[3]["rare"] = {"world": 7}
+    pr = proj()
+    assert sort_ids([1, 2, 3], obs, pr, "rarity", "asc") == [3, 1, 2]
+    assert sort_ids([1, 2, 3], obs, pr, "rarity", "desc") == [1, 3, 2]
+
+
+def test_month_sort_ignores_the_year():
+    pr = proj()
+    # January, February, March, May 2024, November 2025, then no date.
+    assert sort_ids(pr.order, OBS, pr, "month", "asc") == [1, 6, 3, 5, 2, 4]
+    obs = norm(
+        make_obs(1, 47702, observed_on="2026-10-20"),
+        make_obs(2, 47692, observed_on="2024-10-03"),
+        make_obs(3, 47602, observed_on="2025-10-03"),
+        make_obs(4, 47693, observed_on="2027-10-02"),  # earlier day, later year
+    )
+    assert sort_ids([1, 2, 3, 4], obs, pr, "month") == [4, 2, 3, 1]
+    # Descending: December first, and no date still last.
+    assert sort_ids(pr.order, OBS, pr, "month", "desc") == [2, 5, 3, 6, 1, 4]
 
 
 def test_original_order_and_random():
