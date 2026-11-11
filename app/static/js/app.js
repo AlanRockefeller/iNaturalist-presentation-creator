@@ -1691,7 +1691,14 @@
     S.project.settings.grouping = e.target.value;
     markDirty();
     const s = S.project.settings.sort;
-    if (s.key === 'custom') announce(`${groupingText()} ${shownText(renderOrganize())}`);
+    if (s.key === 'custom') {
+      // A sort still pending (say Month of the year, chosen from Custom) would
+      // otherwise land after this and undo the new grouping: drop it, and put
+      // the Sort menu back to Custom.
+      sortSeq++;
+      syncToolbar();
+      announce(`${groupingText()} ${shownText(renderOrganize())}`);
+    }
     else applySort(s.key, s.direction);
   });
   $('#min-faves').addEventListener('input', debounce((e) => {
